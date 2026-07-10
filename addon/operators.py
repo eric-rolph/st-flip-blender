@@ -1,17 +1,243 @@
 """Operators: quick setup, bake (modal), free bake, GPU support installer."""
 
+from __future__ import annotations
+
+import ctypes
 import importlib
+import json
+import math
+import os
+from pathlib import Path
+import shutil
 import subprocess
 import sys
+import time
 
 import bpy
-import numpy as np
 
-from ..stflip import cache
-from ..stflip.backend import cuda_available, get_backend
-from ..stflip.solver import Params, STFLIPSolver
-from . import handlers, mesher, voxelize
-from .handlers import resolve_cache_dir
+
+CUPY_VERSION = "14.1.1"
+GPU_INSTALL_CANDIDATES = (
+    {
+        "label": "CUDA 13 runtime",
+        "slug": "cuda13",
+        "requirement": f"cupy-cuda13x[ctk]=={CUPY_VERSION}",
+    },
+    {
+        "label": "CUDA 12 toolkit",
+        "slug": "cuda12",
+        "requirement": f"cupy-cuda12x=={CUPY_VERSION}",
+    },
+)
+
+_RUNTIME_DIRNAME = "stflip_cuda_runtime"
+_ACTIVE_RUNTIME_FILE = "active.txt"
+_INSTALLING_RUNTIME_FILE = ".installing"
+_INSTALLING_STALE_SECONDS = 24 * 60 * 60
+_GRID_BYTES_PER_CELL = 256
+_PARTICLE_BYTES = 160
+_CUDA_HOST_GRID_BYTES_PER_CELL = 96
+_CUDA_HOST_PARTICLE_BYTES = 48
+_MEMORY_HEADROOM_FRACTION = 0.75
+
+
+def _value(source, *names, default=None):
+    for name in names:
+        if isinstance(source, dict) and name in source:
+            return source[name]
+        if hasattr(source, name):
+            return getattr(source, name)
+    return default
+
+
+def normalize_cuda_diagnostics(diagnostic) -> dict:
+    """Normalize backend diagnostic mappings, objects, or ``(ok, reason)``."""
+    if isinstance(diagnostic, tuple) and len(diagnostic) >= 2:
+        available = bool(diagnostic[0])
+        reason = str(diagnostic[1] or "")
+        prefix = "CUDA preflight passed on "
+        return {
+            "available": available,
+            "device": reason[len(prefix):] if available
+            and reason.startswith(prefix) else "",
+            "free_bytes": None,
+            "total_bytes": None,
+            "error": "" if available else reason,
+        }
+    available = bool(_value(diagnostic, "available", "ok", default=False))
+    return {
+        "available": available,
+        "device": str(_value(
+            diagnostic, "device_name", "device", default="") or ""),
+        "free_bytes": _value(
+            diagnostic, "free_bytes", "memory_free", default=None),
+        "total_bytes": _value(
+            diagnostic, "total_bytes", "memory_total", default=None),
+        "error": "" if available else str(_value(
+            diagnostic, "error", "message", "reason", default="") or ""),
+    }
+
+
+def estimate_bake_memory(dims, particles_per_cell: int) -> dict:
+    """Return a deliberately conservative worst-case working-set estimate.
+
+    The estimate assumes every domain cell is initially filled.  It includes
+    persistent particle/grid state and the large temporary index/weight arrays
+    used by P2G, interpolation, pressure projection, and cache export.
+    """
+    dims = tuple(int(v) for v in dims)
+    if len(dims) != 3 or any(v <= 0 for v in dims):
+        raise ValueError(f"invalid grid dimensions: {dims!r}")
+    ppc = max(1, int(particles_per_cell))
+    cells = math.prod(dims)
+    particles = cells * ppc
+    working = (cells * _GRID_BYTES_PER_CELL
+               + particles * _PARTICLE_BYTES)
+    cuda_host = (cells * _CUDA_HOST_GRID_BYTES_PER_CELL
+                 + particles * _CUDA_HOST_PARTICLE_BYTES)
+    return {
+        "dims": dims,
+        "cells": cells,
+        "particles": particles,
+        "working_set_bytes": working,
+        "cuda_host_bytes": cuda_host,
+    }
+
+
+def _format_bytes(value: int | float) -> str:
+    value = float(value)
+    for suffix in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or suffix == "TiB":
+            return f"{value:.1f} {suffix}"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def memory_guard_reason(estimate: dict, backend_name: str,
+                        ram_available: int | None,
+                        vram_available: int | None) -> str | None:
+    """Explain a predictable OOM, or return ``None`` when headroom is sane."""
+    dims = "x".join(str(v) for v in estimate["dims"])
+    working = int(estimate["working_set_bytes"])
+    if backend_name == "cuda" and vram_available:
+        safe_vram = int(vram_available * _MEMORY_HEADROOM_FRACTION)
+        if working > safe_vram:
+            return (
+                f"Grid {dims} may require {_format_bytes(working)} VRAM, "
+                f"above the safe {_format_bytes(safe_vram)} of currently "
+                "available VRAM. Lower Resolution or Particles / Cell."
+            )
+    host_need = (int(estimate["cuda_host_bytes"])
+                 if backend_name == "cuda" else working)
+    if ram_available:
+        safe_ram = int(ram_available * _MEMORY_HEADROOM_FRACTION)
+        if host_need > safe_ram:
+            return (
+                f"Grid {dims} may require {_format_bytes(host_need)} RAM, "
+                f"above the safe {_format_bytes(safe_ram)} of currently "
+                "available RAM. Lower Resolution or Particles / Cell."
+            )
+    return None
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def remove_shadow_numpy(candidate_dir: Path) -> list[str]:
+    """Remove pip's target-local NumPy while preserving all other packages.
+
+    Blender ships a tested NumPy build.  ``pip --target`` otherwise installs
+    a newer dependency beside CuPy and shadows Blender's copy on restart.
+    Candidate directories are isolated, so only direct NumPy artifacts inside
+    the supplied directory are eligible for removal.
+    """
+    candidate_dir = Path(candidate_dir)
+    if not candidate_dir.is_dir():
+        return []
+    removed = []
+    for child in candidate_dir.iterdir():
+        lower = child.name.lower()
+        if lower not in {"numpy", "numpy.libs"} \
+                and not (lower.startswith("numpy-")
+                         and lower.endswith(".dist-info")):
+            continue
+        if not _is_within(child, candidate_dir):
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+        removed.append(child.name)
+    return removed
+
+
+def _user_modules_dir(create: bool = False) -> Path | None:
+    try:
+        value = bpy.utils.user_resource(
+            "SCRIPTS", path="modules", create=create)
+    except Exception:
+        return None
+    return Path(value) if value else None
+
+
+def _runtime_root(create: bool = False) -> Path | None:
+    modules = _user_modules_dir(create=create)
+    if modules is None:
+        return None
+    root = modules / _RUNTIME_DIRNAME
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _configured_runtime_path() -> Path | None:
+    root = _runtime_root(create=False)
+    if root is None:
+        return None
+    marker = root / _ACTIVE_RUNTIME_FILE
+    try:
+        candidate = Path(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if candidate.is_dir() and _is_within(candidate, root):
+        return candidate
+    return None
+
+
+def _activate_runtime_path(candidate: Path | None) -> None:
+    if candidate is None:
+        return
+    prefixes = ("cupy", "cupyx", "cupy_backends", "cuda_pathfinder")
+    for name in tuple(sys.modules):
+        if any(name == prefix or name.startswith(prefix + ".")
+               for prefix in prefixes):
+            sys.modules.pop(name, None)
+    text = str(candidate)
+    if text not in sys.path:
+        # NumPy is already loaded by addon.handlers before operators.  Put the
+        # isolated runtime first so an obsolete legacy CuPy cannot shadow it.
+        sys.path.insert(0, text)
+    importlib.invalidate_caches()
+
+
+_activate_runtime_path(_configured_runtime_path())
+
+import numpy as np  # noqa: E402 - runtime path must be activated first
+
+from ..stflip import cache  # noqa: E402
+from ..stflip.backend import (  # noqa: E402
+    cuda_device_name,
+    cuda_diagnostics,
+    get_backend,
+)
+from ..stflip.solver import Params, STFLIPSolver  # noqa: E402
+from . import handlers, mesher, voxelize  # noqa: E402
+from .handlers import resolve_cache_dir  # noqa: E402
 
 # The live solver cannot be stored on Blender ID properties; module state it is.
 _BAKE: dict = {}
@@ -20,6 +246,230 @@ _BAKE: dict = {}
 def _fluid_objects(scene, role: str):
     return [o for o in scene.objects
             if o.type == "MESH" and o.stflip.role == role]
+
+
+def _system_available_memory_bytes() -> int | None:
+    """Best-effort available physical RAM without adding a psutil dependency."""
+    try:
+        if sys.platform == "win32":
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("length", ctypes.c_ulong),
+                    ("memory_load", ctypes.c_ulong),
+                    ("total_physical", ctypes.c_ulonglong),
+                    ("available_physical", ctypes.c_ulonglong),
+                    ("total_page_file", ctypes.c_ulonglong),
+                    ("available_page_file", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong),
+                    ("available_virtual", ctypes.c_ulonglong),
+                    ("available_extended_virtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                    ctypes.byref(status)):
+                return int(status.available_physical)
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        return page_size * available_pages
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _cuda_memory_info() -> tuple[int | None, int | None]:
+    try:
+        import cupy
+
+        free, total = cupy.cuda.runtime.memGetInfo()
+        return int(free), int(total)
+    except Exception:
+        return None, None
+
+
+def current_cuda_diagnostics(force: bool = False) -> dict:
+    """Return normalized compute diagnostics including live memory figures."""
+    try:
+        raw = cuda_diagnostics(force=force)
+    except TypeError:  # Compatibility with older backend implementations.
+        raw = cuda_diagnostics()
+    except Exception as exc:
+        raw = (False, f"CUDA diagnostic failed: {type(exc).__name__}: {exc}")
+    result = normalize_cuda_diagnostics(raw)
+    if result["available"]:
+        if not result["device"]:
+            result["device"] = cuda_device_name() or "CUDA device 0"
+        free, total = _cuda_memory_info()
+        result["free_bytes"] = free
+        result["total_bytes"] = total
+    return result
+
+
+def _purge_cuda_imports() -> None:
+    """Forget CuPy modules so a newly selected isolated wheel can be loaded."""
+    prefixes = ("cupy", "cupyx", "cupy_backends", "cuda_pathfinder")
+    for name in tuple(sys.modules):
+        if any(name == prefix or name.startswith(prefix + ".")
+               for prefix in prefixes):
+            sys.modules.pop(name, None)
+    importlib.invalidate_caches()
+
+
+def _safe_remove_runtime_dir(path: Path, root: Path) -> None:
+    if path.is_dir() and path != root and _is_within(path, root):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def cleanup_inactive_cuda_runtimes(active: Path | None = None) -> list[str]:
+    """Remove obsolete isolated CUDA installs while preserving the active one."""
+    root = _runtime_root(create=False)
+    if root is None or not root.is_dir():
+        return []
+    active = active or _configured_runtime_path()
+    active_resolved = active.resolve() if active is not None else None
+    removed = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        installing = child / _INSTALLING_RUNTIME_FILE
+        if installing.is_file():
+            try:
+                age = time.time() - installing.stat().st_mtime
+            except OSError:
+                age = 0.0
+            # Another Blender process may be downloading a multi-gigabyte
+            # runtime into this directory. Only reap abandoned day-old work.
+            if age < _INSTALLING_STALE_SECONDS:
+                continue
+        try:
+            is_active = (active_resolved is not None
+                         and child.resolve() == active_resolved)
+        except OSError:
+            is_active = False
+        if is_active:
+            continue
+        name = child.name
+        _safe_remove_runtime_dir(child, root)
+        if not child.exists():
+            removed.append(name)
+    return removed
+
+
+# On a clean Blender start no old CuPy DLLs are mapped, so this is the safest
+# point to reclaim superseded timestamped runtimes from earlier installations.
+cleanup_inactive_cuda_runtimes()
+
+
+_CUDA_PREFLIGHT_PREFIX = "STFLIP_CUDA_PREFLIGHT="
+_CUDA_PREFLIGHT_SCRIPT = r"""
+import json
+try:
+    import cupy
+    if int(cupy.cuda.runtime.getDeviceCount()) < 1:
+        raise RuntimeError("CUDA reported no devices")
+    values = cupy.asarray([1.0, 2.0, 3.0, 4.0], dtype=cupy.float32)
+    reduced = (values * values + 1.0).sum()
+    target = cupy.zeros((3,), dtype=cupy.float32)
+    indices = cupy.asarray([0, 1, 1, 2], dtype=cupy.int32)
+    updates = cupy.asarray([1.0, 2.0, 3.0, 4.0], dtype=cupy.float32)
+    cupy.add.at(target, indices, updates)
+    cupy.cuda.get_current_stream().synchronize()
+    reduced_host = float(cupy.asnumpy(reduced).item())
+    target_host = cupy.asnumpy(target).tolist()
+    if abs(reduced_host - 34.0) > 1e-5:
+        raise RuntimeError(f"reduction returned {reduced_host}, expected 34")
+    if target_host != [1.0, 5.0, 4.0]:
+        raise RuntimeError(f"scatter returned {target_host}")
+    props = cupy.cuda.runtime.getDeviceProperties(0)
+    name = props.get("name", props.get(b"name", "CUDA device 0"))
+    if isinstance(name, bytes):
+        name = name.decode(errors="replace")
+    free, total = cupy.cuda.runtime.memGetInfo()
+    payload = {"available": True, "device_name": str(name),
+               "free_bytes": int(free), "total_bytes": int(total)}
+except Exception as exc:
+    payload = {"available": False,
+               "error": f"{type(exc).__name__}: {exc}"}
+print("STFLIP_CUDA_PREFLIGHT=" + json.dumps(payload))
+raise SystemExit(0 if payload["available"] else 2)
+"""
+
+
+def _preflight_candidate(candidate_dir: Path) -> dict:
+    env = os.environ.copy()
+    env["CUPY_COMPILE_WITH_PTX"] = "1"
+    current_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (str(candidate_dir) +
+                         (os.pathsep + current_pythonpath
+                          if current_pythonpath else ""))
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _CUDA_PREFLIGHT_SCRIPT],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+    except Exception as exc:
+        return {"available": False,
+                "error": f"preflight process failed: {exc}"}
+    for line in reversed(result.stdout.splitlines()):
+        if line.startswith(_CUDA_PREFLIGHT_PREFIX):
+            try:
+                payload = json.loads(line[len(_CUDA_PREFLIGHT_PREFIX):])
+                return normalize_cuda_diagnostics(payload)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                break
+    detail = (result.stderr or result.stdout or
+              f"preflight exited with code {result.returncode}")
+    return {"available": False, "device": "", "free_bytes": None,
+            "total_bytes": None,
+            "error": " ".join(detail.strip().split())[-800:]}
+
+
+def _write_active_runtime(candidate_dir: Path) -> None:
+    root = _runtime_root(create=True)
+    if root is None or not _is_within(candidate_dir, root):
+        raise RuntimeError("Refusing to activate a CUDA runtime outside "
+                           "Blender's ST-FLIP modules directory")
+    (root / _ACTIVE_RUNTIME_FILE).write_text(
+        str(candidate_dir.resolve()), encoding="utf-8")
+
+
+def _switch_runtime_path(candidate_dir: Path) -> None:
+    root = _runtime_root(create=False)
+    if root is not None:
+        sys.path[:] = [entry for entry in sys.path
+                       if not _is_within(Path(entry), root)]
+    _purge_cuda_imports()
+    _activate_runtime_path(candidate_dir)
+
+
+def _process_failure_detail(result) -> str:
+    detail = result.stderr or result.stdout or (
+        f"pip exited with code {result.returncode}")
+    return " ".join(detail.strip().split())[-800:]
+
+
+def _build_solver(params, backend_name: str):
+    """Construct and synchronize once so lazy CUDA allocation errors surface."""
+    backend = get_backend(backend_name)
+    solver = STFLIPSolver(params, backend)
+    backend.synchronize()
+    return backend, solver
+
+
+def _set_surface_enabled(obj, enabled: bool) -> None:
+    if obj is None:
+        return
+    obj.hide_render = not enabled
+    if hasattr(obj, "hide_viewport"):
+        obj.hide_viewport = not enabled
+    try:
+        obj.hide_set(not enabled)
+    except (AttributeError, RuntimeError):
+        pass
+    modifier = getattr(obj, "modifiers", {}).get("STFLIP Surface")
+    if modifier is not None:
+        modifier.show_viewport = enabled
+        modifier.show_render = enabled
 
 
 class STFLIP_OT_quick_setup(bpy.types.Operator):
@@ -79,30 +529,80 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
         deps = context.evaluated_depsgraph_get()
         dims, dx, origin = voxelize.domain_grid(st.domain, st.resolution)
-
-        st.bake_status = "Voxelizing scene..."
-        solid_sdf = None
-        if obstacles:
-            solid_sdf = voxelize.sdf_from_objects(obstacles, deps, origin, dx, dims)
-
         fps = scene.render.fps / scene.render.fps_base
         gravity = tuple(scene.gravity) if scene.use_gravity else (0.0, 0.0, 0.0)
         params = Params(
             resolution=dims, dx=dx, gravity=gravity,
             frame_dt=1.0 / fps, cfl_target=st.cfl_target,
             particles_per_cell=st.particles_per_cell,
+            seed=st.seed,
             flip_blend=st.flip_blend, st_enabled=st.st_enabled,
             jitter_strength=st.jitter_strength,
             adaptive_gamma=st.adaptive_gamma, eta_phi=st.eta_phi,
         )
-        try:
-            backend = get_backend(st.backend)
-        except Exception as exc:
-            self.report({"WARNING"},
-                        f"GPU backend unavailable ({exc}); using CPU")
-            backend = get_backend("cpu")
 
-        solver = STFLIPSolver(params, backend)
+        cuda_state = ({"available": False, "device": "",
+                       "free_bytes": None, "total_bytes": None, "error": ""}
+                      if st.backend == "cpu" else current_cuda_diagnostics())
+        desired_backend = (
+            "cuda" if st.backend != "cpu" and cuda_state["available"]
+            else "cpu"
+        )
+        if st.backend == "cuda" and not cuda_state["available"]:
+            reason = cuda_state["error"] or "CUDA compute preflight failed"
+            self.report({"WARNING"}, f"{reason}; using CPU")
+
+        estimate = estimate_bake_memory(dims, st.particles_per_cell)
+        ram_available = _system_available_memory_bytes()
+        memory_reason = memory_guard_reason(
+            estimate, desired_backend, ram_available,
+            cuda_state["free_bytes"] if desired_backend == "cuda" else None,
+        )
+        if memory_reason and desired_backend == "cuda":
+            cpu_reason = memory_guard_reason(
+                estimate, "cpu", ram_available, None)
+            if cpu_reason is None:
+                self.report({"WARNING"}, f"{memory_reason} Using CPU instead.")
+                desired_backend = "cpu"
+                memory_reason = None
+            else:
+                memory_reason = f"{memory_reason} {cpu_reason}"
+        if memory_reason:
+            st.bake_status = f"Bake blocked: {memory_reason}"
+            self.report({"ERROR"}, memory_reason)
+            return False
+
+        try:
+            backend, solver = _build_solver(params, desired_backend)
+        except Exception as exc:
+            if desired_backend != "cuda":
+                raise
+            cpu_reason = memory_guard_reason(
+                estimate, "cpu", ram_available, None)
+            if cpu_reason:
+                message = (
+                    f"CUDA solver initialization failed ({exc}), and CPU "
+                    f"fallback is unsafe: {cpu_reason}")
+                st.bake_status = f"Bake blocked: {message}"
+                self.report({"ERROR"}, message)
+                return False
+            self.report({"WARNING"},
+                        f"CUDA solver initialization failed ({exc}); using CPU")
+            backend, solver = _build_solver(params, "cpu")
+
+        cuda_device = None
+        if backend.name == "cuda":
+            cuda_device = (cuda_state["device"] or cuda_device_name()
+                           or "CUDA device 0")
+            backend_label = f"CUDA ({cuda_device})"
+        else:
+            backend_label = "CPU (NumPy)"
+
+        st.bake_status = f"Voxelizing scene for {backend_label}..."
+        solid_sdf = None
+        if obstacles:
+            solid_sdf = voxelize.sdf_from_objects(
+                obstacles, deps, origin, dx, dims)
         if solid_sdf is not None:
             solver.set_solid_sdf(solid_sdf)
 
@@ -112,7 +612,8 @@ class STFLIP_OT_bake(bpy.types.Operator):
             mask = voxelize.mask_from_object(obj, deps, origin, dx, dims)
             if not_solid is not None:
                 mask &= not_solid
-            seeded += solver.add_liquid_mask(mask)
+            seeded += solver.add_liquid_mask(
+                mask, tuple(obj.stflip.initial_velocity))
         for obj in inflows:
             mask = voxelize.mask_from_object(obj, deps, origin, dx, dims)
             if not_solid is not None:
@@ -129,7 +630,43 @@ class STFLIP_OT_bake(bpy.types.Operator):
             "frame_end": scene.frame_end,
             "frame_end_baked": scene.frame_start,
             "dx": dx, "dims": list(dims), "origin": origin.tolist(),
-            "backend": backend.name, "version": 1,
+            "backend_requested": st.backend,
+            "backend": backend.name,
+            "cuda_device": cuda_device,
+            "settings": {
+                "resolution": st.resolution,
+                "grid_dims": list(dims),
+                "target_cfl": st.cfl_target,
+                "particles_per_cell": st.particles_per_cell,
+                "seed": st.seed,
+                "spatiotemporal_sampling": st.st_enabled,
+                "jitter_strength": st.jitter_strength,
+                "adaptive_gamma": st.adaptive_gamma,
+                "eta_phi": st.eta_phi,
+                "flip_fraction": st.flip_blend,
+                "density": params.rho,
+                "local_advection_cfl": params.cfl_local,
+                "pcg_tolerance": params.pcg_tol,
+                "pcg_max_iterations": params.pcg_max_iter,
+                "eps_m": params.eps_m,
+                "eps_rho_relative": params.eps_rho_rel,
+                "gravity": list(gravity),
+                "fps": fps,
+                "create_surface": st.create_surface,
+                "surface_particle_radius_dx": st.particle_radius,
+                "surface_voxel_size_dx": st.surface_voxel,
+            },
+            "liquid_sources": [
+                {"name": obj.name,
+                 "initial_velocity": list(obj.stflip.initial_velocity)}
+                for obj in liquids
+            ],
+            "inflow_sources": [
+                {"name": obj.name,
+                 "velocity": list(obj.stflip.inflow_velocity)}
+                for obj in inflows
+            ],
+            "version": 2,
         }
         cache.write_meta(cache_dir, meta)
 
@@ -137,19 +674,33 @@ class STFLIP_OT_bake(bpy.types.Operator):
         cache.write_frame(cache_dir, scene.frame_start,
                           pos + origin[None, :].astype(np.float32), vel)
 
-        particle_obj = mesher.ensure_particle_object()
+        particle_obj = mesher.ensure_particle_object(
+            existing_obj=st.particle_object)
         st.particle_object = particle_obj
         if st.create_surface:
             st.surface_object = mesher.ensure_surface_object(
-                particle_obj, dx, st.particle_radius, st.surface_voxel)
+                particle_obj, dx, st.particle_radius, st.surface_voxel,
+                existing_obj=st.surface_object)
+            _set_surface_enabled(st.surface_object, True)
+        else:
+            stale_surface = st.surface_object
+            if stale_surface is None:
+                candidate = bpy.data.objects.get(
+                    getattr(mesher, "SURFACE_OBJ", "STFLIP Liquid Surface"))
+                if candidate is not None and candidate.name in scene.objects:
+                    stale_surface = candidate
+                    st.surface_object = candidate
+            _set_surface_enabled(stale_surface, False)
         handlers.ensure_registered()
 
         _BAKE.update(solver=solver, origin=origin.astype(np.float32),
                      cache_dir=cache_dir, meta=meta,
                      frame=scene.frame_start, end=scene.frame_end,
+                     backend_label=backend_label,
                      running=True)
         scene.frame_set(scene.frame_start)
-        st.bake_status = f"Baking: {seeded} particles seeded..."
+        st.bake_status = (
+            f"Baking on {backend_label}: {seeded} particles seeded...")
         return True
 
     def _bake_next_frame(self, scene) -> bool:
@@ -168,7 +719,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
         scene.stflip.bake_status = (
             f"Frame {b['frame']}/{b['end']}  "
             f"({stats.n_particles} pts, {stats.steps} steps, "
-            f"{solver.be.name})")
+            f"{b.get('backend_label', solver.be.name)})")
         scene.frame_set(b["frame"])
         return b["frame"] < b["end"]
 
@@ -198,8 +749,10 @@ class STFLIP_OT_bake(bpy.types.Operator):
         finally:
             _BAKE["running"] = False
             _BAKE.pop("solver", None)
+        backend_label = _BAKE.get("backend_label", "unknown backend")
         context.scene.stflip.bake_status = (
-            f"Bake complete ({_BAKE.get('frame', '?')} frames)")
+            f"Bake complete ({_BAKE.get('frame', '?')} frames) on "
+            f"{backend_label}")
         return {"FINISHED"}
 
     def modal(self, context, event):
@@ -226,8 +779,10 @@ class STFLIP_OT_bake(bpy.types.Operator):
             wm.event_timer_remove(self._timer)
             self._timer = None
         st = context.scene.stflip
+        backend_label = _BAKE.get("backend_label", "unknown backend")
         st.bake_status = ("Bake cancelled" if cancelled
-                          else f"Bake complete ({_BAKE.get('frame', '?')} frames)")
+                          else f"Bake complete ({_BAKE.get('frame', '?')} "
+                               f"frames) on {backend_label}")
         _BAKE["running"] = False
         _BAKE.pop("solver", None)
         return {"CANCELLED"} if cancelled else {"FINISHED"}
@@ -250,41 +805,104 @@ class STFLIP_OT_free_bake(bpy.types.Operator):
 
 
 class STFLIP_OT_install_gpu(bpy.types.Operator):
-    """Install CuPy (NVIDIA CUDA 12.x) into Blender's user modules.
-    Downloads ~100 MB from PyPI; Blender may freeze for a few minutes"""
+    """Install and compute-test a pinned CuPy runtime for this Blender."""
     bl_idname = "stflip.install_gpu"
     bl_label = "Install GPU Support (CUDA)"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        target = bpy.utils.user_resource("SCRIPTS", path="modules", create=True)
-        res = None
-        for package in ("cupy-cuda13x", "cupy-cuda12x"):
-            cmd = [sys.executable, "-m", "pip", "install", "--upgrade",
-                   "--target", target, package]
-            try:
-                res = subprocess.run(cmd, capture_output=True, text=True,
-                                     timeout=1800)
-            except Exception as exc:
-                self.report({"ERROR"}, f"pip failed to run: {exc}")
-                return {"CANCELLED"}
-            if res.returncode == 0:
-                break
-        if res is None or res.returncode != 0:
-            self.report({"ERROR"},
-                        f"pip install failed: {res.stderr[-400:]}")
+        st = context.scene.stflip
+        root = _runtime_root(create=True)
+        if root is None:
+            self.report({"ERROR"}, "Blender user modules directory unavailable")
             return {"CANCELLED"}
-        if target not in sys.path:
-            sys.path.append(target)
-        importlib.invalidate_caches()
-        from . import panels
-        panels.invalidate_gpu_state()
-        if cuda_available():
-            self.report({"INFO"}, "CuPy installed; CUDA GPU detected")
-        else:
-            self.report({"WARNING"},
-                        "CuPy installed but no CUDA device detected")
-        return {"FINISHED"}
+
+        attempts = []
+        for candidate in GPU_INSTALL_CANDIDATES:
+            install_dir = root / (
+                f"{candidate['slug']}-{CUPY_VERSION}-{time.time_ns()}")
+            install_dir.mkdir(parents=True, exist_ok=False)
+            installing_marker = install_dir / _INSTALLING_RUNTIME_FILE
+            installing_marker.write_text(
+                f"pid={os.getpid()}\n", encoding="utf-8")
+            st.bake_status = f"Installing {candidate['label']}..."
+            cmd = [
+                sys.executable, "-m", "pip", "install",
+                "--disable-pip-version-check",
+                "--only-binary=:all:",
+                "--upgrade", "--upgrade-strategy", "only-if-needed",
+                "--target", str(install_dir),
+                candidate["requirement"],
+            ]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=1800)
+            except Exception as exc:
+                attempts.append(
+                    f"{candidate['label']} pip launch failed: {exc}")
+                _safe_remove_runtime_dir(install_dir, root)
+                continue
+            if result.returncode != 0:
+                attempts.append(
+                    f"{candidate['label']} install failed: "
+                    f"{_process_failure_detail(result)}")
+                _safe_remove_runtime_dir(install_dir, root)
+                continue
+
+            # Preserve Blender's own tested NumPy.  The isolated CuPy runtime
+            # can resolve that existing module, while CUDA component wheels
+            # and cuda-pathfinder remain inside this candidate directory.
+            removed_numpy = remove_shadow_numpy(install_dir)
+            importlib.invalidate_caches()
+            preflight = _preflight_candidate(install_dir)
+            if not preflight["available"]:
+                attempts.append(
+                    f"{candidate['label']} compute preflight failed: "
+                    f"{preflight['error'] or 'unknown CUDA error'}")
+                _safe_remove_runtime_dir(install_dir, root)
+                continue
+
+            _write_active_runtime(install_dir)
+            installing_marker.unlink(missing_ok=True)
+            _switch_runtime_path(install_dir)
+            active = current_cuda_diagnostics(force=True)
+            if active["available"]:
+                cleanup_inactive_cuda_runtimes(install_dir)
+            from . import panels
+            panels.invalidate_gpu_state()
+
+            preserved = (f"; preserved Blender NumPy {np.__version__}"
+                         if removed_numpy else "")
+            device = preflight["device"] or "CUDA device 0"
+            if active["available"]:
+                device = active["device"] or device
+                st.bake_status = f"CUDA ready: {device}"
+                self.report(
+                    {"INFO"},
+                    f"Installed {candidate['requirement']}; CUDA compute "
+                    f"passed on {device}{preserved}",
+                )
+            else:
+                # A failed CuPy DLL can remain loaded in a Windows process and
+                # cannot be unloaded safely.  The clean subprocess proved the
+                # selected runtime; the marker activates it on next launch.
+                st.bake_status = "CUDA installed; restart Blender to activate"
+                self.report(
+                    {"WARNING"},
+                    f"Installed {candidate['requirement']} and clean-process "
+                    f"compute passed on {device}, but this Blender still has "
+                    f"stale CUDA modules ({active['error']}). Restart Blender"
+                    f"{preserved}.",
+                )
+            return {"FINISHED"}
+
+        detail = "; ".join(attempts) or "No compatible wheel was attempted"
+        message = (
+            "CUDA support installation failed. Update the NVIDIA driver, "
+            "confirm Internet/PyPI access, then retry. " + detail)
+        st.bake_status = message
+        self.report({"ERROR"}, message[-1800:])
+        return {"CANCELLED"}
 
 
 CLASSES = (

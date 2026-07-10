@@ -27,6 +27,12 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
         name="Inflow Velocity", subtype="VELOCITY", size=3,
         default=(0.0, 0.0, 0.0),
     )
+    initial_velocity: FloatVectorProperty(
+        name="Initial Velocity", subtype="VELOCITY", size=3,
+        default=(0.0, 0.0, 0.0),
+        description="Uniform starting velocity for particles seeded from "
+                    "this liquid volume",
+    )
 
 
 class STFLIPSettings(bpy.types.PropertyGroup):
@@ -37,7 +43,8 @@ class STFLIPSettings(bpy.types.PropertyGroup):
     resolution: IntProperty(
         name="Resolution", default=64, min=8, soft_max=128, max=512,
         description="Grid cells along the longest domain axis. Above ~128 "
-                    "scene voxelization becomes slow (see README)",
+                    "scene voxelization becomes slow; bake setup estimates "
+                    "RAM/VRAM and blocks settings that cannot fit safely",
     )
     cfl_target: FloatProperty(
         name="Target CFL", default=8.0, min=0.5, max=30.0,
@@ -45,7 +52,15 @@ class STFLIPSettings(bpy.types.PropertyGroup):
                     "Standard FLIP uses 1-2; ST-FLIP stays coherent at 8-15+",
     )
     particles_per_cell: IntProperty(
-        name="Particles / Cell", default=8, min=1, max=27,
+        name="Particles / Cell", default=8, min=1, max=64,
+        description="Initial samples per occupied cell. The paper sweeps "
+                    "1-16 against a 50-particle reference; higher values "
+                    "increase RAM/VRAM use",
+    )
+    seed: IntProperty(
+        name="Random Seed", default=0, min=0, max=2_147_483_647,
+        description="Seed for deterministic particle placement and temporal "
+                    "jitter; use the same value for comparable reruns",
     )
     flip_blend: FloatProperty(
         name="FLIP Fraction", default=0.98, min=0.0, max=1.0,
@@ -53,8 +68,9 @@ class STFLIPSettings(bpy.types.PropertyGroup):
     )
     st_enabled: BoolProperty(
         name="Spatiotemporal Sampling", default=True,
-        description="Enable ST-FLIP time-jittered particles. Disable to "
-                    "compare with standard FLIP",
+        description="Enable ST-FLIP temporal weighting and jitter. Disable "
+                    "for an instantaneous-P2G ablation, not a full "
+                    "standard-FLIP/GFM baseline",
     )
     jitter_strength: FloatProperty(
         name="Jitter Strength", default=1.0, min=0.0, max=1.0,
@@ -66,14 +82,17 @@ class STFLIPSettings(bpy.types.PropertyGroup):
     )
     eta_phi: FloatProperty(
         name="Interface Steepness", default=0.5, min=0.1, max=2.0,
-        description="Phase-field steepness eta; smaller = smoother interface",
+        description="Phase-field eta (paper Eq. 13): smaller steepens the "
+                    "transition and levels sampling wells more aggressively; "
+                    "larger preserves more detail but also more noise",
     )
     backend: EnumProperty(
         name="Compute Backend",
         items=[
             ("auto", "Auto", "Use CUDA GPU when available, else CPU"),
             ("cpu", "CPU (NumPy)", "Portable CPU backend"),
-            ("cuda", "GPU (CUDA)", "NVIDIA GPU via CuPy"),
+            ("cuda", "GPU (CUDA)", "NVIDIA GPU via compute-tested CuPy; "
+                                     "falls back to CPU with a warning"),
         ],
         default="auto",
     )
@@ -85,7 +104,7 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         description="Attach a Geometry Nodes points-to-mesh surface",
     )
     particle_radius: FloatProperty(
-        name="Particle Radius", default=0.6, min=0.1, max=2.0,
+        name="Particle Radius", default=0.5, min=0.1, max=2.0,
         description="Surfacing sphere radius in cell widths",
     )
     surface_voxel: FloatProperty(

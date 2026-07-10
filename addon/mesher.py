@@ -11,6 +11,17 @@ import bpy
 GROUP_NAME = "STFLIP_Surface"
 SURFACE_OBJ = "STFLIP Liquid Surface"
 PARTICLE_OBJ = "STFLIP Particles"
+GROUP_SCHEMA_KEY = "stflip_schema_version"
+GROUP_SCHEMA_VERSION = 2
+
+_INTERFACE_SCHEMA = (
+    ("Geometry", "INPUT", "NodeSocketGeometry"),
+    ("Points Object", "INPUT", "NodeSocketObject"),
+    ("Radius", "INPUT", "NodeSocketFloat"),
+    ("Voxel Size", "INPUT", "NodeSocketFloat"),
+    ("Material", "INPUT", "NodeSocketMaterial"),
+    ("Geometry", "OUTPUT", "NodeSocketGeometry"),
+)
 
 
 def _new_socket(ng, name, in_out, socket_type):
@@ -27,19 +38,42 @@ def _set_resolution_mode(node, legacy_value, menu_value):
         node.inputs["Resolution Mode"].default_value = menu_value
 
 
-def build_node_group():
-    ng = bpy.data.node_groups.get(GROUP_NAME)
-    if ng is not None:
-        return ng
-    ng = bpy.data.node_groups.new(GROUP_NAME, "GeometryNodeTree")
+def _is_geometry_group(ng):
+    return getattr(ng, "bl_idname", "") == "GeometryNodeTree"
+
+
+def _schema_version(ng):
+    try:
+        return int(ng.get(GROUP_SCHEMA_KEY, 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _find_current_node_group():
+    """Find the generated group even if Blender had to suffix its name."""
+    named = bpy.data.node_groups.get(GROUP_NAME)
+    if named is not None and _is_geometry_group(named) \
+            and _schema_version(named) == GROUP_SCHEMA_VERSION:
+        return named
+    for candidate in bpy.data.node_groups:
+        if candidate is named or not candidate.name.startswith(GROUP_NAME):
+            continue
+        if _is_geometry_group(candidate) \
+                and _schema_version(candidate) == GROUP_SCHEMA_VERSION:
+            return candidate
+    return None
+
+
+def _populate_node_group(ng):
+    """Populate a newly-created group and stamp it only after it is valid."""
     ng.is_modifier = True
 
-    _new_socket(ng, "Geometry", "INPUT", "NodeSocketGeometry")
-    s_obj = _new_socket(ng, "Points Object", "INPUT", "NodeSocketObject")
-    s_rad = _new_socket(ng, "Radius", "INPUT", "NodeSocketFloat")
-    s_vox = _new_socket(ng, "Voxel Size", "INPUT", "NodeSocketFloat")
-    _new_socket(ng, "Material", "INPUT", "NodeSocketMaterial")
-    _new_socket(ng, "Geometry", "OUTPUT", "NodeSocketGeometry")
+    sockets = {
+        (name, in_out): _new_socket(ng, name, in_out, socket_type)
+        for name, in_out, socket_type in _INTERFACE_SCHEMA
+    }
+    s_rad = sockets[("Radius", "INPUT")]
+    s_vox = sockets[("Voxel Size", "INPUT")]
     s_rad.default_value = 0.05
     s_rad.min_value = 0.0
     s_vox.default_value = 0.04
@@ -85,7 +119,30 @@ def build_node_group():
     ln(smooth.outputs["Geometry"], set_mat.inputs["Geometry"])
     ln(n_in.outputs["Material"], set_mat.inputs["Material"])
     ln(set_mat.outputs["Geometry"], n_out.inputs["Geometry"])
+    ng[GROUP_SCHEMA_KEY] = GROUP_SCHEMA_VERSION
     return ng
+
+
+def build_node_group():
+    """Return the current generated surface group.
+
+    Older files can contain a same-named group built for a different Blender
+    node API.  Such groups have no schema marker.  Leave that datablock intact
+    (so opening/migrating a file is non-destructive) and build a marked local
+    replacement; Blender will give it a numeric suffix when necessary.
+    """
+    ng = _find_current_node_group()
+    if ng is not None:
+        return ng
+
+    ng = bpy.data.node_groups.new(GROUP_NAME, "GeometryNodeTree")
+    try:
+        return _populate_node_group(ng)
+    except Exception:
+        # Do not leave a half-built group that a later call could mistake for a
+        # successful migration.
+        bpy.data.node_groups.remove(ng)
+        raise
 
 
 def ensure_water_material():
@@ -113,16 +170,56 @@ def _socket_identifier(ng, name):
     return None
 
 
+def _bound_scene_object(property_name):
+    scene = getattr(bpy.context, "scene", None)
+    settings = getattr(scene, "stflip", None) if scene is not None else None
+    return getattr(settings, property_name, None) if settings is not None else None
+
+
+def _mesh_output(existing_obj, property_name, fallback_name):
+    """Prefer a scene binding, then a same-scene legacy-named output.
+
+    Blender object datablocks are global. Reusing a canonical name from a
+    different scene would make both scenes write into the same output mesh.
+    """
+    obj = existing_obj
+    if obj is None:
+        obj = _bound_scene_object(property_name)
+    if obj is not None and getattr(obj, "type", None) == "MESH":
+        return obj
+    obj = bpy.data.objects.get(fallback_name)
+    scene = getattr(bpy.context, "scene", None)
+    if (obj is not None and getattr(obj, "type", None) == "MESH"
+            and scene is not None and obj.name in scene.objects):
+        return obj
+    return None
+
+
+def _bind_scene_object(property_name, obj):
+    scene = getattr(bpy.context, "scene", None)
+    settings = getattr(scene, "stflip", None) if scene is not None else None
+    if settings is not None:
+        setattr(settings, property_name, obj)
+
+
+def _link_if_needed(obj):
+    scene = getattr(bpy.context, "scene", None)
+    if scene is not None and obj.name not in scene.objects:
+        scene.collection.objects.link(obj)
+
+
 def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
-                          voxel_factor: float):
+                          voxel_factor: float, existing_obj=None):
     """Create/update the surface object driven by the particle object."""
     ng = build_node_group()
 
-    obj = bpy.data.objects.get(SURFACE_OBJ)
+    obj = _mesh_output(existing_obj, "surface_object", SURFACE_OBJ)
     if obj is None:
         mesh = bpy.data.meshes.new(SURFACE_OBJ)
         obj = bpy.data.objects.new(SURFACE_OBJ, mesh)
         bpy.context.scene.collection.objects.link(obj)
+    else:
+        _link_if_needed(obj)
 
     mod = obj.modifiers.get("STFLIP Surface")
     if mod is None:
@@ -137,13 +234,18 @@ def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
         if ident is not None:
             mod[ident] = value
     obj.update_tag()
+    _bind_scene_object("surface_object", obj)
     return obj
 
 
-def ensure_particle_object():
-    obj = bpy.data.objects.get(PARTICLE_OBJ)
+def ensure_particle_object(existing_obj=None):
+    """Return the scene-bound particle mesh, including after user renames."""
+    obj = _mesh_output(existing_obj, "particle_object", PARTICLE_OBJ)
     if obj is None:
         mesh = bpy.data.meshes.new(PARTICLE_OBJ)
         obj = bpy.data.objects.new(PARTICLE_OBJ, mesh)
         bpy.context.scene.collection.objects.link(obj)
+    else:
+        _link_if_needed(obj)
+    _bind_scene_object("particle_object", obj)
     return obj

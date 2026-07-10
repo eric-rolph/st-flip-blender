@@ -2,7 +2,7 @@
 
 import bpy
 
-from ..stflip.backend import cuda_available, cuda_device_name
+from .operators import current_cuda_diagnostics
 
 # Checking CUDA means importing CuPy; doing that inside draw() would stall
 # the UI (first import takes seconds) and re-run per redraw. Cache it.
@@ -12,7 +12,7 @@ _GPU_STATE = None
 def gpu_state():
     global _GPU_STATE
     if _GPU_STATE is None:
-        _GPU_STATE = (cuda_available(), cuda_device_name())
+        _GPU_STATE = current_cuda_diagnostics()
     return _GPU_STATE
 
 
@@ -60,7 +60,9 @@ class STFLIP_PT_object(bpy.types.Panel):
             layout.label(text="Select a mesh object")
             return
         layout.prop(obj.stflip, "role", text="Role")
-        if obj.stflip.role == "INFLOW":
+        if obj.stflip.role == "LIQUID":
+            layout.prop(obj.stflip, "initial_velocity")
+        elif obj.stflip.role == "INFLOW":
             layout.prop(obj.stflip, "inflow_velocity")
 
 
@@ -83,14 +85,26 @@ class STFLIP_PT_solver(bpy.types.Panel):
         sub.prop(st, "adaptive_gamma")
         sub.prop(st, "eta_phi")
         layout.prop(st, "flip_blend")
+        layout.prop(st, "seed")
 
         layout.separator()
         layout.prop(st, "backend")
-        available, device = gpu_state()
-        if available:
-            layout.label(text=f"GPU: {device}", icon="CHECKMARK")
+        state = gpu_state()
+        if state["available"]:
+            layout.label(text=f"GPU: {state['device']}", icon="CHECKMARK")
+            if state["free_bytes"] and state["total_bytes"]:
+                gib = 1024 ** 3
+                layout.label(
+                    text=(f"VRAM: {state['free_bytes'] / gib:.1f} / "
+                          f"{state['total_bytes'] / gib:.1f} GiB free"),
+                )
         else:
-            layout.label(text="No CUDA GPU / CuPy not installed", icon="INFO")
+            layout.label(text="CUDA compute unavailable", icon="INFO")
+            if state["error"]:
+                detail = " ".join(state["error"].split())
+                if len(detail) > 90:
+                    detail = detail[:87] + "..."
+                layout.label(text=detail, icon="ERROR")
             layout.operator("stflip.install_gpu", icon="IMPORT")
         layout.prop(st, "cache_dir")
 

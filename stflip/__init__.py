@@ -4,10 +4,16 @@ Implementation of "Spatiotemporal FLIP for Fast Free-Surface and Two-Phase
 Simulation With Very Large Time Steps", Braun et al., ACM TOG 45(4), 2026.
 """
 
-from .backend import Backend, cuda_available, cuda_device_name, get_backend
+from .backend import (
+    Backend,
+    cuda_available,
+    cuda_device_name,
+    cuda_diagnostics,
+    get_backend,
+)
 from .solver import FrameStats, Params, STFLIPSolver
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Backend",
@@ -16,6 +22,7 @@ __all__ = [
     "STFLIPSolver",
     "cuda_available",
     "cuda_device_name",
+    "cuda_diagnostics",
     "get_backend",
     "__version__",
 ]

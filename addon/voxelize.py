@@ -32,20 +32,45 @@ def _cell_range(obj, origin, dx, dims, pad=1):
     return lo_i, hi_i
 
 
-def _bvh_and_transform(obj, depsgraph):
-    bvh = BVHTree.FromObject(obj, depsgraph)
-    # inverted_safe: plain inverted() raises on zero-scale (flattened) objects.
-    inv = obj.matrix_world.inverted_safe()
-    # Average scale factor to convert local distances back to world units.
-    scale = obj.matrix_world.to_scale()
-    s = (abs(scale[0]) + abs(scale[1]) + abs(scale[2])) / 3.0
-    return bvh, inv, max(s, 1e-9)
+def _world_bvh(obj, depsgraph):
+    """Build an evaluated BVH whose coordinates and distances are world-space.
+
+    A local-space nearest point cannot be converted to an exact world-space
+    distance with one scale factor when an object is scaled non-uniformly.  By
+    transforming the evaluated vertices first, BVH nearest-point queries use
+    the correct anisotropic metric and naturally retain rotation support.
+
+    ``orientation`` corrects polygon normals for reflection transforms (an odd
+    number of negative scale axes), whose transformed winding is reversed.
+    """
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        matrix = evaluated.matrix_world.copy()
+        vertices = [matrix @ vertex.co for vertex in mesh.vertices]
+        polygons = [tuple(poly.vertices) for poly in mesh.polygons]
+        if not vertices or not polygons:
+            return None, 1.0
+        bvh = BVHTree.FromPolygons(vertices, polygons, all_triangles=False)
+        determinant = matrix.to_3x3().determinant()
+        orientation = -1.0 if determinant < 0.0 else 1.0
+        return bvh, orientation
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def _signed_distance(point, location, normal, distance, orientation):
+    if (point - location).dot(normal) * orientation < 0.0:
+        return -distance
+    return distance
 
 
 def mask_from_object(obj, depsgraph, origin, dx, dims) -> np.ndarray:
     """Boolean cell mask: cell centres inside the (closed) mesh."""
     mask = np.zeros(dims, dtype=bool)
-    bvh, inv, _s = _bvh_and_transform(obj, depsgraph)
+    bvh, orientation = _world_bvh(obj, depsgraph)
+    if bvh is None:
+        return mask
     lo, hi = _cell_range(obj, origin, dx, dims)
     for i in range(lo[0], hi[0]):
         for j in range(lo[1], hi[1]):
@@ -53,11 +78,11 @@ def mask_from_object(obj, depsgraph, origin, dx, dims) -> np.ndarray:
                 wp = Vector((origin[0] + (i + 0.5) * dx,
                              origin[1] + (j + 0.5) * dx,
                              origin[2] + (k + 0.5) * dx))
-                lp = inv @ wp
-                loc, normal, _idx, _d = bvh.find_nearest(lp)
+                loc, normal, _idx, distance = bvh.find_nearest(wp)
                 if loc is None:
                     continue
-                if (lp - loc).dot(normal) < 0.0:
+                if _signed_distance(
+                        wp, loc, normal, distance, orientation) < 0.0:
                     mask[i, j, k] = True
     return mask
 
@@ -67,7 +92,9 @@ def sdf_from_objects(objects, depsgraph, origin, dx, dims) -> np.ndarray:
     (positive outside).  Cells far from every obstacle stay at +big."""
     sdf = np.full(dims, 1e9, dtype=np.float32)
     for obj in objects:
-        bvh, inv, s = _bvh_and_transform(obj, depsgraph)
+        bvh, orientation = _world_bvh(obj, depsgraph)
+        if bvh is None:
+            continue
         # Distance field is only accurate near the obstacle; pad generously.
         lo, hi = _cell_range(obj, origin, dx, dims, pad=4)
         for i in range(lo[0], hi[0]):
@@ -76,13 +103,11 @@ def sdf_from_objects(objects, depsgraph, origin, dx, dims) -> np.ndarray:
                     wp = Vector((origin[0] + (i + 0.5) * dx,
                                  origin[1] + (j + 0.5) * dx,
                                  origin[2] + (k + 0.5) * dx))
-                    lp = inv @ wp
-                    loc, normal, _idx, dist = bvh.find_nearest(lp)
+                    loc, normal, _idx, dist = bvh.find_nearest(wp)
                     if loc is None:
                         continue
-                    d = dist * s
-                    if (lp - loc).dot(normal) < 0.0:
-                        d = -d
+                    d = _signed_distance(
+                        wp, loc, normal, dist, orientation)
                     if d < sdf[i, j, k]:
                         sdf[i, j, k] = d
     return sdf

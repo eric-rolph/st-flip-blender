@@ -21,31 +21,50 @@ double as a phase field that replaces per-step surface reconstruction. The
 result: time steps **up to an order of magnitude larger** (CFL 8–15+) with
 coherent, detailed flow.
 
-Measured on a 64³ dam break (344k particles, 8 frames @ 24 fps):
+Measured on a 64³ dam break (344k particles, 8 frames at 24 fps) with
+Blender 5.1's Python on Windows 11, Ryzen 7 9800X3D, and RTX 5090. Times
+include solver stepping and render-particle re-synchronization:
 
 | Configuration                  | s / frame | vs. baseline |
 |--------------------------------|-----------|--------------|
-| Plain FLIP, CFL 1, CPU         | 17.8      | 1×           |
-| ST-FLIP, CFL 8, CPU            | 11.4      | 1.6×         |
-| ST-FLIP, CFL 8, RTX 5090       | 0.68      | **26×**      |
-| ST-FLIP, CFL 15, RTX 5090      | 0.53      | 33×          |
+| Instantaneous P2G, CFL 1, CPU  | 5.43      | 1×           |
+| ST-FLIP, CFL 8, CPU            | 4.57      | 1.2×         |
+| ST-FLIP, CFL 8, RTX 5090       | 0.53      | **10.2×**    |
+| ST-FLIP, CFL 15, RTX 5090      | 0.52      | 10.5×        |
+
+The timing baseline disables temporal weighting and jitter but retains this
+add-on's phase-field projection. It is an ablation control, not the paper's
+standard-FLIP/GFM reference solver.
 
 ## Install
 
-1. Download this repository as a ZIP (or `git clone` and zip the folder).
-2. Blender → *Edit → Preferences → Get Extensions → Install from Disk…*
-   (or *Add-ons → Install…* on 4.1) and pick the ZIP.
+1. Download a release ZIP, or build a clean extension archive from a clone:
+
+   ```bash
+   python tools/build_extension.py
+   ```
+
+   The archive is written to `dist/st_flip-<version>.zip`. Do not install a
+   GitHub source ZIP directly: its extra top-level folder and development files
+   are not a valid Blender extension package layout.
+2. Blender → *Edit → Preferences → Get Extensions → Install from Disk…* and
+   pick the ZIP.
 3. Enable **ST-FLIP Fluid**. Requires Blender **4.2+** (tested on 5.1).
 
 ### GPU acceleration (optional, recommended)
 
-*ST-FLIP panel → Solver → Install GPU Support (CUDA)* pip-installs CuPy into
-Blender's user modules (~100 MB download). Needs an NVIDIA GPU with a
-CUDA 12/13 driver. Blackwell GPUs (RTX 50xx) are supported via PTX JIT.
+*ST-FLIP panel → Solver → Install GPU Support (CUDA)* installs a pinned CuPy
+runtime into an isolated Blender user-module directory, then runs allocation,
+kernel, reduction, scatter, and synchronization checks before enabling it.
+The preferred CUDA 13 bundle is roughly a 1.1 GB download / 1.5 GB installed;
+it does not require a separately installed CUDA toolkit. A CUDA 12 wheel is
+tried only if the compute preflight fails. Needs a current NVIDIA driver.
+Blackwell GPUs (RTX 50xx) are supported via PTX JIT.
 
-AMD GPUs: CuPy's ROCm builds work on Linux (`pip install cupy-rocm-5-0` into
-Blender's Python, untested); on Windows the CPU backend is used. A
-vendor-neutral wgpu backend is on the roadmap.
+AMD GPU acceleration is not integrated. CuPy's ROCm support is experimental
+on Linux and recent CuPy versions do not publish official ROCm wheels; the
+add-on therefore uses its CPU backend unless the user supplies a compatible
+custom build. A vendor-neutral wgpu backend is on the roadmap.
 
 ## Use
 
@@ -73,11 +92,62 @@ settings.
 
 | Setting | Paper ref | Meaning |
 |---|---|---|
-| Spatiotemporal Sampling | §3 | Disable to compare with standard FLIP |
-| Jitter Strength (γ) | Eq. 10 | Temporal jitter amplitude, 1 = full slab |
+| Target CFL | Algorithm 1, §4 | Global step target from 0.5–30; paper examples use values through 30 |
+| Particles / Cell | §4.5 | Initial samples per occupied cell, 1–64; paper sweeps 1–16 against a 50-particle reference |
+| Spatiotemporal Sampling | §3 | Disable temporal weighting and jitter for an instantaneous-P2G ablation; this is not a full standard-FLIP/GFM baseline |
+| Jitter Strength (γ) | Eq. 10 | Base temporal jitter amplitude; 1 permits full-slab jitter before adaptive attenuation |
 | Adaptive Attenuation | §3.10 | Less jitter noise on calm surfaces |
-| Interface Steepness (η) | Eq. 13 | Lower = smoother phase interface |
+| Interface Steepness (η) | Eq. 13 | Lower = steeper/stronger leveling; higher = finer detail/noise |
 | FLIP Fraction | §4 | FLIP/PIC blend (default 0.98) |
+| Random Seed | §3.5 | Reproducible particle placement and temporal jitter |
+| Initial / Inflow Velocity | §4.8 | Uniform velocity per liquid or inflow mesh; general spatial fields are not supported |
+
+### Paper coverage
+
+Version 0.2 implements the paper's **single-phase, free-surface ST-FLIP
+core**; it is not a full reproduction of every solver variant and production
+example in the paper.
+
+| Paper capability | Status in this add-on |
+|---|---|
+| One-sided temporal kernel, slab P2G, residual jitter, phase field, variable-coefficient projection | Implemented |
+| Large target CFL and instantaneous-P2G temporal ablation | Implemented; target CFL 0.5–30 |
+| Reproducible manual reruns over particle count, `γ`, `η`, and FLIP/PIC blend | Controls implemented; no automated sweep or paper-metric pipeline |
+| Single-phase liquid scenes with static mesh obstacles and inflows | Implemented |
+| Fractional solid face apertures from Eq. 14–16 | Partial; obstacle faces use binary open/closed masks |
+| Paper render reconstruction (`0.5Δx` spheres, 2× grid, MCF) | Partial; radius/voxel defaults match the first two values, but Geometry Nodes replaces MCF |
+| Two-phase liquid/gas coupling | Not implemented |
+| APIC and implicit-density-projection comparison solvers | Not implemented |
+| Surface-tension examples | Not implemented |
+| Sparse/adaptive grids and billion-particle production scale | Not implemented |
+| Appendix B mean-curvature-flow output reconstruction | Not implemented; Geometry Nodes volume meshing is an approximation |
+| Animated/deforming obstacle boundary conditions | Not implemented |
+
+Experiment-level coverage is narrower than method-level coverage:
+
+| Paper experiment | Reproduction level |
+|---|---|
+| Laminar/standard dam breaks over large CFL values | Partial: qualitative dam-break setup and CFL control, without the paper's GFM/APIC baselines, exact presets, or volume/energy metrics |
+| Static-obstacle wake and thin-obstacle inflow jet | Partial: static obstacles and inflows are supported, but solid apertures are binary |
+| Particle-count and FLIP-blend studies | Controls and deterministic seed are available; RMSE, enstrophy, and batch-sweep tooling are not |
+| Kleefsman obstacle validation | Missing water-height gauges and experimental-data comparison |
+| MCF reconstruction study | Missing MCF and normal-RMSE evaluation |
+| Whirlpool, rotational fields, and outflow scenes | Missing general spatial velocity fields and outflow boundaries |
+| Two-phase glugging/discharge and production-scale scenes | Missing two-phase solver and sparse production grid |
+
+The Blender UI exposes these inputs for the implemented single-phase solver:
+resolution, target CFL, particles/cell, `γ`, adaptive attenuation, `η`,
+FLIP/PIC blend, seed, backend, gravity, frame rate/range, inflow velocity, and
+per-liquid initial velocity, plus surface display radius/voxel size. Every
+bake records these settings in its cache metadata. The solver's Python
+`Params` API additionally exposes liquid density, pressure tolerance/iteration
+limit, local advection CFL, the under-sampling threshold, and the relative
+density floor. Paper-stated defaults include `γ = 1`, `ηφ = 0.5`,
+`αFLIP = 0.98`, local CFL `= 1`, and PPE tolerance `= 1e-4`; the add-on also
+uses `ρ = 1000` and a 400-iteration PCG limit. The paper's `kψ = 30` belongs
+to the unimplemented MCF reconstruction. Controls for gas properties, surface
+tension, APIC, sparse-grid adaptivity, and MCF reconstruction do not exist
+because the corresponding algorithms are not implemented.
 
 ## What's implemented
 
@@ -85,7 +155,7 @@ settings.
   one-sided temporal kernel (Eq. 19)
 - 4D→3D slab-integrated P2G with weight-accumulator phase field (Eq. 8–13)
 - Variational variable-coefficient pressure projection, matrix-free
-  Jacobi-PCG (Eq. 14–16)
+  Jacobi-PCG (Eq. 14–16), with binary rather than fractional solid apertures
 - Temporal jitter with residual carryover and the Appendix A boundedness
   guarantee (tested), adaptive γ attenuation
 - Globally adaptive time stepping with even frame subdivision, sub-stepped
@@ -96,7 +166,8 @@ settings.
 
 Not (yet) implemented from the paper: two-phase air–liquid coupling, surface
 tension (CSF), APIC transfers, sparse/adaptive grids, mean-curvature-flow
-surface smoothing (Appendix B — the Geometry Nodes volume meshing stands in).
+surface smoothing (Appendix B — the Geometry Nodes volume meshing stands in),
+and the paper's standard-FLIP/GFM and implicit-density-projection baselines.
 
 Known limitations: scene voxelization (mesh → grid masks/SDF) is a pure
 Python BVH loop and gets slow above resolution ~128 — vectorizing it is on
@@ -118,7 +189,7 @@ blender -b scene.blend --python-expr "import bpy; bpy.ops.stflip.bake()"
 # CPU tests
 uv run --no-project --with pytest --with numpy pytest tests -v
 # GPU parity test (NVIDIA GPU required)
-uv run --no-project --with pytest --with numpy --with cupy-cuda13x pytest tests -m gpu -v
+uv run --no-project --with pytest --with numpy --with "cupy-cuda13x[ctk]==14.1.1" pytest tests -m gpu -v
 ```
 
 The solver (`stflip/`) is bpy-free and usable standalone:

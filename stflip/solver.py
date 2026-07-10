@@ -49,7 +49,10 @@ class Params:
     cfl_target: float = 8.0
     particles_per_cell: int = 8
     flip_blend: float = 0.98          # alpha_FLIP
-    st_enabled: bool = True           # False -> plain FLIP (gamma = 0, W_T = const)
+    # False is an instantaneous-P2G temporal ablation. It is not a complete
+    # standard-FLIP/GFM implementation because the spatial phase projection
+    # remains active.
+    st_enabled: bool = True
     jitter_strength: float = 1.0      # base gamma
     adaptive_gamma: bool = True       # attenuate jitter in calm regions (Sec 3.10)
     eta_phi: float = 0.5              # phase-transition steepness
@@ -58,7 +61,6 @@ class Params:
     pcg_tol: float = 1e-4
     pcg_max_iter: int = 400
     cfl_local: float = 1.0            # advection sub-step bound
-    max_substeps: int = 40
     seed: int = 0
 
 
@@ -230,11 +232,12 @@ class STFLIPSolver:
             valid = m > p.eps_m
             grids[g] = xp.where(valid, grids[g + "_p"] / xp.maximum(m, p.eps_m), 0.0)
             grids[g + "_valid"] = valid
-            # Space-time phase field from the weight accumulators (Eq. 13).
+            # Space-time phase field from the weight accumulators (Eq. 13):
+            # phi = C(m / (eta_phi * m0)), C(x) = min(sqrt(x), 1).
             grids[g + "_phi"] = xp.minimum(
-                xp.sqrt((m / self.m0) ** p.eta_phi), 1.0)
+                xp.sqrt(m / (p.eta_phi * self.m0)), 1.0)
         grids["c_phi"] = xp.minimum(
-            xp.sqrt((grids["c_m"] / self.m0) ** p.eta_phi), 1.0)
+            xp.sqrt(grids["c_m"] / (p.eta_phi * self.m0)), 1.0)
         return grids
 
     # ------------------------------------------------------------- grid utils
@@ -266,12 +269,18 @@ class STFLIPSolver:
             uf = u * vf
             s = xp.zeros_like(u)
             c = xp.zeros_like(u)
-            s[:-1] += uf[1:];       c[:-1] += vf[1:]
-            s[1:] += uf[:-1];       c[1:] += vf[:-1]
-            s[:, :-1] += uf[:, 1:]; c[:, :-1] += vf[:, 1:]
-            s[:, 1:] += uf[:, :-1]; c[:, 1:] += vf[:, :-1]
-            s[:, :, :-1] += uf[:, :, 1:]; c[:, :, :-1] += vf[:, :, 1:]
-            s[:, :, 1:] += uf[:, :, :-1]; c[:, :, 1:] += vf[:, :, :-1]
+            s[:-1] += uf[1:]
+            c[:-1] += vf[1:]
+            s[1:] += uf[:-1]
+            c[1:] += vf[:-1]
+            s[:, :-1] += uf[:, 1:]
+            c[:, :-1] += vf[:, 1:]
+            s[:, 1:] += uf[:, :-1]
+            c[:, 1:] += vf[:, :-1]
+            s[:, :, :-1] += uf[:, :, 1:]
+            c[:, :, :-1] += vf[:, :, 1:]
+            s[:, :, 1:] += uf[:, :, :-1]
+            c[:, :, 1:] += vf[:, :, :-1]
             newly = (~valid) & (c > 0)
             u = xp.where(newly, s / xp.maximum(c, 1.0), u)
             valid = valid | newly
@@ -352,7 +361,9 @@ class STFLIPSolver:
         speed = _norm_rows(xp, self.vel) if self.vel.shape[0] else dt_act * 0
         nsub = xp.ceil(
             speed * xp.abs(dt_act) / (p.dx * p.cfl_local)).astype(xp.int32)
-        nsub = xp.clip(nsub, 1, p.max_substeps)
+        # Never cap this count: a global cap can violate the documented local
+        # CFL bound when large global CFL targets and temporal jitter combine.
+        nsub = xp.maximum(nsub, 1)
         h = dt_act / nsub.astype(xp.float32)
         max_n = int(nsub.max()) if nsub.size else 0
         for s in range(max_n):
