@@ -26,6 +26,17 @@ class Backend:
 
     def __init__(self, name: str):
         if name == "cuda":
+            import sys
+            if ("cupy" in sys.modules
+                    and os.environ.get("CUPY_COMPILE_WITH_PTX") != "1"):
+                import warnings
+
+                warnings.warn(
+                    "cupy was imported before stflip, so "
+                    "CUPY_COMPILE_WITH_PTX=1 could not take effect; on very "
+                    "new GPU architectures kernel compilation may fail with "
+                    "CUDA_ERROR_NO_BINARY_FOR_GPU. Set the variable before "
+                    "importing cupy.")
             import cupy  # noqa: F811 - optional dependency
             import cupyx
 

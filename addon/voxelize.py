@@ -34,7 +34,8 @@ def _cell_range(obj, origin, dx, dims, pad=1):
 
 def _bvh_and_transform(obj, depsgraph):
     bvh = BVHTree.FromObject(obj, depsgraph)
-    inv = obj.matrix_world.inverted()
+    # inverted_safe: plain inverted() raises on zero-scale (flattened) objects.
+    inv = obj.matrix_world.inverted_safe()
     # Average scale factor to convert local distances back to world units.
     scale = obj.matrix_world.to_scale()
     s = (abs(scale[0]) + abs(scale[1]) + abs(scale[2])) / 3.0

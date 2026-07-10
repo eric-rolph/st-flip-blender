@@ -52,14 +52,17 @@ def diagonal(xp, kx, ky, kz, liquid):
     return diag * liquid
 
 
-def _dot(xp, a, b) -> float:
-    """Plain reduction dot product (avoids cuBLAS, which CuPy's Windows
-    wheels do not bundle)."""
-    return float((a * b).sum())
+def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400,
+          check_every=8):
+    """Jacobi-preconditioned CG.  Returns (p, iterations, rel_residual).
 
-
-def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400):
-    """Jacobi-preconditioned CG.  Returns (p, iterations, rel_residual)."""
+    All scalars (sigma, alpha, beta) stay as 0-d device arrays: converting
+    them to Python floats every iteration would force a blocking GPU sync
+    three times per iteration and make the solve latency-bound.  Only the
+    convergence check transfers to host, every `check_every` iterations.
+    Plain reductions are used throughout (no cupy.linalg/cuBLAS, which the
+    CuPy Windows wheels do not bundle).
+    """
     import math
 
     diag = diagonal(xp, kx, ky, kz, liquid)
@@ -70,31 +73,33 @@ def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400):
 
     p = xp.zeros_like(rhs)
     r = rhs.copy()
-    b_norm = math.sqrt(_dot(xp, r, r))
+    b_norm = math.sqrt(float((r * r).sum()))
     if b_norm < 1e-30:
         return p, 0, 0.0
 
     z = inv_diag * r
     s = z.copy()
-    sigma = _dot(xp, z, r)
+    sigma = (z * r).sum()  # 0-d device scalar
 
     rel = 1.0
     it = 0
     for it in range(1, max_iter + 1):
         As = apply_laplacian(xp, s, kx, ky, kz, solvable)
-        sAs = _dot(xp, s, As)
-        if abs(sAs) < 1e-30:
-            break
-        alpha = sigma / sAs
+        sAs = (s * As).sum()
+        # Guard breakdown (sAs ~ 0 at exact convergence) without a sync.
+        ok = xp.abs(sAs) > 1e-30
+        alpha = xp.where(ok, sigma / xp.where(ok, sAs, 1.0), 0.0)
         p = p + alpha * s
         r = r - alpha * As
-        rel = math.sqrt(_dot(xp, r, r)) / b_norm
-        if rel <= tol:
-            break
         z = inv_diag * r
-        sigma_new = _dot(xp, z, r)
-        beta = sigma_new / sigma
+        sigma_new = (z * r).sum()
+        ok = xp.abs(sigma) > 1e-30
+        beta = xp.where(ok, sigma_new / xp.where(ok, sigma, 1.0), 0.0)
         sigma = sigma_new
         s = z + beta * s
+        if it % check_every == 0 or it == max_iter:
+            rel = math.sqrt(float((r * r).sum())) / b_norm
+            if rel <= tol or not math.isfinite(rel):
+                break
 
     return p * solvable, it, rel

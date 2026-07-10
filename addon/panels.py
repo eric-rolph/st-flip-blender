@@ -4,6 +4,22 @@ import bpy
 
 from ..stflip.backend import cuda_available, cuda_device_name
 
+# Checking CUDA means importing CuPy; doing that inside draw() would stall
+# the UI (first import takes seconds) and re-run per redraw. Cache it.
+_GPU_STATE = None
+
+
+def gpu_state():
+    global _GPU_STATE
+    if _GPU_STATE is None:
+        _GPU_STATE = (cuda_available(), cuda_device_name())
+    return _GPU_STATE
+
+
+def invalidate_gpu_state():
+    global _GPU_STATE
+    _GPU_STATE = None
+
 
 class STFLIP_PT_main(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
@@ -70,8 +86,9 @@ class STFLIP_PT_solver(bpy.types.Panel):
 
         layout.separator()
         layout.prop(st, "backend")
-        if cuda_available():
-            layout.label(text=f"GPU: {cuda_device_name()}", icon="CHECKMARK")
+        available, device = gpu_state()
+        if available:
+            layout.label(text=f"GPU: {device}", icon="CHECKMARK")
         else:
             layout.label(text="No CUDA GPU / CuPy not installed", icon="INFO")
             layout.operator("stflip.install_gpu", icon="IMPORT")

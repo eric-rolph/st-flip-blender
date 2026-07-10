@@ -33,7 +33,11 @@ def _apply_frame(scene, frame: int) -> bool:
         return False
     pos, vel = data
 
-    obj = bpy.data.objects.get(mesher.PARTICLE_OBJ)
+    # Prefer the pointer binding (survives renames); name lookup is the
+    # fallback for legacy files.
+    obj = scene.stflip.particle_object
+    if obj is None:
+        obj = bpy.data.objects.get(mesher.PARTICLE_OBJ)
     if obj is None or obj.type != "MESH":
         return False
     me = obj.data

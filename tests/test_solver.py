@@ -106,6 +106,37 @@ def test_solid_obstacle_blocks_particles():
     assert inside.mean() < 0.02  # essentially no particles deep in the solid
 
 
+def test_no_energy_kick_for_zero_temporal_weight_particles():
+    """Regression: an isolated particle whose time sample lands in the
+    temporal kernel's zero tail deposits ~no mass, invalidating its own
+    faces.  The FLIP delta must then be formed against the extrapolated old
+    field (not hard zeros), or the particle receives its neighbours' full
+    velocity as a spurious energy kick (~1.98x speed in one step)."""
+    n = 16
+    p = Params(resolution=(n, n, n), dx=1.0 / n, gravity=(0.0, 0.0, 0.0),
+               frame_dt=1.0 / 24.0, cfl_target=8.0, seed=2)
+    s = STFLIPSolver(p, "cpu")
+    xp = s.be.xp
+    mask = np.zeros((n, n, n), dtype=bool)
+    mask[4:8, 6:10, 6:10] = True
+    s.add_liquid_mask(mask, velocity=(1.0, 0.0, 0.0))
+    # Isolated particle 3 cells from the block, same velocity, with a time
+    # residual that puts theta at the very edge of the slab (W_T ~ 0).
+    s.pos = xp.concatenate(
+        [s.pos, xp.asarray([[11.5 / n, 8.0 / n, 8.0 / n]], dtype=xp.float32)])
+    s.vel = xp.concatenate(
+        [s.vel, xp.asarray([[1.0, 0.0, 0.0]], dtype=xp.float32)])
+    dt = p.frame_dt / 4.0
+    s._dt_prev = dt
+    s.dt_resid = xp.concatenate(
+        [s.dt_resid, xp.asarray([0.49995 * dt], dtype=xp.float32)])
+
+    from stflip.solver import FrameStats
+    s._step(dt, FrameStats())
+    speed = float(np.linalg.norm(s.be.to_numpy(s.vel)[-1]))
+    assert speed < 1.3, f"isolated particle gained energy: |v| = {speed:.3f}"
+
+
 @pytest.mark.gpu
 def test_gpu_backend_parity():
     cupy = pytest.importorskip("cupy")

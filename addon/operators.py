@@ -58,22 +58,24 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
     _timer = None
 
-    def invoke(self, context, event):
+    def _setup(self, context) -> bool:
+        """Voxelize the scene, build the solver, write the first frame.
+        Returns False (after self.report) if the bake cannot start."""
         scene = context.scene
         st = scene.stflip
         if _BAKE.get("running"):
             self.report({"WARNING"}, "A bake is already running")
-            return {"CANCELLED"}
+            return False
         if st.domain is None:
             self.report({"ERROR"}, "Set a domain object first")
-            return {"CANCELLED"}
+            return False
 
         liquids = _fluid_objects(scene, "LIQUID")
         inflows = _fluid_objects(scene, "INFLOW")
         obstacles = _fluid_objects(scene, "OBSTACLE")
         if not liquids and not inflows:
             self.report({"ERROR"}, "Mark at least one mesh as Liquid or Inflow")
-            return {"CANCELLED"}
+            return False
 
         deps = context.evaluated_depsgraph_get()
         dims, dx, origin = voxelize.domain_grid(st.domain, st.resolution)
@@ -118,7 +120,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
             solver.add_inflow(mask, tuple(obj.stflip.inflow_velocity))
         if seeded == 0 and not inflows:
             self.report({"ERROR"}, "No liquid cells inside the domain")
-            return {"CANCELLED"}
+            return False
 
         cache_dir = resolve_cache_dir(scene)
         cache.clear(cache_dir)
@@ -136,8 +138,9 @@ class STFLIP_OT_bake(bpy.types.Operator):
                           pos + origin[None, :].astype(np.float32), vel)
 
         particle_obj = mesher.ensure_particle_object()
+        st.particle_object = particle_obj
         if st.create_surface:
-            mesher.ensure_surface_object(
+            st.surface_object = mesher.ensure_surface_object(
                 particle_obj, dx, st.particle_radius, st.surface_voxel)
         handlers.ensure_registered()
 
@@ -145,28 +148,15 @@ class STFLIP_OT_bake(bpy.types.Operator):
                      cache_dir=cache_dir, meta=meta,
                      frame=scene.frame_start, end=scene.frame_end,
                      running=True)
-
         scene.frame_set(scene.frame_start)
-        st.bake_status = f"Baked {seeded} particles seeded..."
-        wm = context.window_manager
-        self._timer = wm.event_timer_add(0.01, window=context.window)
-        wm.modal_handler_add(self)
-        return {"RUNNING_MODAL"}
+        st.bake_status = f"Baking: {seeded} particles seeded..."
+        return True
 
-    def modal(self, context, event):
-        scene = context.scene
-        st = scene.stflip
-        if event.type == "ESC":
-            return self._finish(context, cancelled=True)
-        if event.type != "TIMER":
-            return {"PASS_THROUGH"}
-
+    def _bake_next_frame(self, scene) -> bool:
+        """Advance one frame; returns True while frames remain."""
         b = _BAKE
-        if not b.get("running"):
-            return self._finish(context, cancelled=True)
         if b["frame"] >= b["end"]:
-            return self._finish(context, cancelled=False)
-
+            return False
         solver: STFLIPSolver = b["solver"]
         stats = solver.step_frame()
         b["frame"] += 1
@@ -175,12 +165,59 @@ class STFLIP_OT_bake(bpy.types.Operator):
                           pos + b["origin"][None, :], vel)
         b["meta"]["frame_end_baked"] = b["frame"]
         cache.write_meta(b["cache_dir"], b["meta"])
-
-        st.bake_status = (
+        scene.stflip.bake_status = (
             f"Frame {b['frame']}/{b['end']}  "
             f"({stats.n_particles} pts, {stats.steps} steps, "
             f"{solver.be.name})")
         scene.frame_set(b["frame"])
+        return b["frame"] < b["end"]
+
+    def invoke(self, context, event):
+        try:
+            if not self._setup(context):
+                return {"CANCELLED"}
+        except Exception as exc:
+            _BAKE["running"] = False
+            self.report({"ERROR"}, f"Bake setup failed: {exc}")
+            return {"CANCELLED"}
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        """Synchronous bake for scripts and headless (blender -b) use."""
+        try:
+            if not self._setup(context):
+                return {"CANCELLED"}
+            while self._bake_next_frame(context.scene):
+                pass
+        except Exception as exc:
+            self.report({"ERROR"}, f"Bake failed: {exc}")
+            return {"CANCELLED"}
+        finally:
+            _BAKE["running"] = False
+            _BAKE.pop("solver", None)
+        context.scene.stflip.bake_status = (
+            f"Bake complete ({_BAKE.get('frame', '?')} frames)")
+        return {"FINISHED"}
+
+    def modal(self, context, event):
+        if event.type == "ESC":
+            return self._finish(context, cancelled=True)
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        if not _BAKE.get("running"):
+            return self._finish(context, cancelled=True)
+        # Any exception must still tear down the timer and _BAKE state, or
+        # baking is bricked for the rest of the session.
+        try:
+            more = self._bake_next_frame(context.scene)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Bake failed: {exc}")
+            return self._finish(context, cancelled=True)
+        if not more:
+            return self._finish(context, cancelled=False)
         return {"RUNNING_MODAL"}
 
     def _finish(self, context, cancelled: bool):
@@ -240,6 +277,8 @@ class STFLIP_OT_install_gpu(bpy.types.Operator):
         if target not in sys.path:
             sys.path.append(target)
         importlib.invalidate_caches()
+        from . import panels
+        panels.invalidate_gpu_state()
         if cuda_available():
             self.report({"INFO"}, "CuPy installed; CUDA GPU detected")
         else:

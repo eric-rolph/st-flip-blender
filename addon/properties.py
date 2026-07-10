@@ -35,8 +35,9 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         description="Axis-aligned box defining the simulation region",
     )
     resolution: IntProperty(
-        name="Resolution", default=64, min=8, max=512,
-        description="Grid cells along the longest domain axis",
+        name="Resolution", default=64, min=8, soft_max=128, max=512,
+        description="Grid cells along the longest domain axis. Above ~128 "
+                    "scene voxelization becomes slow (see README)",
     )
     cfl_target: FloatProperty(
         name="Target CFL", default=8.0, min=0.5, max=30.0,
@@ -92,6 +93,9 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         description="Surfacing voxel size in cell widths",
     )
     bake_status: StringProperty(name="Bake Status", default="")
+    # Robust bindings to the bake outputs (survive renames; null on delete).
+    particle_object: PointerProperty(type=bpy.types.Object)
+    surface_object: PointerProperty(type=bpy.types.Object)
 
 
 def register():

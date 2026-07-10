@@ -85,6 +85,15 @@ class STFLIPSolver:
         self.vel = xp.zeros((0, 3), dtype=xp.float32)
         self.dt_resid = xp.zeros((0,), dtype=xp.float32)
 
+        # Device-resident constants (allocating these per call would force
+        # host->device transfers inside the advection hot loop on GPU).
+        self._offsets_dev = {g: xp.asarray(off, dtype=xp.float32)
+                             for g, off in _OFFSETS.items()}
+        eps = 1e-3 * params.dx
+        self._clamp_lo = xp.asarray([eps] * 3, dtype=xp.float32)
+        self._clamp_hi = xp.asarray([s - eps for s in self.size],
+                                    dtype=xp.float32)
+
         # Solid signed distance, cell-centred; positive outside solids.
         self.sdf = xp.full(self.shape, 1e9, dtype=xp.float32)
         self._sdf_grad = None
@@ -173,7 +182,10 @@ class STFLIPSolver:
         nx, ny, nz = self.shape
 
         gp = self.pos / p.dx  # positions in grid units
-        theta = xp.clip(-self.dt_resid / max(dt_prev, 1e-12), -0.5, 0.5)
+        # No clipping: W_T is zero outside the slab on BOTH sides, so
+        # out-of-slab samples (possible after abrupt adaptive-dt changes)
+        # correctly receive zero weight instead of the clipped peak weight.
+        theta = -self.dt_resid / max(dt_prev, 1e-12)
         if p.st_enabled:
             wt = kernels.w_temporal(xp, theta).astype(xp.float32)
         else:
@@ -189,7 +201,7 @@ class STFLIPSolver:
             mass = xp.zeros(sh, dtype=xp.float32).ravel()
             mom = (xp.zeros(sh, dtype=xp.float32).ravel()
                    if g != "c" else None)
-            xi = gp - xp.asarray(off, dtype=xp.float32)
+            xi = gp - self._offsets_dev[g]
             base = xp.floor(xi).astype(xp.int32)
             frac = xi - base
             for (di, dj, dk) in _TAPS:
@@ -244,24 +256,22 @@ class STFLIPSolver:
         return self._solid_faces
 
     def _extrapolate(self, u, valid, layers: int):
-        """Propagate velocities into invalid faces by neighbour averaging."""
+        """Propagate velocities into invalid faces by neighbour averaging.
+
+        Shifted-slice accumulation: no wrap-around to correct and roughly a
+        third of the kernel launches of an xp.roll formulation."""
         xp = self.be.xp
         for _ in range(layers):
             vf = valid.astype(u.dtype)
+            uf = u * vf
             s = xp.zeros_like(u)
             c = xp.zeros_like(u)
-            for axis in range(3):
-                for shift in (1, -1):
-                    s += xp.roll(u * vf, shift, axis=axis)
-                    c += xp.roll(vf, shift, axis=axis)
-                # roll wraps around; zero the wrapped slice
-                sl = [slice(None)] * 3
-                sl[axis] = 0
-                s[tuple(sl)] -= (xp.roll(u * vf, 1, axis=axis))[tuple(sl)]
-                c[tuple(sl)] -= (xp.roll(vf, 1, axis=axis))[tuple(sl)]
-                sl[axis] = -1
-                s[tuple(sl)] -= (xp.roll(u * vf, -1, axis=axis))[tuple(sl)]
-                c[tuple(sl)] -= (xp.roll(vf, -1, axis=axis))[tuple(sl)]
+            s[:-1] += uf[1:];       c[:-1] += vf[1:]
+            s[1:] += uf[:-1];       c[1:] += vf[:-1]
+            s[:, :-1] += uf[:, 1:]; c[:, :-1] += vf[:, 1:]
+            s[:, 1:] += uf[:, :-1]; c[:, 1:] += vf[:, :-1]
+            s[:, :, :-1] += uf[:, :, 1:]; c[:, :, :-1] += vf[:, :, 1:]
+            s[:, :, 1:] += uf[:, :, :-1]; c[:, :, 1:] += vf[:, :, :-1]
             newly = (~valid) & (c > 0)
             u = xp.where(newly, s / xp.maximum(c, 1.0), u)
             valid = valid | newly
@@ -275,7 +285,7 @@ class STFLIPSolver:
         for ax, g in enumerate(("u", "v", "w")):
             arr = grids[g]
             sh = arr.shape
-            xi = gp - xp.asarray(_OFFSETS[g], dtype=xp.float32)
+            xi = gp - self._offsets_dev[g]
             base = xp.floor(xi).astype(xp.int32)
             frac = (xi - base).astype(xp.float32)
             val = xp.zeros((pos.shape[0],), dtype=xp.float32)
@@ -317,7 +327,9 @@ class STFLIPSolver:
         d = self._sample_cells(self.sdf, pos)
         margin = 0.1 * self.p.dx
         need = d < margin
-        if not bool(xp.any(need)):
+        # The early-out saves real time on CPU, but on GPU the any() forces
+        # a blocking device sync inside every RK substep; compute through.
+        if not self.be.is_gpu and not bool(xp.any(need)):
             return pos
         gx = self._sample_cells(self._sdf_grad[0], pos)
         gy = self._sample_cells(self._sdf_grad[1], pos)
@@ -329,11 +341,7 @@ class STFLIPSolver:
         return xp.where(need[:, None], pos + push, pos)
 
     def _clamp_domain(self, pos):
-        xp = self.be.xp
-        eps = 1e-3 * self.p.dx
-        lo = xp.asarray([eps] * 3, dtype=xp.float32)
-        hi = xp.asarray([s - eps for s in self.size], dtype=xp.float32)
-        return xp.clip(pos, lo, hi)
+        return self.be.xp.clip(pos, self._clamp_lo, self._clamp_hi)
 
     def _advect(self, grids, pos, dt_act):
         """Sub-stepped RK3 (Ralston) through the grid velocity field.
@@ -416,11 +424,22 @@ class STFLIPSolver:
         grids["v"] = xp.where(sv, 0.0, grids["v"])
         grids["w"] = xp.where(sw, 0.0, grids["w"])
 
-        # Extrapolate into under-sampled faces so advection sees a full field.
-        layers = int(math.ceil(p.cfl_target)) + 2
+        # Extrapolate into under-sampled faces so advection sees a full
+        # field.  Jittered advection can move a particle up to 2*dt, i.e.
+        # 2*CFL cells, so the band must cover that worst case.  The saved
+        # pre-force field is extrapolated with the SAME mask: forming the
+        # FLIP delta between an extrapolated new field and hard zeros would
+        # hand isolated spray particles their neighbours' full velocity as
+        # a spurious energy kick (temporal weights can invalidate all of a
+        # particle's own faces when theta lands in the kernel's zero tail).
+        layers = int(math.ceil(2.0 * p.cfl_target)) + 2
         for gname, sf in (("u", su), ("v", sv), ("w", sw)):
             valid = grids[gname + "_valid"] & (~sf)
             grids[gname], _ = self._extrapolate(grids[gname], valid, layers)
+            old[gname], _ = self._extrapolate(old[gname], valid, layers)
+            # Re-enforce no-through after extrapolation refills solid faces.
+            grids[gname] = xp.where(sf, 0.0, grids[gname])
+            old[gname] = xp.where(sf, 0.0, old[gname])
 
         # G2P: FLIP/PIC blend (Sec 3.9, standard operator).
         u_new = self._sample_faces(grids, self.pos)

@@ -25,10 +25,10 @@ Measured on a 64³ dam break (344k particles, 8 frames @ 24 fps):
 
 | Configuration                  | s / frame | vs. baseline |
 |--------------------------------|-----------|--------------|
-| Plain FLIP, CFL 1, CPU         | 19.1      | 1×           |
-| ST-FLIP, CFL 8, CPU            | 11.9      | 1.6×         |
-| ST-FLIP, CFL 8, RTX 5090       | 0.67      | **28.6×**    |
-| ST-FLIP, CFL 15, RTX 5090      | 0.54      | 35×          |
+| Plain FLIP, CFL 1, CPU         | 17.8      | 1×           |
+| ST-FLIP, CFL 8, CPU            | 11.4      | 1.6×         |
+| ST-FLIP, CFL 8, RTX 5090       | 0.68      | **26×**      |
+| ST-FLIP, CFL 15, RTX 5090      | 0.53      | 33×          |
 
 ## Install
 
@@ -97,6 +97,20 @@ settings.
 Not (yet) implemented from the paper: two-phase air–liquid coupling, surface
 tension (CSF), APIC transfers, sparse/adaptive grids, mean-curvature-flow
 surface smoothing (Appendix B — the Geometry Nodes volume meshing stands in).
+
+Known limitations: scene voxelization (mesh → grid masks/SDF) is a pure
+Python BVH loop and gets slow above resolution ~128 — vectorizing it is on
+the roadmap. Temporal jitter randoms are drawn on the host for cross-backend
+determinism, costing a small per-step transfer on GPU.
+
+### Headless / scripted baking
+
+`bpy.ops.stflip.bake()` (EXEC context) runs the bake synchronously, so it
+works from scripts and `blender -b`:
+
+```bash
+blender -b scene.blend --python-expr "import bpy; bpy.ops.stflip.bake()"
+```
 
 ## Development
 
