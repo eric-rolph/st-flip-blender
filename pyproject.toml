@@ -1,0 +1,18 @@
+[project]
+name = "st-flip-blender"
+version = "0.1.0"
+description = "ST-FLIP large-time-step liquid simulation for Blender"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+cuda = ["cupy-cuda13x>=14.0"]
+cuda12 = ["cupy-cuda12x>=13.0"]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires an NVIDIA GPU with CuPy installed",
+]
+addopts = "-m 'not gpu'"

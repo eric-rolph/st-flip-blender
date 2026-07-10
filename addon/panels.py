@@ -1,0 +1,114 @@
+"""ST-FLIP sidebar UI (3D Viewport > N-panel > ST-FLIP)."""
+
+import bpy
+
+from ..stflip.backend import cuda_available, cuda_device_name
+
+
+class STFLIP_PT_main(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "ST-FLIP Fluid"
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.stflip
+
+        layout.operator("stflip.quick_setup", icon="MOD_FLUIDSIM")
+        layout.prop(st, "domain")
+
+        col = layout.column(align=True)
+        col.prop(st, "resolution")
+        col.prop(st, "cfl_target")
+        col.prop(st, "particles_per_cell")
+
+        row = layout.row(align=True)
+        row.operator("stflip.bake", icon="PLAY")
+        row.operator("stflip.free_bake", icon="TRASH", text="")
+        if st.bake_status:
+            layout.label(text=st.bake_status)
+
+
+class STFLIP_PT_object(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "Active Object"
+    bl_parent_id = "STFLIP_PT_main"
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            layout.label(text="Select a mesh object")
+            return
+        layout.prop(obj.stflip, "role", text="Role")
+        if obj.stflip.role == "INFLOW":
+            layout.prop(obj.stflip, "inflow_velocity")
+
+
+class STFLIP_PT_solver(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "Solver"
+    bl_parent_id = "STFLIP_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.stflip
+
+        layout.prop(st, "st_enabled")
+        sub = layout.column(align=True)
+        sub.enabled = st.st_enabled
+        sub.prop(st, "jitter_strength")
+        sub.prop(st, "adaptive_gamma")
+        sub.prop(st, "eta_phi")
+        layout.prop(st, "flip_blend")
+
+        layout.separator()
+        layout.prop(st, "backend")
+        if cuda_available():
+            layout.label(text=f"GPU: {cuda_device_name()}", icon="CHECKMARK")
+        else:
+            layout.label(text="No CUDA GPU / CuPy not installed", icon="INFO")
+            layout.operator("stflip.install_gpu", icon="IMPORT")
+        layout.prop(st, "cache_dir")
+
+
+class STFLIP_PT_display(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "Surface"
+    bl_parent_id = "STFLIP_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.stflip
+        layout.prop(st, "create_surface")
+        col = layout.column(align=True)
+        col.enabled = st.create_surface
+        col.prop(st, "particle_radius")
+        col.prop(st, "surface_voxel")
+
+
+CLASSES = (
+    STFLIP_PT_main,
+    STFLIP_PT_object,
+    STFLIP_PT_solver,
+    STFLIP_PT_display,
+)
+
+
+def register():
+    for cls in CLASSES:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(CLASSES):
+        bpy.utils.unregister_class(cls)

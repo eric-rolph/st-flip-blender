@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "st_flip"
+version = "0.1.0"
+name = "ST-FLIP Fluid"
+tagline = "Large-time-step FLIP liquid simulation with GPU acceleration"
+maintainer = "Eric Rolph <ericrolph@gmail.com>"
+type = "add-on"
+website = "https://github.com/eric-rolph/st-flip-blender"
+tags = ["Physics", "Object"]
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+
+[permissions]
+files = "Read/write simulation caches next to the .blend file"
+network = "Optional: pip-install CuPy for CUDA GPU acceleration"
