@@ -1,10 +1,8 @@
 """Operators: quick setup, bake (modal), free bake, GPU support installer."""
 
 import importlib
-import os
 import subprocess
 import sys
-import tempfile
 
 import bpy
 import numpy as np
@@ -13,6 +11,7 @@ from ..stflip import cache
 from ..stflip.backend import cuda_available, get_backend
 from ..stflip.solver import Params, STFLIPSolver
 from . import handlers, mesher, voxelize
+from .handlers import resolve_cache_dir
 
 # The live solver cannot be stored on Blender ID properties; module state it is.
 _BAKE: dict = {}
@@ -21,14 +20,6 @@ _BAKE: dict = {}
 def _fluid_objects(scene, role: str):
     return [o for o in scene.objects
             if o.type == "MESH" and o.stflip.role == role]
-
-
-def _resolve_cache_dir(scene) -> str:
-    path = bpy.path.abspath(scene.stflip.cache_dir)
-    if path.startswith("//") or not os.path.isabs(path):
-        # .blend not saved yet: fall back to a temp location.
-        path = os.path.join(tempfile.gettempdir(), "stflip_cache")
-    return path
 
 
 class STFLIP_OT_quick_setup(bpy.types.Operator):
@@ -129,7 +120,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
             self.report({"ERROR"}, "No liquid cells inside the domain")
             return {"CANCELLED"}
 
-        cache_dir = _resolve_cache_dir(scene)
+        cache_dir = resolve_cache_dir(scene)
         cache.clear(cache_dir)
         meta = {
             "frame_start": scene.frame_start,
@@ -215,7 +206,7 @@ class STFLIP_OT_free_bake(bpy.types.Operator):
         if _BAKE.get("running"):
             self.report({"WARNING"}, "Stop the running bake first (Esc)")
             return {"CANCELLED"}
-        n = cache.clear(_resolve_cache_dir(context.scene))
+        n = cache.clear(resolve_cache_dir(context.scene))
         context.scene.stflip.bake_status = ""
         self.report({"INFO"}, f"Removed {n} cache files")
         return {"FINISHED"}

@@ -18,6 +18,15 @@ def _new_socket(ng, name, in_out, socket_type):
                                    socket_type=socket_type)
 
 
+def _set_resolution_mode(node, legacy_value, menu_value):
+    """Blender <=4.x exposes resolution_mode as a node property; 5.x turned
+    it into a 'Resolution Mode' menu input socket."""
+    if hasattr(node, "resolution_mode"):
+        node.resolution_mode = legacy_value
+    else:
+        node.inputs["Resolution Mode"].default_value = menu_value
+
+
 def build_node_group():
     ng = bpy.data.node_groups.get(GROUP_NAME)
     if ng is not None:
@@ -29,6 +38,7 @@ def build_node_group():
     s_obj = _new_socket(ng, "Points Object", "INPUT", "NodeSocketObject")
     s_rad = _new_socket(ng, "Radius", "INPUT", "NodeSocketFloat")
     s_vox = _new_socket(ng, "Voxel Size", "INPUT", "NodeSocketFloat")
+    _new_socket(ng, "Material", "INPUT", "NodeSocketMaterial")
     _new_socket(ng, "Geometry", "OUTPUT", "NodeSocketGeometry")
     s_rad.default_value = 0.05
     s_rad.min_value = 0.0
@@ -50,14 +60,18 @@ def build_node_group():
 
     ptv = ng.nodes.new("GeometryNodePointsToVolume")
     ptv.location = (-200, 0)
-    ptv.resolution_mode = "VOXEL_SIZE"
+    _set_resolution_mode(ptv, "VOXEL_SIZE", "Size")
 
     vtm = ng.nodes.new("GeometryNodeVolumeToMesh")
     vtm.location = (0, 0)
-    vtm.resolution_mode = "GRID"
+    _set_resolution_mode(vtm, "GRID", "Grid")
 
     smooth = ng.nodes.new("GeometryNodeSetShadeSmooth")
     smooth.location = (200, 0)
+
+    # Generated geometry ignores object material slots; assign explicitly.
+    set_mat = ng.nodes.new("GeometryNodeSetMaterial")
+    set_mat.location = (300, 0)
 
     ln = ng.links.new
     ln(n_in.outputs["Points Object"], info.inputs["Object"])
@@ -68,8 +82,27 @@ def build_node_group():
     ln(n_in.outputs["Voxel Size"], ptv.inputs["Voxel Size"])
     ln(ptv.outputs["Volume"], vtm.inputs["Volume"])
     ln(vtm.outputs["Mesh"], smooth.inputs["Geometry"])
-    ln(smooth.outputs["Geometry"], n_out.inputs["Geometry"])
+    ln(smooth.outputs["Geometry"], set_mat.inputs["Geometry"])
+    ln(n_in.outputs["Material"], set_mat.inputs["Material"])
+    ln(set_mat.outputs["Geometry"], n_out.inputs["Geometry"])
     return ng
+
+
+def ensure_water_material():
+    mat = bpy.data.materials.get("STFLIP Water")
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new("STFLIP Water")
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = (0.02, 0.3, 0.75, 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.08
+        if "Transmission Weight" in bsdf.inputs:
+            bsdf.inputs["Transmission Weight"].default_value = 0.5
+        if "IOR" in bsdf.inputs:
+            bsdf.inputs["IOR"].default_value = 1.33
+    return mat
 
 
 def _socket_identifier(ng, name):
@@ -98,7 +131,8 @@ def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
 
     for name, value in (("Points Object", particle_obj),
                         ("Radius", dx * radius_factor),
-                        ("Voxel Size", dx * voxel_factor)):
+                        ("Voxel Size", dx * voxel_factor),
+                        ("Material", ensure_water_material())):
         ident = _socket_identifier(ng, name)
         if ident is not None:
             mod[ident] = value

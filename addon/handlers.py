@@ -1,5 +1,8 @@
 """Frame-change handler: stream cached particle frames into the point cloud."""
 
+import os
+import tempfile
+
 import bpy
 import numpy as np
 from bpy.app.handlers import persistent
@@ -8,12 +11,17 @@ from ..stflip import cache
 from . import mesher
 
 
-def _resolve_cache_dir(scene) -> str:
-    return bpy.path.abspath(scene.stflip.cache_dir)
+def resolve_cache_dir(scene) -> str:
+    """Absolute cache path; falls back to the system temp directory when the
+    .blend file has not been saved (so '//' cannot resolve)."""
+    path = bpy.path.abspath(scene.stflip.cache_dir)
+    if path.startswith("//") or not os.path.isabs(path):
+        path = os.path.join(tempfile.gettempdir(), "stflip_cache")
+    return path
 
 
 def _apply_frame(scene, frame: int) -> bool:
-    cache_dir = _resolve_cache_dir(scene)
+    cache_dir = resolve_cache_dir(scene)
     meta = cache.read_meta(cache_dir)
     if meta is None:
         return False
