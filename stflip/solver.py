@@ -22,6 +22,7 @@ import numpy as np
 
 from . import apertures, kernels, pressure
 from .backend import Backend, get_backend
+from .velocity import VelocityField, VelocityInput, as_velocity_field
 
 # Face-grid offsets (in cell units) of node (i,j,k) for each MAC grid.
 _OFFSETS = {
@@ -111,7 +112,10 @@ class STFLIPSolver:
         self._sdf_grad = None
         self._solid_faces = None  # apertures + fully-solid cells, built lazily
 
-        self._inflows: list[tuple] = []  # (cell_mask device bool, velocity xp(3,))
+        # Masks stay on-device for occupancy checks; immutable velocity fields
+        # stay on the host so each refill is sampled deterministically at its
+        # newly jittered particle positions.
+        self._inflows: list[tuple[object, VelocityField]] = []
         self._rng = np.random.default_rng(params.seed)
         self._dt_prev = params.frame_dt / max(params.cfl_target, 1.0)
         self.time = 0.0
@@ -149,19 +153,45 @@ class STFLIPSolver:
         self._sdf_grad = (gx, gy, gz)
         self._solid_faces = None  # rebuild on next step
 
-    def add_liquid_mask(self, cell_mask: np.ndarray, velocity=(0.0, 0.0, 0.0)) -> int:
-        """Seed particles_per_cell jittered particles in every masked cell."""
-        cells = np.argwhere(cell_mask)
-        return self._seed_cells(cells, velocity)
+    def add_liquid_mask(
+        self,
+        cell_mask: np.ndarray,
+        velocity: VelocityInput = (0.0, 0.0, 0.0),
+    ) -> int:
+        """Seed jittered particles and sample velocity at their positions."""
+        field = as_velocity_field(velocity)
+        mask = self._validate_cell_mask(cell_mask)
+        cells = np.argwhere(mask)
+        return self._seed_cells(cells, field)
 
-    def add_inflow(self, cell_mask: np.ndarray, velocity=(0.0, 0.0, 0.0)) -> None:
-        xp = self.be.xp
+    def add_inflow(
+        self,
+        cell_mask: np.ndarray,
+        velocity: VelocityInput = (0.0, 0.0, 0.0),
+    ) -> None:
+        field = as_velocity_field(velocity)
+        mask = self._validate_cell_mask(cell_mask)
         self._inflows.append(
-            (self.be.from_numpy(cell_mask.astype(bool)),
-             xp.asarray(velocity, dtype=xp.float32))
+            (self.be.from_numpy(mask),
+             field)
         )
 
-    def _seed_cells(self, cells: np.ndarray, velocity) -> int:
+    def _validate_cell_mask(self, cell_mask: np.ndarray) -> np.ndarray:
+        try:
+            mask = np.asarray(cell_mask)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"cell_mask must have solver shape {self.shape}"
+            ) from exc
+        if mask.shape != self.shape:
+            raise ValueError(f"cell_mask must have solver shape {self.shape}")
+        # Own the mask: CPU Backend.from_numpy intentionally avoids copies,
+        # while CUDA upload inherently copies. Retaining caller storage here
+        # would let later mutations change CPU inflows only.
+        return np.array(mask, dtype=bool, order="C", copy=True)
+
+    def _seed_cells(self, cells: np.ndarray, velocity: VelocityInput) -> int:
+        field = as_velocity_field(velocity)
         if len(cells) == 0:
             return 0
         xp = self.be.xp
@@ -177,7 +207,8 @@ class STFLIPSolver:
             pts = (base + (sub + jitter) * 0.5) * self.p.dx
         else:
             pts = (base + jitter) * self.p.dx
-        vel = np.broadcast_to(np.asarray(velocity, dtype=np.float32), (n, 3)).copy()
+        pts = np.ascontiguousarray(pts, dtype=np.float32)
+        vel = field.sample(pts)
         self.pos = xp.concatenate([self.pos, self.be.from_numpy(pts)])
         self.vel = xp.concatenate([self.vel, self.be.from_numpy(vel)])
         self.dt_resid = xp.concatenate(
@@ -643,11 +674,11 @@ class STFLIPSolver:
         if flat.shape[0]:
             self.be.scatter_add(counts, flat, xp.ones_like(flat, dtype=xp.float32))
         counts = counts.reshape(self.shape)
-        for mask, vel in self._inflows:
+        for mask, velocity_field in self._inflows:
             refill = self.be.to_numpy(
                 mask & (counts < 0.5 * self.p.particles_per_cell))
             cells = np.argwhere(refill)
-            self._seed_cells(cells, self.be.to_numpy(vel))
+            self._seed_cells(cells, velocity_field)
 
     # ----------------------------------------------------------------- export
 
