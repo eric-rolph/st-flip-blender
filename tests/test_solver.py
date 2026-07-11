@@ -34,10 +34,11 @@ def _dam_break(
     return s
 
 
-def test_m0_calibration_close_to_ppc():
-    s = _dam_break()
-    # Normalised kernels: expected accumulator ~ particles-per-cell.
-    assert 0.7 * 8 <= s.m0 <= 1.3 * 8
+def test_m0_uniform_reference_is_exactly_particles_per_cell():
+    # Unit-integral spatial/temporal kernels make the uniform expectation
+    # analytically equal to particles-per-cell, without calibration noise.
+    assert _dam_break(ppc=2).m0 == 2.0
+    assert _dam_break(ppc=8).m0 == 8.0
 
 
 @pytest.mark.parametrize(
@@ -274,6 +275,95 @@ def test_overlapping_inflows_use_registration_order_precedence():
     # Occupancy from the first call prevents either source from reseeding.
     solver._seed_inflows()
     assert solver.pos.shape[0] == 3
+
+
+def test_inflow_schedule_is_inclusive_at_start_and_exclusive_at_end():
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, gravity=(0.0, 0.0, 0.0),
+        frame_dt=0.25, particles_per_cell=1, seed=17,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[0, 0, 0] = True
+    solver.add_inflow(
+        mask, (1.0, 0.0, 0.0), start_time=0.5, end_time=1.0,
+    )
+
+    solver.time = 0.5 - 1e-6
+    solver._seed_inflows()
+    assert solver.pos.shape[0] == 0
+
+    solver.time = 0.5
+    solver._seed_inflows()
+    assert solver.pos.shape[0] == 1
+
+    solver.pos = solver.pos[:0]
+    solver.vel = solver.vel[:0]
+    solver.dt_resid = solver.dt_resid[:0]
+    solver.time = 1.0
+    solver._seed_inflows()
+    assert solver.pos.shape[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("start_time", "end_time"),
+    (
+        (-1.0, None), (np.nan, None), (True, None),
+        (1.0, 0.5), (0.0, np.inf), (0.0, False),
+    ),
+)
+def test_inflow_schedule_rejects_invalid_intervals(start_time, end_time):
+    p = Params(resolution=(2, 2, 2), dx=0.5)
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.ones(p.resolution, dtype=bool)
+    with pytest.raises(ValueError, match="inflow .*time"):
+        solver.add_inflow(mask, start_time=start_time, end_time=end_time)
+
+
+def test_zero_duration_inflow_schedule_is_valid_and_inactive():
+    p = Params(resolution=(2, 2, 2), dx=0.5, particles_per_cell=1)
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.ones(p.resolution, dtype=bool)
+    solver.add_inflow(mask, start_time=0.5, end_time=0.5)
+    solver.time = 0.5
+
+    solver._seed_inflows()
+
+    assert solver.pos.shape[0] == 0
+
+
+def test_inactive_inflow_filters_before_domain_occupancy_allocation(monkeypatch):
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, particles_per_cell=1,
+        frame_dt=1.0 / 24.0,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.ones(p.resolution, dtype=bool)
+    solver.add_liquid_mask(mask)
+    solver.add_inflow(mask, start_time=1.0, end_time=2.0)
+
+    def unexpected_scatter(*_args, **_kwargs):
+        raise AssertionError("inactive inflow allocated an occupancy grid")
+
+    monkeypatch.setattr(solver.be, "scatter_add", unexpected_scatter)
+    solver.time = 0.0
+    solver._seed_inflows()
+
+
+def test_inflow_exclusive_endpoint_tolerates_accumulated_frame_roundoff():
+    frame_dt = 1.0 / 24.0
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, particles_per_cell=1,
+        frame_dt=frame_dt,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.ones(p.resolution, dtype=bool)
+    solver.add_inflow(mask, start_time=0.0, end_time=0.5)
+    solver.time = sum(frame_dt for _ in range(12))
+
+    solver._seed_inflows()
+
+    assert solver.pos.shape[0] == 0
 
 
 def test_dam_break_runs_and_stays_finite():

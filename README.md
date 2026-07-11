@@ -12,29 +12,77 @@ This is an independent implementation of **ST-FLIP**:
 
 ## Why ST-FLIP?
 
-Classic FLIP solvers need small time steps (CFL 1–2, i.e. fluid moves at most
-1–2 grid cells per step) or the free surface dissolves into temporal-aliasing
-ripples. ST-FLIP treats particles as **Monte Carlo samples in 4D space-time**:
-each particle carries a small random time offset, particle-to-grid transfers
-use a separable spatial × temporal kernel, and the accumulated kernel weights
-double as a phase field that replaces per-step surface reconstruction. The
-result: time steps **up to an order of magnitude larger** (CFL 8–15+) with
-coherent, detailed flow.
+Hybrid FLIP solvers can remain numerically stable when particles cross several
+grid cells in one step, but stability is not fidelity. The paper shows that
+instantaneous particle-to-grid deposition leaves gaps in space-time coverage;
+pressure projection amplifies the resulting temporal aliasing into unphysical
+surface waves, often becoming visually objectionable above roughly CFL 2–3.
 
-Measured on a 64³ dam break (344k particles, 8 frames at 24 fps) with
-Blender 5.1's Python on Windows 11, Ryzen 7 9800X3D, and RTX 5090. Times
-include solver stepping and render-particle re-synchronization:
+ST-FLIP treats particles as **Monte Carlo samples in 4D space-time**. Each
+particle carries a bounded temporal residual, deposition uses a separable
+spatial × temporal kernel, and the accumulated weights become a space-time
+phase field for variable-coefficient pressure projection. This is more than
+naively randomizing advection times: the tracked residual and temporal kernel
+keep particle state and deposited mass/momentum consistent. Locally sub-stepped
+RK3 advection still enforces collision-safe travel; the larger global step
+reduces expensive P2G/projection updates rather than eliminating all substeps.
 
-| Configuration                  | s / frame | vs. baseline |
-|--------------------------------|-----------|--------------|
-| Instantaneous P2G, CFL 1, CPU  | 5.43      | 1×           |
-| ST-FLIP, CFL 8, CPU            | 4.57      | 1.2×         |
-| ST-FLIP, CFL 8, RTX 5090       | 0.53      | **10.2×**    |
-| ST-FLIP, CFL 15, RTX 5090      | 0.52      | 10.5×        |
+The paper reports benchmark-dependent **2×–8×** wall-clock improvements at
+high effective resolutions and target CFL values through 30. Its often-quoted
+`≈ O(n⁴)` observation is a resolution-scaling argument for 3D CFL-conforming
+simulations—`n³` cells plus about `n` times as many steps—not a universal
+complexity guarantee. The authors' sparse/adaptive CPU implementation and
+multi-billion-particle scenes also do not directly predict this add-on's
+dense-grid CPU or CUDA performance.
 
-The timing baseline disables temporal weighting and jitter but retains this
-add-on's phase-field projection. It is an ablation control, not the paper's
-standard-FLIP/GFM reference solver.
+The algorithm is lightweight, not free: the paper adds one particle-time
+attribute and changes advection/P2G/interface handling, while avoiding extra
+grids, linear solves, or particle passes in its host architecture. One reported
+comparison measured 3.7% additional peak memory. This repository is a
+standalone solver, not a binary drop-in patch for Mantaflow or FLIP Fluids.
+
+### Reproducible core validation
+
+`tools/run_validation.py` runs a deterministic four-case matrix on one fixed
+backend: ST-FLIP and instantaneous-P2G at matched target CFL 1 and 16. It
+requires identical initial particle hashes, records actual (not merely target)
+CFL, residual bounds, trajectory/occupancy/energy differences, output hashes,
+and timing in a separate section. The instantaneous branch is an ablation of
+this solver; it is not the paper's standard-FLIP/GFM reference implementation.
+
+```bash
+python tools/run_validation.py
+python tools/run_validation.py --scale evidence --seeds 0 1 2 --require-validation-ready
+```
+
+The quick scale is a 2-PPC CI/developer stress smoke and may correctly report
+that it did not reach high observed CFL or the expected coherence trend. The
+evidence scale uses the paper/add-on default of 8 PPC. Its internal regression
+gate requires lower mean error in the bounded Eq. 13 pressure/interface phase
+field, higher mean threshold-interface IoU, and strict-majority agreement for
+both across three seeds. Raw Eq. 8 deposited-mass RMSE remains prominent as a
+non-gating Monte Carlo-variance diagnostic. CUDA timing must be run separately
+at the same ST-FLIP configuration; changing the method, target CFL, and backend
+in one speedup ratio would conflate three effects.
+
+This matrix validates the implemented temporal mechanism and an internal
+phase-field coherence surrogate, not an exact paper reproduction: it uses a
+dense unit-cube dam break and an internal diffuse-phase instantaneous ablation
+instead of standard FLIP/GFM or APIC. It does not replace the paper's
+predeclared `T=7` SDF/mass-slice studies or MCF-smoothed render-surface normal
+metric. Output hashes are audit fingerprints for the artifact's declared
+Python/NumPy/backend environment, not bitwise-determinism claims across
+hardware or numerical-library versions.
+
+The checked [three-seed CPU evidence artifact](https://github.com/eric-rolph/st-flip-blender/blob/main/validation/stflip_matched_cpu.json)
+was regenerated from its embedded source hashes. Every run reached observed
+particle CFL above 10.6. Mean Eq. 13 phase RMSE was `0.07880` for ST-FLIP
+versus `0.08574` for the instantaneous ablation (ratio `0.9191`, ST better in
+3/3 seeds); mean threshold-interface IoU was `0.92829` versus `0.92175` (ST
+better in 3/3). Raw deposited-mass RMSE was `0.23379` versus `0.23034` (ratio
+`1.0150`, ST better in only 1/3), so the artifact reports that diagnostic as
+inconclusive rather than disguising Monte Carlo noise as a successful paper
+reproduction.
 
 ## Install
 
@@ -73,12 +121,15 @@ custom build. A vendor-neutral wgpu backend is on the roadmap.
 1. Save the `.blend` file, or choose an absolute **Cache Directory**.
    Blend-file-relative caches (`//...`) are refused in an unsaved file so a
    later Save As cannot silently move the cache path.
-2. *3D Viewport → Sidebar (N) → ST-FLIP → Quick Dam-Break Setup*, **or**:
+2. *3D Viewport → Sidebar (N) → ST-FLIP* and choose **Dam Break**,
+   **Whirlpool Preview**, or the approximate **High-CFL Jet Preview**, **or**:
    - Create a box, set it as the **Domain** (defines the grid).
    - Select any closed mesh and set its role to **Liquid**, **Inflow**
      (with a velocity), **Outflow**, or **Obstacle**.
 3. Pick **Resolution** (cells along the longest domain axis) and
-   **Target CFL** (8 is a good start; raise for speed, lower for accuracy).
+   **Target CFL** (8 is a good start; higher values may reduce global solves
+   when the frame interval does not cap the step, while lower values generally
+   trade more work for accuracy).
 4. Press **Bake Simulation**. Frames are cached to disk (`Cache Directory`)
    and playback is driven by a frame-change handler. To continue a cancelled,
    failed, or completed long bake, extend the scene's End frame and press
@@ -90,10 +141,6 @@ trajectory-defining inputs, geometry, outlet modes, or the compute backend no
 longer match the checkpoint. Existing output and metric history are preserved.
 Raw checkpoints trade disk space for exact restart state, so plan cache storage
 accordingly for high particle counts and long frame ranges.
-
-Save the `.blend` before using the default relative cache. An unsaved file has
-no stable base directory, so Bake/Resume asks you to save first; an explicitly
-absolute Cache Directory can be used without saving the scene.
 
 Save the `.blend` before using the default relative cache. An unsaved file has
 no stable base directory, so Bake/Resume asks you to save first; an explicitly
@@ -116,6 +163,15 @@ The bake produces two objects:
 Gravity comes from the scene's gravity settings; frame rate from the render
 settings.
 
+One-click setups replace generated setup objects, clear this scene's owned
+bake, and may change scene-global units, gravity, FPS, and frame range. When a
+bake exists Blender asks for confirmation because the disk-cache deletion
+cannot be restored by Undo. Use a new scene or save first if those settings
+matter. Editing the Jet Preview's
+domain, resolution, FPS, source speed, or plate dimensions breaks its authored
+one-cell / 16-cells-per-frame ratios; current values and an intact/modified flag
+are recorded in the next bake's metadata.
+
 Outflows have two explicit modes. **Volume Sink** removes particles inside a
 mesh and is useful anywhere in the domain. **Pressure Outlet** opens only the
 covered exterior domain faces at atmospheric pressure and removes particles
@@ -123,6 +179,21 @@ after they cross; its mesh must intersect a domain boundary. The latter is
 the closer analog for the paper's bottom drain. Use **Whirlpool** beside the
 quick setup button for a clearly labeled, low-resolution preview constrained
 by the paper's published dimensions and `0.1 rad/s` initial rotation.
+
+### Workflow fit
+
+| Workflow | Practical support | Boundary |
+|---|---|---|
+| Cropped environment puddles and standing water | GPU/CPU bakes, static cut-cell obstacles, resumable caches, high global CFL, and Blender surfacing | Uniform dense grid and Python scene voxelization make full landscapes impractical; build a shot-sized interaction domain |
+| Rain, leaks, and jets | Static inflow volumes support uniform or solid-body velocity plus an optional inclusive evolved-output frame range; the High-CFL Jet Preview demonstrates a high-speed static collision | Refill is occupancy based, not a physical flow-rate or pressure/head boundary; no droplet distribution, viscosity, wetting, surface tension, or air coupling |
+| Vortex and sci-fi prop look development | Solid-body rotation can initialize liquid or drive a rotating inflow; the whirlpool setup reproduces the published rotation field and dimensions at preview scale | No torque model or rotating propeller boundary; this is a visual-effects flow field, not engineering validation |
+| Moving tire or mechanism interaction | A stationary proxy can be a fractional-aperture obstacle | Animated/deforming obstacles and moving-wall velocity are not implemented; a moving tire splash is therefore not a supported claim |
+| AI/procedural detail enhancement | A portable playback handoff exports committed world-space particle positions, velocities, settings, units, timing, hashes, and optional metrics | No stable particle IDs, foam/spray labels, training pairs, inference model, or generated microdetail; temporal AI consistency remains a downstream responsibility |
+
+This distinction is intentional. Re-voxelizing a moving tire without imposing
+its boundary velocity in collision response and pressure projection would be
+nonphysical, so the add-on does not present static-obstacle support as moving
+solid support.
 
 ### Solver settings
 
@@ -136,14 +207,14 @@ by the paper's published dimensions and `0.1 rad/s` initial rotation.
 | Interface Steepness (η) | Eq. 13 | Lower = steeper/stronger leveling; higher = finer detail/noise |
 | FLIP Fraction | §4 | FLIP/PIC blend (default 0.98) |
 | Random Seed | §3.10 | Reproducible particle placement and temporal jitter; seed 0 is an add-on default, not a published paper value |
-| Initial / Inflow Velocity | §4.8 | Per-liquid uniform or solid-body rotational initial velocity; inflow meshes remain uniform |
+| Initial / Inflow Velocity | §4.8 | Liquid and inflow sources can use uniform or solid-body rotational fields; inflows can be limited to an inclusive scene-frame range |
 | Outflow Mode | §4.8 | Interior particle-removal volume or exterior half-cell `p=0` pressure outlet |
 | Advanced Solver | §3.3, §3.7 | Liquid density, local advection CFL, PCG tolerance/limit, and relative density floor |
 
-### Solid-body initial velocity
+### Source velocity fields
 
-For each **Liquid** object, choose **Solid Body Rotation** to initialize the
-actual jittered particles with
+For each **Liquid** or **Inflow** object, choose **Solid Body Rotation** to
+sample the actual jittered particles with
 `u(x) = v_linear + omega × (x - center)`. The center and axis are entered in
 Blender world coordinates. The axis is normalized, the signed angular speed
 is in radians per scene second, and positive speed follows the right-hand
@@ -151,10 +222,17 @@ rule. The linear velocity is superposed on the rotation. Field sampling uses
 a deterministic host-float32 path, so a fixed seed produces the same initial
 particle positions and velocities on CPU and CUDA.
 
+An inflow may also be restricted to inclusive evolved **Start Frame / End
+Frame** outputs. The cache's first frame is a pre-step snapshot; subsequent
+frames receive emission during their preceding simulation interval. Scheduling
+is checkpoint-safe because it is derived from the restored solver clock; it
+does not turn the occupancy refill source into a prescribed volume-flow
+boundary.
+
 With the paper's vertical axis mapped through Blender's world origin, its
 whirlpool initialization is represented by center `(0, 0, 0)`, axis `+Z`,
 zero linear velocity, and angular speed `0.1 rad/s`. This reproduces the
-published initial velocity field. Version 0.6 also provides an approximate
+published initial velocity field. Version 0.7 also provides an approximate
 whirlpool preview with the published `200 x 200 x 80 m` domain proportions
 and an authored `20 m` diameter by `10 m` bottom outlet mesh. The solver uses
 the mesh's circular boundary footprint; its displayed `10 m` length is
@@ -170,8 +248,9 @@ scene; they do **not** recreate the paper's geometry, reference solvers, or
 surface reconstruction:
 
 - Laminar dam break (§4.1): target CFL 1, 3, 5, 10, or 20.
-- Standard dam break (§4.3): target CFL 1, 2, 4, 8, or 16, plus an explicitly
-  labeled instantaneous-P2G ablation that is not standard FLIP/GFM.
+- Standard dam break (§4.3): target CFL 1, 2, 4, 8, or 16, plus explicitly
+  labeled instantaneous-P2G ablations at CFL 1 and 16 that are not standard
+  FLIP/GFM.
 - Enstrophy (§4.4): ST-FLIP analogs for `(CFL, FLIP)` pairs `(1, .99)`,
   `(5, .99)`, `(10, .99)`, `(1, .95)`, and `(1, .90)`. The paper's CFL 1
   comparison curves use the unavailable standard-FLIP/GFM solver.
@@ -199,9 +278,20 @@ maximum particle speed and are therefore not labeled as paper-equivalent grid
 CFL. Enstrophy adds an O(grid) diagnostic and synchronization, but it is timed
 outside the reported solver-only wall time.
 
+The open **Downstream Export** panel exposes **Export Playback Handoff**, which
+writes an atomic ZIP for downstream procedural or AI-assisted enhancement. It
+contains only committed, validated playback NPZ
+frames (`positions`, `velocities`), a strict versioned manifest, per-frame
+SHA-256 hashes and counts, Blender world-space/unit/timing declarations,
+sanitized solver settings, and validated metrics when available. Raw resume
+checkpoints are deliberately excluded. The manifest explicitly declares that
+stable particle IDs, foam/spray labels, inferred microdetail, and an AI model
+are absent, so consumers cannot mistake a transport package for a turnkey
+detail generator.
+
 ### Paper coverage
 
-Version 0.6 implements the paper's **single-phase, free-surface ST-FLIP
+Version 0.7 implements the paper's **single-phase, free-surface ST-FLIP
 core**; it is not a full reproduction of every solver variant and production
 example in the paper.
 
@@ -209,8 +299,8 @@ example in the paper.
 |---|---|
 | One-sided temporal kernel, slab P2G, residual jitter, phase field, variable-coefficient projection | Implemented |
 | Large target CFL and instantaneous-P2G temporal ablation | Implemented; target CFL 0.5–30 |
-| Reproducible reruns over paper-inspired CFL, particle-count, and FLIP/PIC parameter matrices | ST-FLIP-side profiles and auditable frame diagnostics implemented; no true FLIP/GFM branches, automated batch runner, or exact paper scenes |
-| Single-phase liquid scenes with static mesh obstacles, inflows, and outflows | Implemented; outflows support volume sinks and exterior atmospheric-pressure faces |
+| Reproducible reruns over paper-inspired CFL, particle-count, and FLIP/PIC parameter matrices | ST-FLIP-side profiles, auditable frame diagnostics, and a matched four-case batch validator are implemented; no true FLIP/GFM branches or exact paper scenes |
+| Single-phase liquid scenes with static mesh obstacles, inflows, and outflows | Implemented; inflows support uniform/rotational fields and active frame ranges; outflows support volume sinks and exterior atmospheric-pressure faces |
 | Fractional solid face apertures in Eq. 14–17 | Implemented for stationary mesh obstacles using an add-on-specific node-SDF reconstruction; moving/deforming solids remain unsupported |
 | Paper render reconstruction (`0.5Δx` spheres, 2× grid, MCF) | Partial; radius/voxel defaults match the first two values, but Geometry Nodes replaces MCF |
 | Two-phase liquid/gas coupling | Not implemented |
@@ -225,7 +315,7 @@ Experiment-level coverage is narrower than method-level coverage:
 | Paper experiment | Reproduction level |
 |---|---|
 | Laminar/standard dam breaks over large CFL values | Partial: parameter profiles, qualitative setup, and raw diagnostics, without exact geometry, GFM/APIC baselines, or the paper's unspecified normalization |
-| Static-obstacle wake and thin-obstacle inflow jet | Partial: stationary obstacles use fractional face apertures and inflows are supported, but the paper's exact geometry and jet parameters are unpublished |
+| Static-obstacle wake and thin-obstacle inflow jet | Partial: an explicitly approximate High-CFL Jet Preview exercises a scheduled high-speed inflow, thin stationary cut-cell obstacle, and pressure outlet; the paper's exact geometry and jet parameters are unpublished |
 | Particle-count and FLIP-blend studies | ST-FLIP-side parameter profiles, deterministic seed, and enstrophy diagnostic are available; true FLIP/GFM branches, SDF RMSE, and batch-sweep tooling are not |
 | Kleefsman obstacle validation | Missing water-height gauges and experimental-data comparison |
 | MCF reconstruction study | Missing MCF and normal-RMSE evaluation |
@@ -234,9 +324,9 @@ Experiment-level coverage is narrower than method-level coverage:
 
 The Blender UI exposes these inputs for the implemented single-phase solver:
 resolution, target CFL, particles/cell, `γ`, adaptive attenuation, `η`,
-FLIP/PIC blend, seed, backend, gravity, frame rate/range, uniform inflow
-velocity, per-liquid uniform or solid-body initial velocity (linear velocity,
-world center/axis, and signed angular speed), both outflow modes, density,
+FLIP/PIC blend, seed, backend, gravity, frame rate/range, per-source uniform
+or solid-body velocity (linear velocity, world center/axis, and signed angular
+speed), optional inflow active frames, both outflow modes, density,
 local CFL, PCG controls, and the relative density floor. Surface controls
 include live refresh plus optional Blender Laplacian smoothing, which is
 deliberately not labeled as the paper's MCF reconstruction. Every
@@ -264,9 +354,9 @@ because the corresponding algorithms are not implemented.
   grid-advector-bounded RK3 substeps (local CFL defaults to 1)
 - Particle re-synchronisation (un-jittering) at output frames
 - Stationary solid obstacles via cell/node-sampled voxelised SDF, fractional
-  face apertures, and particle push-back; inflow emitters
-- Uniform and right-handed solid-body initial velocity fields, sampled at the
-  actual jittered particle positions with deterministic CPU/CUDA setup
+  face apertures, and particle push-back; optionally scheduled inflow emitters
+- Uniform and right-handed solid-body liquid/inflow velocity fields, sampled
+  at actual jittered particle positions with deterministic CPU/CUDA setup
 - Interior volume sinks and exterior half-cell atmospheric-pressure outlets,
   including synchronized particle-state removal and auditable metrics
 - Scene-owned caches with missing/foreign-cache reconciliation, explicit bake
@@ -275,6 +365,10 @@ because the corresponding algorithms are not implemented.
 - NumPy CPU + CuPy CUDA backends sharing one code path
 - Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy
+- Matched four-case ST/instantaneous CFL 1/16 validation with observed-CFL,
+  quality, state-hash, residual, and separately scoped timing evidence
+- Atomic playback-only downstream handoff with a strict manifest and explicit
+  absence declarations for IDs, foam/spray labels, inferred detail, and AI
 
 Not (yet) implemented from the paper: two-phase air–liquid coupling, surface
 tension (CSF), APIC transfers, sparse/adaptive grids, mean-curvature-flow
@@ -306,7 +400,7 @@ partial records are ignored and exports include only frames with valid cache
 files.
 
 `bpy.ops.stflip.resume_bake()` is also synchronous in an EXEC context. It
-requires an owned v0.6 checkpoint, unchanged simulation inputs, and a scene End
+requires an owned v0.7 checkpoint, unchanged simulation inputs, and a scene End
 frame later than the latest committed frame.
 
 ## Development

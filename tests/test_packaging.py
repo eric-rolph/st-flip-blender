@@ -12,7 +12,9 @@ def test_package_allowlist_excludes_development_files():
     assert "blender_manifest.toml" in relative
     assert "__init__.py" in relative
     assert "addon/operators.py" in relative
+    assert "stflip/handoff.py" in relative
     assert "stflip/solver.py" in relative
+    assert "stflip/validation.py" in relative
     assert not any(name.startswith((".git/", "tests/", "tmp/"))
                    for name in relative)
     assert not any("__pycache__" in name or name.endswith(".pyc")

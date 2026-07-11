@@ -199,7 +199,13 @@ class STFLIPSolver:
         # Masks stay on-device for occupancy checks; immutable velocity fields
         # stay on the host so each refill is sampled deterministically at its
         # newly jittered particle positions.
-        self._inflows: list[tuple[object, VelocityField]] = []
+        # Inflows are static source masks with an immutable velocity field and
+        # an optional active interval in solver seconds. Scheduling depends
+        # only on ``self.time``, so exact checkpoints need no extra emitter
+        # state beyond the simulation clock they already store.
+        self._inflows: list[
+            tuple[object, VelocityField, float, float | None]
+        ] = []
         # Outflow masks are lazy: two dense 512^3 boolean allocations would
         # otherwise cost ~256 MiB on every no-outflow CUDA simulation.
         self._volume_outflow = None
@@ -412,12 +418,37 @@ class STFLIPSolver:
         self,
         cell_mask: np.ndarray,
         velocity: VelocityInput = (0.0, 0.0, 0.0),
+        *,
+        start_time: float = 0.0,
+        end_time: float | None = None,
     ) -> None:
+        """Register a refill source, optionally limited to a time interval.
+
+        ``start_time`` is inclusive and ``end_time`` is exclusive, both in
+        solver seconds relative to the bake start. The default remains an
+        always-active source. Refill is occupancy based, not a prescribed
+        volumetric flow rate. Equal endpoints define a valid inactive source.
+        """
         field = as_velocity_field(velocity)
         mask = self._validate_cell_mask(cell_mask)
+        if (isinstance(start_time, bool)
+                or not isinstance(start_time, numbers.Real)
+                or not math.isfinite(float(start_time))
+                or float(start_time) < 0.0):
+            raise ValueError("inflow start_time must be finite and non-negative")
+        start = float(start_time)
+        end = None
+        if end_time is not None:
+            if (isinstance(end_time, bool)
+                    or not isinstance(end_time, numbers.Real)
+                    or not math.isfinite(float(end_time))
+                    or float(end_time) < start):
+                raise ValueError(
+                    "inflow end_time must be finite and not precede start_time"
+                )
+            end = float(end_time)
         self._inflows.append(
-            (self.be.from_numpy(mask),
-             field)
+            (self.be.from_numpy(mask), field, start, end)
         )
 
     def add_outflow(self, cell_mask: np.ndarray, mode: str = "VOLUME") -> None:
@@ -510,23 +541,16 @@ class STFLIPSolver:
 
     def _calibrate_m0(self) -> float:
         """Reference mass: expected accumulator value for a uniformly filled
-        patch with ppc particles per cell and tau ~ U(-1/2, 1/2) (Sec 3.6)."""
-        rng = np.random.default_rng(12345)
-        ppc = self.p.particles_per_cell
-        n_cells, trials = 6, 8
-        acc = 0.0
-        for _ in range(trials):
-            pts = rng.random((n_cells**3 * ppc, 3)) * n_cells
-            tau = rng.random(len(pts)) - 0.5
-            wt = (kernels.w_temporal(np, tau) if self.p.st_enabled
-                  else np.ones_like(tau))
-            centre = np.array([n_cells / 2.0] * 3)
-            r = (pts - centre)
-            w = (kernels.w_spatial_1d(np, r[:, 0])
-                 * kernels.w_spatial_1d(np, r[:, 1])
-                 * kernels.w_spatial_1d(np, r[:, 2]) * wt)
-            acc += float(w.sum())
-        return acc / trials
+        patch with ppc particles per cell and tau ~ U(-1/2, 1/2) (Sec 3.6).
+
+        Both the separable spatial kernel and temporal kernel are analytically
+        normalized to unit integral. For a uniform particle number density of
+        ``ppc`` per cell, the expected accumulator is therefore exactly
+        ``ppc``. The previous eight-sample Monte Carlo calibration introduced
+        a large, method-dependent error at low PPC (despite using the same
+        physical particle density), which confounded phase comparisons.
+        """
+        return float(self.p.particles_per_cell)
 
     def _p2g(self, dt_prev: float):
         """4D->3D particle-to-grid transfer (Eq. 8-9). Returns face grids."""
@@ -1352,6 +1376,23 @@ class STFLIPSolver:
     def _seed_inflows(self) -> None:
         if not self._inflows:
             return
+        # Filter schedules before allocating a domain-sized occupancy grid.
+        # A future or expired source should preserve the empty-frame fast path,
+        # especially at production resolutions where one 512^3 float grid is
+        # 512 MiB.  The tolerance prevents accumulated frame-time roundoff from
+        # activating a source for one extra interval at its exclusive endpoint.
+        tolerance = max(1e-12, 1e-9 * self.p.frame_dt)
+        active_inflows = []
+        for inflow in self._inflows:
+            _, _, start_time, end_time = inflow
+            if self.time + tolerance < start_time:
+                continue
+            if (end_time is not None
+                    and self.time + tolerance >= end_time):
+                continue
+            active_inflows.append(inflow)
+        if not active_inflows:
+            return
         xp = self.be.xp
         nx, ny, nz = self.shape
         # Occupancy from particle binning.
@@ -1362,7 +1403,7 @@ class STFLIPSolver:
         if flat.shape[0]:
             self.be.scatter_add(counts, flat, xp.ones_like(flat, dtype=xp.float32))
         counts = counts.reshape(self.shape)
-        for mask, velocity_field in self._inflows:
+        for mask, velocity_field, _start_time, _end_time in active_inflows:
             refill_device = mask & (
                 counts < 0.5 * self.p.particles_per_cell
             )

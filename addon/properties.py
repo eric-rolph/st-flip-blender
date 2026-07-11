@@ -14,13 +14,28 @@ from bpy.props import (
 from ..stflip.experiments import PROFILE_ENUM_ITEMS
 
 
+_VELOCITY_MODE_ITEMS = [
+    ("UNIFORM", "Uniform", "Use one world-space velocity vector"),
+    (
+        "SOLID_BODY",
+        "Solid Body Rotation",
+        "Use linear velocity plus a world-space rigid rotation",
+    ),
+]
+
+
 class STFLIPObjectSettings(bpy.types.PropertyGroup):
     role: EnumProperty(
         name="Role",
         items=[
             ("NONE", "None", "Not part of the simulation"),
             ("LIQUID", "Liquid", "Initial liquid volume (closed mesh)"),
-            ("INFLOW", "Inflow", "Continuously emits liquid (closed mesh)"),
+            (
+                "INFLOW",
+                "Inflow",
+                "Emits liquid from a closed mesh, optionally over a frame "
+                "range",
+            ),
             (
                 "OUTFLOW",
                 "Outflow",
@@ -33,6 +48,41 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
     inflow_velocity: FloatVectorProperty(
         name="Inflow Velocity", subtype="VELOCITY", size=3,
         default=(0.0, 0.0, 0.0),
+        description="World-space linear velocity for particles emitted by "
+                    "this inflow; in Solid Body mode it is superposed on "
+                    "the rotational velocity",
+    )
+    inflow_velocity_mode: EnumProperty(
+        name="Inflow Velocity Mode",
+        items=_VELOCITY_MODE_ITEMS,
+        default="UNIFORM",
+    )
+    inflow_use_frame_range: BoolProperty(
+        name="Limit Active Frames",
+        default=False,
+        description="Emit into evolved output frames from inclusive Start "
+                    "through End; the initial cache frame is a pre-step "
+                    "snapshot. Disable for the whole bake and extensions",
+    )
+    inflow_start_frame: IntProperty(
+        name="Start Frame",
+        default=1,
+        min=-1_048_574,
+        max=1_048_574,
+        soft_min=1,
+        soft_max=250,
+        description="First evolved output frame receiving this inflow "
+                    "(inclusive)",
+    )
+    inflow_end_frame: IntProperty(
+        name="End Frame",
+        default=250,
+        min=-1_048_574,
+        max=1_048_574,
+        soft_min=1,
+        soft_max=250,
+        description="Last evolved output frame receiving this inflow "
+                    "(inclusive)",
     )
     initial_velocity: FloatVectorProperty(
         name="Initial Velocity", subtype="VELOCITY", size=3,
@@ -43,14 +93,7 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
     )
     initial_velocity_mode: EnumProperty(
         name="Initial Velocity Mode",
-        items=[
-            ("UNIFORM", "Uniform", "Use one world-space velocity vector"),
-            (
-                "SOLID_BODY",
-                "Solid Body Rotation",
-                "Use linear velocity plus a world-space rigid rotation",
-            ),
-        ],
+        items=_VELOCITY_MODE_ITEMS,
         default="UNIFORM",
     )
     rotation_center_world: FloatVectorProperty(
@@ -59,7 +102,7 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
         size=3,
         default=(0.0, 0.0, 0.0),
         description="Rotation center in Blender world coordinates; it is "
-                    "not transformed with the liquid object",
+                    "not transformed with the source object",
     )
     rotation_axis_world: FloatVectorProperty(
         name="Rotation Axis (World)",
@@ -67,7 +110,7 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
         size=3,
         default=(0.0, 0.0, 1.0),
         description="World-space rotation axis; normalized when baking and "
-                    "not transformed with the liquid object",
+                    "not transformed with the source object",
     )
     angular_speed: FloatProperty(
         name="Angular Speed (rad/s)",

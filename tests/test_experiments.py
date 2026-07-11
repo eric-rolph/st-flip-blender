@@ -4,7 +4,9 @@ import pytest
 
 from stflip.experiments import (
     CUSTOM_PROFILE_ID,
+    DAM_BREAK_INSTANTANEOUS_CFL_1,
     DAM_BREAK_INSTANTANEOUS_CFL_16,
+    DAM_BREAK_INSTANTANEOUS_PROFILES,
     DAM_BREAK_PROFILES,
     ENSTROPHY_PROFILES,
     LAMINAR_DAM_BREAK_PROFILES,
@@ -110,16 +112,20 @@ def test_laminar_dam_break_sweep_matches_figure_8_targets():
                for profile in LAMINAR_DAM_BREAK_PROFILES)
 
 
-def test_instantaneous_profile_changes_only_temporal_sampling_at_cfl16():
-    st_cfl16 = DAM_BREAK_PROFILES[-1]
-    ablation = DAM_BREAK_INSTANTANEOUS_CFL_16
-
-    assert ablation.cfl_target == st_cfl16.cfl_target == 16.0
-    assert ablation.st_enabled is False
-    assert st_cfl16.st_enabled is True
-    assert _settings_without(ablation, "st_enabled") == _settings_without(
-        st_cfl16, "st_enabled")
-    assert "not the paper's standard-FLIP/GFM" in ablation.description
+def test_instantaneous_profiles_complete_matched_cfl1_and_cfl16_matrix():
+    assert DAM_BREAK_INSTANTANEOUS_PROFILES == (
+        DAM_BREAK_INSTANTANEOUS_CFL_1,
+        DAM_BREAK_INSTANTANEOUS_CFL_16,
+    )
+    st_profiles = (DAM_BREAK_PROFILES[0], DAM_BREAK_PROFILES[-1])
+    for st_profile, ablation in zip(
+            st_profiles, DAM_BREAK_INSTANTANEOUS_PROFILES):
+        assert ablation.cfl_target == st_profile.cfl_target
+        assert ablation.st_enabled is False
+        assert st_profile.st_enabled is True
+        assert _settings_without(ablation, "st_enabled") == _settings_without(
+            st_profile, "st_enabled")
+        assert "not the paper's standard-FLIP/GFM" in ablation.description
 
 
 def test_enstrophy_matrix_changes_only_cfl_and_flip_fraction():
