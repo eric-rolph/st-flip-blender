@@ -404,8 +404,8 @@ def run(backend: str = "cuda") -> dict:
             raise AssertionError(
                 f"requested {backend!r}, bake used {meta['backend']!r}"
             )
-        if meta.get("version") != 5 or meta.get("settings", {}).get("seed") != 0:
-            raise AssertionError("cache metadata lacks the v5 settings snapshot")
+        if meta.get("version") != 6 or meta.get("settings", {}).get("seed") != 0:
+            raise AssertionError("cache metadata lacks the v6 settings snapshot")
         if meta.get("addon_version") != installed_version:
             raise AssertionError("cache metadata add-on version is stale")
         if not settings.cache_id or meta.get("cache_owner_id") != settings.cache_id:
@@ -485,6 +485,10 @@ def run(backend: str = "cuda") -> dict:
 
         # Exercise the user-facing long-bake path: extend the requested range,
         # restore frame 2, and continue without replacing committed history.
+        # Selecting Paper after a Fast-only bake must not silently display the
+        # Geometry Nodes preview or make derived output block checkpoint resume.
+        preview_surface = settings.surface_object
+        settings.surface_method = "PAPER_MCF"
         scene.frame_end = 3
         _finished(bpy.ops.stflip.resume_bake(), "resume bake")
         meta = json.loads((cache_dir / "stflip_meta.json").read_text("utf-8"))
@@ -510,6 +514,19 @@ def run(backend: str = "cuda") -> dict:
         if (lifecycle.get("state") != "COMPLETE"
                 or lifecycle.get("last_committed_frame") != 3):
             raise AssertionError("resumed lifecycle was not persisted")
+        preview_modifier = preview_surface.modifiers.get("STFLIP Surface")
+        if ("surface_reconstruction" in meta
+                or not preview_surface.hide_render
+                or (preview_modifier is not None
+                    and (preview_modifier.show_viewport
+                         or preview_modifier.show_render))):
+            raise AssertionError(
+                "Paper-without-cache resume silently exposed the fast preview")
+        settings.surface_method = "FAST_PREVIEW"
+        _finished(
+            bpy.ops.stflip.refresh_surface(),
+            "restore preview after derived-free resume",
+        )
 
         metrics = stflip_cache.read_metrics(
             str(cache_dir), stflip_cache.baked_frames(str(cache_dir)))
@@ -620,6 +637,93 @@ def run(backend: str = "cuda") -> dict:
         smoothing = surface.modifiers.get("STFLIP Geometric Smoothing")
         if not np.isclose(smoothing.lambda_factor, 0.17):
             raise AssertionError("surface refresh did not update smoothing")
+
+        # Reconstruct every committed particle frame through the installed
+        # Appendix-B path. Two configurations exercise atomic activation,
+        # provenance-specific cache names, OpenVDB extraction, handler
+        # playback, and switching back to the fast preview.
+        settings.surface_method = "PAPER_MCF"
+        settings.paper_mcf_iterations = 2
+        settings.paper_mesh_adaptivity = 0.0
+        settings.paper_max_reconstruction_voxels = 1_000_000
+        _finished(
+            bpy.ops.stflip.rebuild_paper_surfaces(),
+            "initial paper surface rebuild",
+        )
+        meta = json.loads(metadata_path.read_text("utf-8"))
+        first_surface_meta = meta.get("surface_reconstruction", {})
+        first_surface_fingerprint = first_surface_meta.get("fingerprint")
+        if (first_surface_meta.get("state") != "COMPLETE"
+                or first_surface_meta.get("config", {}).get(
+                    "mcf_iterations") != 2
+                or not isinstance(first_surface_fingerprint, str)
+                or len(first_surface_fingerprint) != 64):
+            raise AssertionError("initial paper cache was not activated")
+        if stflip_cache.surface_frames(
+                str(cache_dir), first_surface_fingerprint) != [1, 2, 3]:
+            raise AssertionError("initial paper cache has incomplete coverage")
+        paper_surface = settings.surface_object
+        paper_modifier = paper_surface.modifiers.get("STFLIP Surface")
+        if (paper_surface.get("stflip_surface_method") != "PAPER_MCF"
+                or len(paper_surface.data.polygons) == 0
+                or (paper_modifier is not None
+                    and (paper_modifier.show_viewport
+                         or paper_modifier.show_render))):
+            raise AssertionError(
+                "paper mesh is not the visible installed surface output")
+
+        settings.paper_mcf_iterations = 3
+        _finished(
+            bpy.ops.stflip.rebuild_paper_surfaces(),
+            "replacement paper surface rebuild",
+        )
+        meta = json.loads(metadata_path.read_text("utf-8"))
+        second_surface_meta = meta.get("surface_reconstruction", {})
+        second_surface_fingerprint = second_surface_meta.get("fingerprint")
+        if (second_surface_meta.get("state") != "COMPLETE"
+                or second_surface_fingerprint == first_surface_fingerprint
+                or stflip_cache.surface_frames(
+                    str(cache_dir), second_surface_fingerprint) != [1, 2, 3]):
+            raise AssertionError(
+                "replacement paper configuration was not atomically activated")
+        for frame in (1, 2, 3):
+            particle_frame = stflip_cache.read_frame(str(cache_dir), frame)
+            paper_frame = stflip_cache.read_surface(
+                str(cache_dir),
+                frame,
+                second_surface_fingerprint,
+                expected_source_positions=particle_frame[0],
+            )
+            if paper_frame is None or len(paper_frame[0]) == 0:
+                raise AssertionError(
+                    f"paper frame {frame} failed source-bound cache validation")
+
+        scene.frame_set(1)
+        paper_frame_one_counts = (
+            len(paper_surface.data.vertices), len(paper_surface.data.polygons))
+        scene.frame_set(2)
+        scene.frame_set(1)
+        if paper_frame_one_counts != (
+                len(paper_surface.data.vertices),
+                len(paper_surface.data.polygons)):
+            raise AssertionError("paper frame playback is not reproducible")
+
+        settings.surface_method = "FAST_PREVIEW"
+        _finished(bpy.ops.stflip.refresh_surface(), "restore fast surface")
+        if (paper_surface.get("stflip_surface_method") != "FAST_PREVIEW"
+                or paper_modifier is None
+                or not paper_modifier.show_viewport
+                or not paper_modifier.show_render):
+            raise AssertionError("fast preview was not restored after paper mode")
+        settings.surface_method = "PAPER_MCF"
+        _finished(bpy.ops.stflip.refresh_surface(), "restore cached paper surface")
+        if (paper_surface.get("stflip_surface_method") != "PAPER_MCF"
+                or paper_modifier.show_viewport
+                or paper_modifier.show_render):
+            raise AssertionError("cached paper mesh did not replace fast preview")
+        settings.surface_method = "FAST_PREVIEW"
+        _finished(bpy.ops.stflip.refresh_surface(), "leave fast surface active")
+
         owner_before_copy = settings.cache_id
         copied_scene_isolation = _validate_copied_scene_output_isolation(
             window, scene)
@@ -655,6 +759,12 @@ def run(backend: str = "cuda") -> dict:
             "velocity_attribute": True,
             "surface": surface.name,
             "surface_smoothing": True,
+            "paper_surface": {
+                "frames": 3,
+                "iterations": 3,
+                "fingerprint": second_surface_fingerprint,
+                "playback_reproducible": True,
+            },
             "fractional_solid_faces": boundary["fractional_face_count"],
             "initial_velocity_mode": source["initial_velocity_mode"],
             "initial_velocity_max_error": initial_velocity_max_error,

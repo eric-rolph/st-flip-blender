@@ -250,7 +250,26 @@ class STFLIPSettings(bpy.types.PropertyGroup):
     )
     create_surface: BoolProperty(
         name="Create Surface", default=True,
-        description="Attach a Geometry Nodes points-to-mesh surface",
+        description="Create either the fast Geometry Nodes preview or the "
+                    "paper-style reconstructed surface",
+    )
+    surface_method: EnumProperty(
+        name="Surface Method",
+        items=[
+            (
+                "FAST_PREVIEW",
+                "Fast Preview",
+                "Deterministic Geometry Nodes points-to-volume preview; "
+                "interactive, but not the paper's MCF reconstruction",
+            ),
+            (
+                "PAPER_MCF",
+                "Paper MCF",
+                "Paper-style dense reconstruction and mean-curvature-flow "
+                "iterations followed by CPU OpenVDB meshing",
+            ),
+        ],
+        default="FAST_PREVIEW",
     )
     particle_radius: FloatProperty(
         name="Particle Radius", default=0.5, min=0.1, max=2.0,
@@ -273,6 +292,33 @@ class STFLIPSettings(bpy.types.PropertyGroup):
     surface_smoothing_factor: FloatProperty(
         name="Smoothing Factor", default=0.35, min=-2.0, max=2.0,
         description="Lambda factor for Blender's Laplacian Smooth modifier",
+    )
+    paper_mcf_iterations: IntProperty(
+        name="MCF Iterations",
+        default=30,
+        min=1,
+        max=100,
+        description="Mean-curvature-flow reconstruction iterations; the "
+                    "paper uses 30",
+    )
+    paper_mesh_adaptivity: FloatProperty(
+        name="OpenVDB Mesh Adaptivity",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+        description="CPU OpenVDB polygon reduction; 0 preserves the full "
+                    "isosurface and matches the paper-facing default",
+    )
+    paper_max_reconstruction_voxels: IntProperty(
+        name="Max Reconstruction Voxels",
+        default=16_777_216,
+        min=262_144,
+        max=268_435_456,
+        soft_max=134_217_728,
+        description="Hard field-size cap for dense paper reconstruction; a "
+                    "separate conservative preflight estimates temporary, "
+                    "particle, OpenVDB, and live-solver memory",
     )
     bake_status: StringProperty(name="Bake Status", default="")
     bake_state: EnumProperty(

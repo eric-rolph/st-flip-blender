@@ -12,6 +12,12 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+from stflip import cache as core_cache
+from stflip import surface as core_surface
+
 
 def _package(name: str) -> types.ModuleType:
     module = types.ModuleType(name)
@@ -32,6 +38,22 @@ def _load_operators(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "bpy", bpy)
 
     cache = types.ModuleType(f"{root}.stflip.cache")
+    for attribute in (
+        "CHECKPOINT_SCHEMA",
+        "CHECKPOINT_VERSION",
+        "META_NAME",
+        "METRICS_NAME",
+        "SURFACE_CONFIG_SCHEMA",
+        "SURFACE_CONFIG_VERSION",
+        "SURFACE_SCHEMA",
+        "SURFACE_VERSION",
+        "SurfaceCacheError",
+        "surface_config_fingerprint",
+        "surface_mesh_fingerprint",
+        "surface_source_fingerprint",
+        "validate_surface_metadata",
+    ):
+        setattr(cache, attribute, getattr(core_cache, attribute))
     backend = types.ModuleType(f"{root}.stflip.backend")
     backend.cuda_available = lambda: False
     backend.cuda_device_name = lambda: None
@@ -47,6 +69,7 @@ def _load_operators(monkeypatch, tmp_path):
     velocity.SolidBodyRotation = object
     velocity.UniformVelocity = object
     monkeypatch.setitem(sys.modules, cache.__name__, cache)
+    monkeypatch.setitem(sys.modules, f"{root}.stflip.surface", core_surface)
     monkeypatch.setitem(sys.modules, backend.__name__, backend)
     monkeypatch.setitem(sys.modules, solver.__name__, solver)
     monkeypatch.setitem(sys.modules, velocity.__name__, velocity)
@@ -156,6 +179,70 @@ def test_memory_guard_uses_vram_for_cuda_without_blocking_normal_gpu(
     assert "VRAM" in reason
 
 
+def test_paper_surface_memory_estimate_includes_dense_fields_and_splat_scratch(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    voxels = 16_777_216
+    chunk = core_surface.DEFAULT_PARTICLE_CHUNK_SIZE
+
+    estimate = operators.estimate_paper_surface_memory(voxels)
+    with_particles = operators.estimate_paper_surface_memory(
+        voxels, particle_count=1_000_000)
+
+    assert estimate["stencil_candidate_count"] == 125
+    assert estimate["splat_scratch_bytes"] == chunk * 125 * 128
+    assert estimate["device_working_set_bytes"] == (
+        voxels * np.dtype(np.float32).itemsize * 40
+        + estimate["splat_scratch_bytes"])
+    assert estimate["cpu_working_set_bytes"] == (
+        estimate["device_working_set_bytes"])
+    assert estimate["cuda_host_working_set_bytes"] == (
+        voxels * np.dtype(np.float32).itemsize * 8)
+    assert (with_particles["device_working_set_bytes"]
+            - estimate["device_working_set_bytes"]) == 12_000_000
+    assert (with_particles["cpu_working_set_bytes"]
+            - estimate["cpu_working_set_bytes"]) == 24_000_000
+    assert (with_particles["cuda_host_working_set_bytes"]
+            - estimate["cuda_host_working_set_bytes"]) == 24_000_000
+
+
+def test_paper_surface_backend_decision_uses_one_backend_for_complete_cache(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    gib = 1024 ** 3
+    estimate = operators.estimate_paper_surface_memory(16_777_216)
+
+    enough = operators.paper_surface_backend_decision(
+        "cuda",
+        estimate,
+        ram_available=32 * gib,
+        vram_available=8 * gib,
+        reserved_ram_bytes=1 * gib,
+        reserved_vram_bytes=2 * gib,
+    )
+    fallback = operators.paper_surface_backend_decision(
+        "cuda",
+        estimate,
+        ram_available=16 * gib,
+        vram_available=4 * gib,
+        reserved_ram_bytes=1 * gib,
+        reserved_vram_bytes=2 * gib,
+    )
+    impossible = operators.paper_surface_backend_decision(
+        "cuda",
+        estimate,
+        ram_available=1 * gib,
+        vram_available=None,
+    )
+
+    assert enough == {"backend": "cuda", "warning": "", "error": ""}
+    assert fallback["backend"] == "cpu"
+    assert "complete Paper MCF cache" in fallback["warning"]
+    assert fallback["error"] == ""
+    assert impossible["backend"] is None
+    assert "CPU fallback is also unsafe" in impossible["error"]
+
+
 def test_normalize_cuda_diagnostics_accepts_mapping_and_object(
         monkeypatch, tmp_path):
     operators = _load_operators(monkeypatch, tmp_path)
@@ -187,3 +274,545 @@ def test_normalize_cuda_diagnostics_accepts_mapping_and_object(
     assert normalized["free_bytes"] == 3
     assert normalized["total_bytes"] == 5
     assert normalized["error"] == "kernel preflight failed"
+
+
+def test_paper_surface_config_pins_paper_and_discretization_constants(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+
+    config = operators.paper_surface_config(0.125, 30, 0.0, "cuda")
+
+    assert config["algorithm"] == "appendix_b_feature_preserving_mcf_v1"
+    assert config["rasterizer"] == "linear_subvoxel_union_v1"
+    assert config["schema"] == core_cache.SURFACE_CONFIG_SCHEMA
+    assert config["version"] == core_cache.SURFACE_CONFIG_VERSION
+    assert config["boundary"] == {
+        "gaussian": "constant_zero_extension_v1",
+        "mcf": "edge_neumann_v1",
+    }
+    assert config["particle_radius_dx"] == core_surface.SPHERE_RADIUS_DX
+    assert config["reconstruction_voxel_dx"] == core_surface.VOXEL_SIZE_DX
+    assert config["sphere_ramp_width_voxels"] == (
+        core_surface.SPHERE_RAMP_WIDTH_VOXELS)
+    assert config["gaussian_sigma_dx"] == core_surface.GAUSSIAN_SIGMA_DX
+    assert config["gaussian_truncate_sigma"] == core_surface.GAUSSIAN_TRUNCATE
+    assert config["feature_theta"] == core_surface.FEATURE_THRESHOLD
+    assert config["feature_zeta"] == core_surface.FEATURE_SLOPE
+    assert config["feature_epsilon"] == core_surface.FEATURE_EPSILON
+    assert config["gradient_epsilon"] == core_surface.NORMAL_EPSILON
+    assert config["isovalue"] == core_surface.SURFACE_ISOVALUE
+    assert config["mcf_iterations"] == 30
+    assert config["mesh_adaptivity"] == 0.0
+    assert config["backend"] == "cuda"
+
+
+def test_paper_surface_config_reads_live_surface_core_constants(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    monkeypatch.setattr(operators.surface_core, "FEATURE_THRESHOLD", 3.25)
+
+    config = operators.paper_surface_config(0.125, 30, 0.0, "cpu")
+
+    assert config["feature_theta"] == 3.25
+
+
+def test_paper_surface_fingerprint_is_config_specific_not_simulation_state(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    base = operators.paper_surface_config(0.25, 30, 0.0, "cpu")
+
+    first = operators.paper_surface_fingerprint(base)
+    second = operators.paper_surface_fingerprint(dict(base))
+    changed = dict(base, mcf_iterations=31)
+
+    assert first == second
+    assert len(first) == 64
+    assert first != operators.paper_surface_fingerprint(changed)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (0.0, 30, 0.0, "cpu"),
+        (0.1, 0, 0.0, "cpu"),
+        (0.1, -1, 0.0, "cpu"),
+        (0.1, 30, 1.1, "cpu"),
+        (0.1, 30, 0.0, "metal"),
+    ],
+)
+def test_paper_surface_config_rejects_invalid_values(
+        monkeypatch, tmp_path, args):
+    operators = _load_operators(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError):
+        operators.paper_surface_config(*args)
+
+
+def test_resume_extends_only_an_exact_current_paper_configuration(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    config = operators.paper_surface_config(0.25, 30, 0.0, "cpu")
+    fingerprint = operators.paper_surface_fingerprint(config)
+    metadata = operators.paper_surface_metadata(
+        config, fingerprint, 262_144, latest_frame=2, state="COMPLETE")
+
+    selected = operators.matching_resume_paper_surface_config(
+        metadata,
+        requested=True,
+        dx=0.25,
+        iterations=30,
+        adaptivity=0.0,
+    )
+    changed = operators.matching_resume_paper_surface_config(
+        metadata,
+        requested=True,
+        dx=0.25,
+        iterations=31,
+        adaptivity=0.0,
+    )
+    disabled = operators.matching_resume_paper_surface_config(
+        metadata,
+        requested=False,
+        dx=0.25,
+        iterations=30,
+        adaptivity=0.0,
+    )
+
+    assert selected == (config, fingerprint, "")
+    assert changed[0:2] == (None, None)
+    assert "will not be extended" in changed[2]
+    assert disabled == (None, None, "")
+
+
+def test_resume_ignores_failed_or_inconsistent_paper_cache(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    config = operators.paper_surface_config(0.25, 30, 0.0, "cpu")
+    fingerprint = operators.paper_surface_fingerprint(config)
+    failed = operators.paper_surface_metadata(
+        config, fingerprint, 262_144, latest_frame=1, state="FAILED")
+    inconsistent = operators.paper_surface_metadata(
+        config, "f" * 64, 262_144, latest_frame=1, state="COMPLETE")
+
+    for metadata in (failed, inconsistent, None):
+        selected = operators.matching_resume_paper_surface_config(
+            metadata,
+            requested=True,
+            dx=0.25,
+            iterations=30,
+            adaptivity=0.0,
+        )
+        assert selected[0:2] == (None, None)
+        assert "Rebuild Paper Surface Cache" in selected[2]
+
+
+def test_runtime_paper_failure_does_not_abort_particle_frame_commit(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    reports = []
+    writes = []
+    monkeypatch.setattr(
+        operators.cache,
+        "write_frame",
+        lambda *args, **kwargs: writes.append("frame"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operators.cache,
+        "write_checkpoint",
+        lambda *args, **kwargs: writes.append("checkpoint"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operators.cache,
+        "write_meta",
+        lambda *args, **kwargs: writes.append("metadata"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operators,
+        "_write_paper_surface_frame",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            MemoryError("surface allocation failed")),
+    )
+
+    stats = types.SimpleNamespace(
+        n_particles=1, steps=1, particles_removed=0)
+    solver = types.SimpleNamespace(
+        p=types.SimpleNamespace(dx=0.25),
+        be=types.SimpleNamespace(name="cuda"),
+        step_frame=lambda: stats,
+        get_render_particles=lambda: (
+            np.zeros((1, 3), dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+        ),
+        checkpoint_state=lambda: {},
+    )
+    settings = types.SimpleNamespace(
+        bake_state="RUNNING", bake_status="", bake_error="", bake_progress=0.0)
+    scene = types.SimpleNamespace(
+        stflip=settings,
+        frame_set=lambda frame: writes.append(("display", frame)),
+    )
+    surface_meta = {"state": "RUNNING"}
+    operators._BAKE.update({
+        "solver": solver,
+        "scene": scene,
+        "cache_dir": str(tmp_path),
+        "frame": 1,
+        "end": 2,
+        "origin": np.zeros(3, dtype=np.float32),
+        "meta": {
+            "frame_start": 1,
+            "frame_end_baked": 1,
+            "checkpoint": {"fingerprint": "a" * 64},
+            "surface_reconstruction": surface_meta,
+        },
+        "paper_surface_config": {"backend": "cuda"},
+        "paper_surface_fingerprint": "b" * 64,
+        "paper_surface_backend": solver.be,
+        "paper_surface_max_voxels": 262_144,
+        "backend_label": "CUDA",
+        "collect_metrics": False,
+    })
+    operator = operators.STFLIP_OT_bake()
+    operator.report = lambda levels, message: reports.append((levels, message))
+
+    assert operator._bake_next_frame() is False
+
+    assert writes[:3] == ["frame", "checkpoint", "metadata"]
+    assert writes[-1] == ("display", 2)
+    assert operators._BAKE["meta"]["frame_end_baked"] == 2
+    assert operators._BAKE["meta"]["checkpoint"]["latest_frame"] == 2
+    assert surface_meta["state"] == "FAILED"
+    assert surface_meta["error"] == "surface allocation failed"
+    assert operators._BAKE["paper_surface_config"] is None
+    assert reports and reports[-1][0] == {"WARNING"}
+    operators._BAKE.clear()
+
+
+def test_reconstruction_honors_configured_backend_instead_of_caller_backend(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    selected = types.SimpleNamespace(
+        name="cpu",
+        xp="cpu-array-module",
+        synchronize=lambda: None,
+    )
+    passed = types.SimpleNamespace(name="cuda", xp="cuda-array-module")
+    observed = {}
+
+    def reconstruct(positions, dx, **kwargs):
+        observed["array_module"] = kwargs["array_module"]
+        return types.SimpleNamespace(
+            density=np.empty((0, 0, 0), dtype=np.float32),
+            origin=np.zeros(3, dtype=np.float32),
+            voxel_size=0.5,
+            diagnostics={"particle_count": 0},
+        )
+
+    monkeypatch.setattr(operators, "get_backend", lambda name: selected)
+    monkeypatch.setattr(operators.surface_core, "reconstruct_surface", reconstruct)
+    config = operators.paper_surface_config(0.25, 30, 0.0, "cpu")
+
+    operators._reconstruct_paper_surface(
+        np.empty((0, 3), dtype=np.float32),
+        0.25,
+        config,
+        1000,
+        passed,
+    )
+
+    assert observed["array_module"] == "cpu-array-module"
+
+
+def test_surface_rebuild_preflight_pins_cpu_fallback_in_config_and_state(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    gib = 1024 ** 3
+    reports = []
+    metadata = {
+        "dx": 0.25,
+        "frame_start": 1,
+        "frame_end_baked": 2,
+        "settings": {
+            "grid_dims": [48, 48, 48],
+            "particles_per_cell": 8,
+        },
+    }
+    settings = types.SimpleNamespace(
+        create_surface=True,
+        surface_method="PAPER_MCF",
+        backend="cuda",
+        paper_mcf_iterations=30,
+        paper_mesh_adaptivity=0.0,
+        paper_max_reconstruction_voxels=16_777_216,
+        bake_status="",
+    )
+    scene = types.SimpleNamespace(stflip=settings)
+    context = types.SimpleNamespace(scene=scene)
+    monkeypatch.setattr(
+        operators.cache, "read_meta", lambda path: metadata, raising=False)
+    monkeypatch.setattr(
+        operators.cache, "committed_frames", lambda path, meta: [1, 2],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operators.handlers, "scene_cache_ownership", lambda scene, meta: "owned",
+        raising=False,
+    )
+    monkeypatch.setattr(operators, "resolve_cache_dir", lambda scene: str(tmp_path))
+    monkeypatch.setattr(
+        operators,
+        "current_cuda_diagnostics",
+        lambda: {"available": True, "free_bytes": 3 * gib},
+    )
+    monkeypatch.setattr(
+        operators, "_system_available_memory_bytes", lambda: 16 * gib)
+    monkeypatch.setattr(
+        operators,
+        "get_backend",
+        lambda name: types.SimpleNamespace(name=name),
+    )
+    operator = operators.STFLIP_OT_rebuild_paper_surfaces()
+    operator.report = lambda level, message: reports.append((level, message))
+
+    assert operator._setup(context) is True
+
+    assert operators._SURFACE_BAKE["backend"].name == "cpu"
+    assert operators._SURFACE_BAKE["config"]["backend"] == "cpu"
+    assert operators._SURFACE_BAKE["fingerprint"] == (
+        operators.paper_surface_fingerprint(
+            operators._SURFACE_BAKE["config"]))
+    assert any(
+        "complete Paper MCF cache" in message
+        for _level, message in reports
+    )
+
+
+def test_surface_rebuild_refuses_noncontiguous_committed_particles(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    metadata = {
+        "dx": 0.25,
+        "frame_start": 1,
+        "frame_end_baked": 3,
+    }
+    settings = types.SimpleNamespace(
+        create_surface=True,
+        surface_method="PAPER_MCF",
+        backend="cpu",
+        paper_mcf_iterations=30,
+        paper_mesh_adaptivity=0.0,
+        paper_max_reconstruction_voxels=262_144,
+        bake_status="",
+    )
+    scene = types.SimpleNamespace(stflip=settings)
+    context = types.SimpleNamespace(scene=scene)
+    reports = []
+    monkeypatch.setattr(
+        operators.cache, "read_meta", lambda path: metadata, raising=False)
+    monkeypatch.setattr(
+        operators.cache,
+        "committed_frames",
+        lambda path, meta: [1, 3],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operators.handlers,
+        "scene_cache_ownership",
+        lambda scene, meta: "owned",
+        raising=False,
+    )
+    monkeypatch.setattr(operators, "resolve_cache_dir", lambda scene: str(tmp_path))
+    operator = operators.STFLIP_OT_rebuild_paper_surfaces()
+    operator.report = lambda levels, message: reports.append((levels, message))
+
+    assert operator._setup(context) is False
+    assert "missing or corrupt" in reports[-1][1]
+    assert operators._SURFACE_BAKE == {}
+
+
+def test_surface_visibility_never_reenables_gn_for_plain_paper_mesh(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    modifier = types.SimpleNamespace(show_viewport=True, show_render=True)
+
+    class Surface(dict):
+        hide_render = True
+        hide_viewport = True
+        modifiers = {"STFLIP Surface": modifier}
+
+        def hide_set(self, hidden):
+            self.hidden = hidden
+
+    surface = Surface(stflip_surface_method="PAPER_MCF")
+
+    operators._set_surface_enabled(surface, True)
+
+    assert surface.hide_render is False
+    assert surface.hide_viewport is False
+    assert surface.hidden is False
+    assert modifier.show_viewport is False
+    assert modifier.show_render is False
+
+    surface["stflip_surface_method"] = "FAST_PREVIEW"
+    operators._set_surface_enabled(surface, True)
+    assert modifier.show_viewport is True
+    assert modifier.show_render is True
+
+    operators._set_surface_enabled(surface, False)
+    assert modifier.show_viewport is False
+    assert modifier.show_render is False
+
+
+@pytest.mark.parametrize(
+    ("create_surface", "surface_method"),
+    [(False, "PAPER_MCF"), (True, "FAST_PREVIEW")],
+)
+def test_surface_rebuild_completion_does_not_apply_mesh_after_ui_mode_change(
+        monkeypatch, tmp_path, create_surface, surface_method):
+    operators = _load_operators(monkeypatch, tmp_path)
+    operators.cache.SURFACE_SCHEMA = "stflip-paper-surface"
+    operators.cache.SURFACE_VERSION = 1
+    metadata_writes = []
+    operators.cache.write_meta = (
+        lambda path, value: metadata_writes.append((path, value.copy())))
+    operators.cache.read_frame = lambda *args: pytest.fail(
+        "viewport particle frame was read after surface display was disabled")
+    operators.cache.read_surface = lambda *args, **kwargs: pytest.fail(
+        "viewport paper mesh was read after surface mode changed")
+    operators.mesher.ensure_paper_surface_object = (
+        lambda *args, **kwargs: pytest.fail(
+            "paper surface object was applied after surface mode changed"))
+
+    settings = types.SimpleNamespace(
+        create_surface=create_surface,
+        surface_method=surface_method,
+        surface_object=object(),
+        bake_status="",
+    )
+    scene = types.SimpleNamespace(
+        stflip=settings,
+        frame_current=1,
+    )
+    context = types.SimpleNamespace(
+        scene=scene,
+        window_manager=types.SimpleNamespace(),
+    )
+    operators._SURFACE_BAKE.update({
+        "running": True,
+        "scene": scene,
+        "frames": [1],
+        "config": {"schema": "test"},
+        "fingerprint": "a" * 64,
+        "max_voxels": 16_777_216,
+        "meta": {"frame_start": 1, "frame_end_baked": 1},
+        "cache_dir": str(tmp_path),
+        "backend": types.SimpleNamespace(name="cpu"),
+        "latest_diagnostics": None,
+    })
+    operator = operators.STFLIP_OT_rebuild_paper_surfaces()
+
+    result = operator._finish(context, "COMPLETE")
+
+    assert result == {"FINISHED"}
+    assert len(metadata_writes) == 1
+    assert metadata_writes[0][1]["surface_reconstruction"]["state"] == (
+        "COMPLETE")
+    assert settings.bake_status == "Paper surface cache complete (1 frames; cpu)"
+    assert operators._SURFACE_BAKE == {}
+
+
+def _active_surface_finish_state(operators, tmp_path):
+    config = operators.paper_surface_config(0.25, 30, 0.0, "cpu")
+    fingerprint = operators.paper_surface_fingerprint(config)
+    settings = types.SimpleNamespace(
+        create_surface=True,
+        surface_method="PAPER_MCF",
+        surface_object=object(),
+        bake_status="",
+    )
+    scene = types.SimpleNamespace(stflip=settings, frame_current=1)
+    context = types.SimpleNamespace(
+        scene=scene,
+        window_manager=types.SimpleNamespace(),
+    )
+    operators._SURFACE_BAKE.update({
+        "running": True,
+        "scene": scene,
+        "frames": [1],
+        "config": config,
+        "fingerprint": fingerprint,
+        "max_voxels": 262_144,
+        "meta": {"frame_start": 1, "frame_end_baked": 1},
+        "cache_dir": str(tmp_path),
+        "backend": types.SimpleNamespace(name="cpu"),
+        "latest_diagnostics": {"voxel_count": 12},
+    })
+    operator = operators.STFLIP_OT_rebuild_paper_surfaces()
+    reports = []
+    operator.report = lambda levels, message: reports.append((levels, message))
+    return operator, context, settings, reports
+
+
+def test_surface_activation_survives_viewport_refresh_failure(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    operator, context, settings, reports = _active_surface_finish_state(
+        operators, tmp_path)
+    metadata_writes = []
+    monkeypatch.setattr(
+        operators.cache,
+        "write_meta",
+        lambda path, value: metadata_writes.append(value.copy()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operators.cache,
+        "read_frame",
+        lambda *args: (np.zeros((1, 3), dtype=np.float32), object()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operators.cache,
+        "read_surface",
+        lambda *args, **kwargs: (object(), object(), object()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operators.mesher,
+        "ensure_paper_surface_object",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("viewport unavailable")),
+        raising=False,
+    )
+
+    result = operator._finish(context, "COMPLETE")
+
+    assert result == {"FINISHED"}
+    assert metadata_writes[0]["surface_reconstruction"]["state"] == "COMPLETE"
+    assert "Paper surface cache complete" in settings.bake_status
+    assert reports[-1][0] == {"WARNING"}
+    assert "cache is active" in reports[-1][1]
+    assert operators._SURFACE_BAKE == {}
+
+
+def test_surface_activation_write_failure_is_caught_and_cleans_state(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    operator, context, settings, reports = _active_surface_finish_state(
+        operators, tmp_path)
+    monkeypatch.setattr(
+        operators.cache,
+        "write_meta",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        raising=False,
+    )
+
+    result = operator._finish(context, "COMPLETE")
+
+    assert result == {"CANCELLED"}
+    assert "activation failed: disk full" in settings.bake_status
+    assert reports[-1][0] == {"ERROR"}
+    assert operators._SURFACE_BAKE == {}

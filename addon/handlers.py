@@ -263,6 +263,10 @@ def _apply_frame(scene, frame: int) -> bool:
     attr.data.foreach_set(
         "vector", np.ascontiguousarray(vel, dtype=np.float32).ravel())
     me.update()
+    # Paper reconstruction is a derived display cache.  Once particles have
+    # loaded successfully, a missing or invalid paper mesh must never turn the
+    # authoritative particle frame into a playback failure.
+    _apply_paper_surface_frame(scene, cache_dir, meta, f, pos)
     return True
 
 
@@ -293,20 +297,32 @@ def _scene_particle_object(scene):
     return obj if obj is not None and _object_in_scene(scene, obj) else None
 
 
-def _mesh_is_shared_with_other_scene(scene, obj) -> bool:
-    return not mesher.output_is_exclusive(scene, obj)
+def _scene_bound_surface_object(scene):
+    """Return only this scene's existing, exclusive surface binding.
+
+    Frame handlers must not create output objects or fall back to a globally
+    named surface: either could mutate a different scene's visible result.
+    """
+    settings = getattr(scene, "stflip", None)
+    obj = getattr(settings, "surface_object", None) if settings else None
+    if (obj is None or getattr(obj, "type", None) != "MESH"
+            or not _object_in_scene(scene, obj)):
+        return None
+    return obj if mesher.output_is_exclusive(scene, obj) else None
 
 
-def clear_scene_output(scene) -> bool:
-    """Empty this scene's particle mesh so its driven surface is also empty."""
-    obj = _scene_particle_object(scene)
-    if obj is None or getattr(obj, "type", None) != "MESH":
-        return False
-    # Linked scene copies can share the object or its mesh datablock. Clearing
-    # either would destroy the valid output in the owning scene, so only a
-    # scene-exclusive output may be mutated here.
-    if _mesh_is_shared_with_other_scene(scene, obj):
-        return False
+def _is_plain_paper_surface(obj) -> bool:
+    try:
+        method = obj.get("stflip_surface_method", "")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        try:
+            method = getattr(obj, "stflip_surface_method", "")
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return False
+    return str(method or "").upper() == "PAPER_MCF"
+
+
+def _clear_mesh_geometry(obj) -> bool:
     mesh = getattr(obj, "data", None)
     if mesh is None or not hasattr(mesh, "clear_geometry"):
         return False
@@ -319,6 +335,82 @@ def clear_scene_output(scene) -> bool:
     except (AttributeError, ReferenceError, RuntimeError, TypeError):
         return False
     return True
+
+
+def _clear_scene_paper_surface(scene, obj=None) -> bool:
+    surface = _scene_bound_surface_object(scene) if obj is None else obj
+    if surface is None or not _is_plain_paper_surface(surface):
+        return False
+    return _clear_mesh_geometry(surface)
+
+
+def _apply_paper_surface_frame(
+    scene,
+    cache_dir: str,
+    meta: dict,
+    frame: int,
+    source_positions,
+) -> bool:
+    """Best-effort playback of one cached Appendix-B surface mesh."""
+    settings = getattr(scene, "stflip", None)
+    if (settings is None
+            or not bool(getattr(settings, "create_surface", False))
+            or str(getattr(settings, "surface_method", "")) != "PAPER_MCF"):
+        return False
+
+    surface = _scene_bound_surface_object(scene)
+    if surface is None:
+        return False
+    reconstruction = meta.get("surface_reconstruction")
+    try:
+        fingerprint = cache.validate_surface_metadata(reconstruction)
+    except cache.SurfaceCacheError:
+        _clear_scene_paper_surface(scene, surface)
+        return False
+
+    try:
+        paper_mesh = cache.read_surface(
+            cache_dir,
+            frame,
+            fingerprint,
+            expected_source_positions=source_positions,
+        )
+    except (cache.CheckpointError, cache.SurfaceCacheError):
+        _clear_scene_paper_surface(scene, surface)
+        return False
+    if paper_mesh is None:
+        _clear_scene_paper_surface(scene, surface)
+        return False
+    try:
+        mesher.update_paper_surface_mesh(surface, *paper_mesh)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _clear_scene_paper_surface(scene, surface)
+        return False
+    return True
+
+
+def _mesh_is_shared_with_other_scene(scene, obj) -> bool:
+    return not mesher.output_is_exclusive(scene, obj)
+
+
+def clear_scene_output(scene) -> bool:
+    """Empty scene-exclusive particle and plain paper-surface outputs."""
+    obj = _scene_particle_object(scene)
+    particle_cleared = False
+    if (obj is not None and getattr(obj, "type", None) == "MESH"
+            and not _mesh_is_shared_with_other_scene(scene, obj)):
+        particle_cleared = _clear_mesh_geometry(obj)
+
+    # Geometry Nodes preview output is driven by the particle mesh and needs no
+    # destructive mutation here.  A cached PAPER_MCF result is ordinary mesh
+    # geometry, so clear an exclusive bound instance explicitly.
+    surface = _scene_bound_surface_object(scene)
+    surface_cleared = False
+    if surface is not obj:
+        surface_cleared = _clear_scene_paper_surface(scene, surface)
+    elif _is_plain_paper_surface(surface):
+        surface_cleared = particle_cleared
+    return particle_cleared or surface_cleared
 
 
 def _expects_persisted_cache(settings) -> bool:

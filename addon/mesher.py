@@ -1,12 +1,16 @@
-"""Geometry Nodes surfacing: points -> volume -> mesh.
+"""Blender surfacing helpers for preview and paper-style reconstruction.
 
-Builds a node group that pulls the baked particle object's vertices, splats
-them as spheres into a volume, and meshes the result -- the standard Blender
-way to get a renderable liquid surface that works with materials, motion
-blur (via the velocity attribute), and normal modifier stacks.
+The fast preview path builds a Geometry Nodes graph that pulls the baked
+particle object's vertices, splats them into a volume, and meshes the result.
+The paper path accepts an already reconstructed density field or polygon mesh
+and writes ordinary Blender mesh geometry without a live Geometry Nodes
+dependency.
 """
 
+import math
+
 import bpy
+import numpy as np
 
 GROUP_NAME = "STFLIP_Surface"
 SURFACE_OBJ = "STFLIP Liquid Surface"
@@ -14,7 +18,7 @@ PARTICLE_OBJ = "STFLIP Particles"
 SURFACE_MODIFIER = "STFLIP Surface"
 SMOOTH_MODIFIER = "STFLIP Geometric Smoothing"
 GROUP_SCHEMA_KEY = "stflip_schema_version"
-GROUP_SCHEMA_VERSION = 2
+GROUP_SCHEMA_VERSION = 3
 
 _INTERFACE_SCHEMA = (
     ("Geometry", "INPUT", "NodeSocketGeometry"),
@@ -97,10 +101,15 @@ def _populate_node_group(ng):
     ptv = ng.nodes.new("GeometryNodePointsToVolume")
     ptv.location = (-200, 0)
     _set_resolution_mode(ptv, "VOXEL_SIZE", "Size")
+    # Do not inherit Blender-version or user-preference defaults. These values
+    # define the preview field and therefore must be deterministic.
+    ptv.inputs["Density"].default_value = 1.0
 
     vtm = ng.nodes.new("GeometryNodeVolumeToMesh")
     vtm.location = (0, 0)
     _set_resolution_mode(vtm, "GRID", "Grid")
+    vtm.inputs["Threshold"].default_value = 0.5
+    vtm.inputs["Adaptivity"].default_value = 0.0
 
     smooth = ng.nodes.new("GeometryNodeSetShadeSmooth")
     smooth.location = (200, 0)
@@ -392,11 +401,8 @@ def _link_if_needed(obj):
         scene.collection.objects.link(obj)
 
 
-def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
-                          voxel_factor: float, existing_obj=None):
-    """Create/update the surface object driven by the particle object."""
-    ng = build_node_group()
-
+def _ensure_surface_output(existing_obj=None):
+    """Return a scene-exclusive surface object, creating one if necessary."""
     obj = _mesh_output(existing_obj, "surface_object", SURFACE_OBJ)
     if obj is None:
         mesh = bpy.data.meshes.new(SURFACE_OBJ)
@@ -404,11 +410,41 @@ def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
         bpy.context.scene.collection.objects.link(obj)
     else:
         _link_if_needed(obj)
+    _bind_scene_object("surface_object", obj)
+    return obj
+
+
+def _set_modifier_enabled(obj, name: str, enabled: bool):
+    """Enable/disable one generated modifier without destroying its setup."""
+    if obj is None:
+        return None
+    modifier = obj.modifiers.get(name)
+    if modifier is None:
+        return None
+    modifier.show_viewport = bool(enabled)
+    modifier.show_render = bool(enabled)
+    return modifier
+
+
+def _stamp_surface_method(obj, method: str) -> None:
+    try:
+        obj["stflip_surface_method"] = method
+    except (AttributeError, KeyError, RuntimeError, TypeError):
+        pass
+
+
+def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
+                          voxel_factor: float, existing_obj=None):
+    """Create/update the surface object driven by the particle object."""
+    ng = build_node_group()
+    obj = _ensure_surface_output(existing_obj)
 
     mod = obj.modifiers.get(SURFACE_MODIFIER)
     if mod is None:
         mod = obj.modifiers.new(SURFACE_MODIFIER, "NODES")
     mod.node_group = ng
+    mod.show_viewport = True
+    mod.show_render = True
 
     for name, value in (("Points Object", particle_obj),
                         ("Radius", dx * radius_factor),
@@ -417,9 +453,199 @@ def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
         ident = _socket_identifier(ng, name)
         if ident is not None:
             mod[ident] = value
+    _stamp_surface_method(obj, "FAST_PREVIEW")
     obj.update_tag()
-    _bind_scene_object("surface_object", obj)
     return obj
+
+
+def restore_preview_surface(particle_obj, dx: float, radius_factor: float,
+                            voxel_factor: float, existing_obj=None):
+    """Restore the deterministic Geometry Nodes preview after paper mode."""
+    return ensure_surface_object(
+        particle_obj,
+        dx,
+        radius_factor,
+        voxel_factor,
+        existing_obj=existing_obj,
+    )
+
+
+def _polygon_array(value, width: int, name: str) -> np.ndarray:
+    array = np.asarray(value)
+    if array.size == 0:
+        return np.empty((0, width), dtype=np.int32)
+    if array.ndim != 2 or array.shape[1] != width:
+        raise ValueError(f"{name} must have shape (N, {width})")
+    if not np.issubdtype(array.dtype, np.integer):
+        raise TypeError(f"{name} must contain integer vertex indices")
+    return np.ascontiguousarray(array, dtype=np.int64)
+
+
+def _validated_polygon_mesh(vertices, triangles, quads):
+    try:
+        points = np.asarray(vertices)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("vertices must be a finite numeric (N, 3) array") from exc
+    if points.size == 0:
+        points = np.empty((0, 3), dtype=np.float32)
+    if (points.ndim != 2 or points.shape[1:] != (3,)
+            or not np.issubdtype(points.dtype, np.number)
+            or not np.isrealobj(points)):
+        raise ValueError("vertices must be a finite numeric (N, 3) array")
+    try:
+        finite = bool(np.all(np.isfinite(points)))
+    except TypeError as exc:
+        raise ValueError("vertices must be a finite numeric (N, 3) array") from exc
+    if not finite:
+        raise ValueError("vertices must be a finite numeric (N, 3) array")
+    points = np.ascontiguousarray(points, dtype=np.float32)
+    tris = _polygon_array(triangles, 3, "triangles")
+    quad_array = _polygon_array(quads, 4, "quads")
+    for name, faces in (("triangles", tris), ("quads", quad_array)):
+        if faces.size and (
+                int(faces.min()) < 0 or int(faces.max()) >= len(points)):
+            raise ValueError(f"{name} contain an out-of-range vertex index")
+    return points, tris, quad_array
+
+
+def density_field_to_polygons(
+    density,
+    origin,
+    voxel_size: float,
+    isovalue: float = 0.5,
+    adaptivity: float = 0.0,
+):
+    """Extract a world-space polygon mesh with Blender's OpenVDB module.
+
+    OpenVDB is imported lazily so the add-on and its CPU/CUDA solver remain
+    usable in Blender builds where the optional Python module is unavailable.
+    Meshing itself is CPU work and is not accelerated by the CUDA solver.
+    """
+    try:
+        values = np.asarray(density)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("density must be a finite numeric 3D array") from exc
+    if (values.ndim != 3 or any(axis <= 0 for axis in values.shape)
+            or not np.issubdtype(values.dtype, np.number)
+            or not np.isrealobj(values)):
+        raise ValueError("density must be a finite numeric 3D array")
+    try:
+        finite_density = bool(np.all(np.isfinite(values)))
+    except TypeError as exc:
+        raise ValueError("density must be a finite numeric 3D array") from exc
+    if not finite_density:
+        raise ValueError("density must be a finite numeric 3D array")
+    values = np.ascontiguousarray(values, dtype=np.float32)
+
+    try:
+        world_origin = np.asarray(origin, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("origin must contain three finite values") from exc
+    if world_origin.shape != (3,) or not bool(np.all(np.isfinite(world_origin))):
+        raise ValueError("origin must contain three finite values")
+
+    try:
+        voxel = float(voxel_size)
+        level = float(isovalue)
+        adaptive = float(adaptivity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "voxel_size, isovalue, and adaptivity must be finite scalars"
+        ) from exc
+    if not math.isfinite(voxel) or voxel <= 0.0:
+        raise ValueError("voxel_size must be finite and positive")
+    if not math.isfinite(level):
+        raise ValueError("isovalue must be finite")
+    if not math.isfinite(adaptive) or not 0.0 <= adaptive <= 1.0:
+        raise ValueError("adaptivity must be between 0 and 1")
+
+    try:
+        import openvdb  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "Paper MCF meshing requires Blender's OpenVDB Python module "
+            "('openvdb'); use an official Blender build with OpenVDB enabled"
+        ) from exc
+
+    try:
+        grid = openvdb.FloatGrid()
+        grid.copyFromArray(values)
+        transform = openvdb.createLinearTransform(voxelSize=voxel)
+        translate = getattr(transform, "postTranslate", None)
+        if translate is None:
+            translate = getattr(transform, "translate", None)
+        if translate is None:
+            raise AttributeError(
+                "the bundled OpenVDB transform has no translation API"
+            )
+        translate(tuple(float(value) for value in world_origin))
+        grid.transform = transform
+        vertices, triangles, quads = grid.convertToPolygons(
+            isovalue=level,
+            adaptivity=adaptive,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"OpenVDB surface extraction failed: {exc}") from exc
+    return _validated_polygon_mesh(vertices, triangles, quads)
+
+
+def _assign_water_material(mesh) -> None:
+    material = ensure_water_material()
+    materials = getattr(mesh, "materials", None)
+    if materials is None:
+        return
+    try:
+        if len(materials):
+            materials[0] = material
+        else:
+            materials.append(material)
+    except (AttributeError, IndexError, RuntimeError, TypeError):
+        try:
+            materials.clear()
+            materials.append(material)
+        except (AttributeError, RuntimeError, TypeError):
+            return
+    for polygon in getattr(mesh, "polygons", ()):
+        try:
+            polygon.material_index = 0
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+
+def update_paper_surface_mesh(obj, vertices, triangles, quads):
+    """Replace a scene-exclusive output with an ordinary polygon mesh."""
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        raise ValueError("paper surface output must be a Blender mesh object")
+    points, tris, quad_array = _validated_polygon_mesh(
+        vertices, triangles, quads)
+    mesh = getattr(obj, "data", None)
+    if mesh is None or not hasattr(mesh, "from_pydata"):
+        raise ValueError("paper surface output has no editable mesh datablock")
+    faces = [tuple(int(index) for index in face) for face in tris]
+    faces.extend(tuple(int(index) for index in face) for face in quad_array)
+    try:
+        mesh.clear_geometry()
+        mesh.from_pydata(points.tolist(), [], faces)
+        _assign_water_material(mesh)
+        mesh.update()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"failed to update paper surface mesh: {exc}") from exc
+    _set_modifier_enabled(obj, SURFACE_MODIFIER, False)
+    _set_modifier_enabled(obj, SMOOTH_MODIFIER, False)
+    _stamp_surface_method(obj, "PAPER_MCF")
+    obj.update_tag()
+    return obj
+
+
+def ensure_paper_surface_object(
+    vertices,
+    triangles,
+    quads,
+    existing_obj=None,
+):
+    """Create or update the scene-owned plain mesh used by paper surfacing."""
+    obj = _ensure_surface_output(existing_obj)
+    return update_paper_surface_mesh(obj, vertices, triangles, quads)
 
 
 def configure_surface_smoothing(obj, enabled: bool, iterations: int,
@@ -427,8 +653,8 @@ def configure_surface_smoothing(obj, enabled: bool, iterations: int,
     """Configure Blender-only post-process smoothing on a surface object.
 
     This intentionally uses Blender's Laplacian Smooth modifier.  It improves
-    the viewport/render mesh without changing cached particles and must not be
-    confused with the paper's unavailable mean-curvature-flow reconstruction.
+    the fast-preview mesh without changing cached particles and is distinct
+    from the paper MCF mode's cached density-field reconstruction.
     """
     if obj is None or getattr(obj, "type", None) != "MESH":
         return None

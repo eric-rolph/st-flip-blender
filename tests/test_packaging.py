@@ -14,6 +14,7 @@ def test_package_allowlist_excludes_development_files():
     assert "addon/operators.py" in relative
     assert "stflip/handoff.py" in relative
     assert "stflip/solver.py" in relative
+    assert "stflip/surface.py" in relative
     assert "stflip/validation.py" in relative
     assert not any(name.startswith((".git/", "tests/", "tmp/"))
                    for name in relative)
