@@ -10,6 +10,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from stflip import cache as core_cache
+from stflip import surface as core_surface
+
 
 ROOT = Path(__file__).parents[1]
 
@@ -47,6 +50,18 @@ def _load_operators(monkeypatch, tmp_path):
         ROOT / "stflip" / "velocity.py",
     )
     cache = types.ModuleType(f"{root}.stflip.cache")
+    for attribute in (
+        "CHECKPOINT_SCHEMA",
+        "CHECKPOINT_VERSION",
+        "META_NAME",
+        "METRICS_NAME",
+        "SURFACE_CONFIG_SCHEMA",
+        "SURFACE_CONFIG_VERSION",
+        "SURFACE_SCHEMA",
+        "SURFACE_VERSION",
+        "surface_config_fingerprint",
+    ):
+        setattr(cache, attribute, getattr(core_cache, attribute))
     backend = types.ModuleType(f"{root}.stflip.backend")
     backend.cuda_device_name = lambda: None
     backend.cuda_diagnostics = lambda *args, **kwargs: {
@@ -58,6 +73,7 @@ def _load_operators(monkeypatch, tmp_path):
     solver.Params = object
     solver.STFLIPSolver = object
     monkeypatch.setitem(sys.modules, cache.__name__, cache)
+    monkeypatch.setitem(sys.modules, f"{root}.stflip.surface", core_surface)
     monkeypatch.setitem(sys.modules, backend.__name__, backend)
     monkeypatch.setitem(sys.modules, solver.__name__, solver)
 

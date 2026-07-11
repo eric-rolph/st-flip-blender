@@ -1,7 +1,8 @@
 # ST-FLIP Fluid for Blender
 
 Large-time-step FLIP liquid simulation as an easy-to-use Blender addon, with
-optional NVIDIA CUDA GPU acceleration.
+optional NVIDIA CUDA GPU acceleration and a paper-defined Appendix-B render
+surface path.
 
 This is an independent implementation of **ST-FLIP**:
 
@@ -70,7 +71,9 @@ phase-field coherence surrogate, not an exact paper reproduction: it uses a
 dense unit-cube dam break and an internal diffuse-phase instantaneous ablation
 instead of standard FLIP/GFM or APIC. It does not replace the paper's
 predeclared `T=7` SDF/mass-slice studies or MCF-smoothed render-surface normal
-metric. Output hashes are audit fingerprints for the artifact's declared
+metric. The add-on now implements that surface operator, but the validator does
+not reproduce the paper's geometry or reference data. Output hashes are audit
+fingerprints for the artifact's declared
 Python/NumPy/backend environment, not bitwise-determinism claims across
 hardware or numerical-library versions.
 
@@ -155,10 +158,36 @@ The bake produces two objects:
 
 - **STFLIP Particles** — a point cloud with a `velocity` point attribute
   (usable for motion blur or Geometry Nodes).
-- **STFLIP Liquid Surface** — a Geometry Nodes
-  points → volume → mesh surface ready for materials and rendering.
-  Tune *Radius*, *Voxel Size*, and optional volume-preserving Laplacian
-  smoothing in the Surface panel, then press **Refresh Surface**.
+- **STFLIP Liquid Surface** — choose **Fast Preview** for deterministic
+  Geometry Nodes points → volume → mesh output, or **Paper MCF** for the
+  Appendix-B `0.5Δx` sphere union, 2× scalar grid, fixed feature mask, and
+  level-set mean-curvature flow before OpenVDB polygonization. Paper MCF uses
+  `kψ = 30` by default; the dense scalar stage follows the selected NumPy/CuPy
+  backend while OpenVDB meshing is CPU-only.
+
+Paper surfaces are derived cache entries, separate from restart checkpoints.
+When selected before a simulation bake, each committed output frame receives a
+matching surface mesh. **Rebuild Paper Surface Cache** regenerates every
+committed particle frame after changing MCF/adaptivity settings, is cancellable
+between frames, and activates the new configuration only after the full range
+finishes. A conservative preflight budgets the configured field cap, dense
+temporaries, particle copies, OpenVDB work, and any live solver. If the combined
+CUDA allocation is unsafe but host RAM is sufficient, the simulation remains
+on CUDA while the entire derived surface configuration is pinned to CPU—frames
+are never mixed across reconstruction backends. The voxel setting is a hard
+field-size cap, not by itself a memory guarantee. **Fast Preview** remains the
+recommended interactive/scrubbing mode.
+Each derived mesh is bound to the exact source-position hash, reconstruction
+configuration hash, frame number, and its own mesh hash.
+
+Surface reconstruction is not part of the authoritative solver transaction. A
+runtime OpenVDB, allocation, or derived-cache failure is recorded as a failed
+Paper cache while particle frames and exact resume checkpoints continue to
+commit. Resume follows the current Surface Method; it never revives an old
+Paper configuration after the user switches to Fast Preview or disables
+surfacing. A missing, failed, changed, or memory-unsafe Paper configuration is
+left inactive and can be regenerated over all committed frames with **Rebuild
+Paper Surface Cache**.
 
 Gravity comes from the scene's gravity settings; frame rate from the render
 settings.
@@ -210,6 +239,7 @@ solid support.
 | Initial / Inflow Velocity | §4.8 | Liquid and inflow sources can use uniform or solid-body rotational fields; inflows can be limited to an inclusive scene-frame range |
 | Outflow Mode | §4.8 | Interior particle-removal volume or exterior half-cell `p=0` pressure outlet |
 | Advanced Solver | §3.3, §3.7 | Liquid density, local advection CFL, PCG tolerance/limit, and relative density floor |
+| Paper MCF Surface | Appendix B | Fixed radius/voxel `0.5Δx`, Gaussian `σ=2Δx`, feature mask `θ=2, ζ=5`, and `0.5` isovalue; `kψ` defaults to 30 |
 
 ### Source velocity fields
 
@@ -245,7 +275,7 @@ so this is not presented as an exact reproduction.
 The **Experiment Diagnostics** panel provides parameter-only, paper-inspired
 profiles. They apply reproducible solver settings to the current Blender
 scene; they do **not** recreate the paper's geometry, reference solvers, or
-surface reconstruction:
+surface-error evaluation datasets:
 
 - Laminar dam break (§4.1): target CFL 1, 3, 5, 10, or 20.
 - Standard dam break (§4.3): target CFL 1, 2, 4, 8, or 16, plus explicitly
@@ -291,9 +321,9 @@ detail generator.
 
 ### Paper coverage
 
-Version 0.7 implements the paper's **single-phase, free-surface ST-FLIP
-core**; it is not a full reproduction of every solver variant and production
-example in the paper.
+Version 0.8 implements the paper's **single-phase, free-surface ST-FLIP core
+and Appendix-B render reconstruction**; it is not a full reproduction of every
+solver variant and production example in the paper.
 
 | Paper capability | Status in this add-on |
 |---|---|
@@ -302,12 +332,12 @@ example in the paper.
 | Reproducible reruns over paper-inspired CFL, particle-count, and FLIP/PIC parameter matrices | ST-FLIP-side profiles, auditable frame diagnostics, and a matched four-case batch validator are implemented; no true FLIP/GFM branches or exact paper scenes |
 | Single-phase liquid scenes with static mesh obstacles, inflows, and outflows | Implemented; inflows support uniform/rotational fields and active frame ranges; outflows support volume sinks and exterior atmospheric-pressure faces |
 | Fractional solid face apertures in Eq. 14–17 | Implemented for stationary mesh obstacles using an add-on-specific node-SDF reconstruction; moving/deforming solids remain unsupported |
-| Paper render reconstruction (`0.5Δx` spheres, 2× grid, MCF) | Partial; radius/voxel defaults match the first two values, but Geometry Nodes replaces MCF |
+| Paper render reconstruction (`0.5Δx` spheres, 2× grid, feature mask, MCF, `0.5` iso) | Implemented as an opt-in, versioned derived mesh cache; the paper does not prescribe the subvoxel rasterizer, so this implementation records its linear one-voxel coverage ramp explicitly |
 | Two-phase liquid/gas coupling | Not implemented |
 | APIC and implicit-density-projection comparison solvers | Not implemented |
 | Surface-tension examples | Not implemented |
 | Sparse/adaptive grids and billion-particle production scale | Not implemented |
-| Appendix B mean-curvature-flow output reconstruction | Not implemented; Geometry Nodes volume meshing is an approximation |
+| Appendix B mean-curvature-flow output reconstruction | Implemented with default `kψ=30`; OpenVDB extracts the render mesh and Fast Preview remains a separate approximation |
 | Animated/deforming obstacle boundary conditions | Not implemented |
 
 Experiment-level coverage is narrower than method-level coverage:
@@ -318,7 +348,7 @@ Experiment-level coverage is narrower than method-level coverage:
 | Static-obstacle wake and thin-obstacle inflow jet | Partial: an explicitly approximate High-CFL Jet Preview exercises a scheduled high-speed inflow, thin stationary cut-cell obstacle, and pressure outlet; the paper's exact geometry and jet parameters are unpublished |
 | Particle-count and FLIP-blend studies | ST-FLIP-side parameter profiles, deterministic seed, and enstrophy diagnostic are available; true FLIP/GFM branches, SDF RMSE, and batch-sweep tooling are not |
 | Kleefsman obstacle validation | Missing water-height gauges and experimental-data comparison |
-| MCF reconstruction study | Missing MCF and normal-RMSE evaluation |
+| MCF reconstruction study | MCF is implemented; the paper's reference surfaces and normal-RMSE evaluation dataset are unavailable |
 | Whirlpool, rotational fields, and outflow scenes | Partial: published rotation and pipe/domain dimensions are available in an approximate preview with a pressure outlet; exact fill height, timing, production scale, and rendering remain unpublished/unreproduced |
 | Two-phase glugging/discharge and production-scale scenes | Missing two-phase solver and sparse production grid |
 
@@ -328,17 +358,18 @@ FLIP/PIC blend, seed, backend, gravity, frame rate/range, per-source uniform
 or solid-body velocity (linear velocity, world center/axis, and signed angular
 speed), optional inflow active frames, both outflow modes, density,
 local CFL, PCG controls, and the relative density floor. Surface controls
-include live refresh plus optional Blender Laplacian smoothing, which is
-deliberately not labeled as the paper's MCF reconstruction. Every
+include deterministic Geometry Nodes preview settings plus a paper-MCF mode
+with iterations, OpenVDB adaptivity, a dense-grid voxel guard, cancellable
+full-cache rebuild, and live cached-frame refresh. Blender Laplacian smoothing
+remains preview-only and is deliberately not labeled as paper MCF. Every
 bake records these settings in its cache metadata. The solver's Python
 `Params` API additionally exposes liquid density, pressure tolerance/iteration
 limit, local advection CFL, the under-sampling threshold, and the relative
 density floor. Paper-stated defaults include `γ = 1`, `ηφ = 0.5`,
 `αFLIP = 0.98`, local CFL `= 1`, and PPE tolerance `= 1e-4`; the add-on also
-uses `ρ = 1000` and a 400-iteration PCG limit. The paper's `kψ = 30` belongs
-to the unimplemented MCF reconstruction. Controls for gas properties, surface
-tension, APIC, sparse-grid adaptivity, and MCF reconstruction do not exist
-because the corresponding algorithms are not implemented.
+uses `ρ = 1000` and a 400-iteration PCG limit. Paper MCF defaults to `kψ=30`.
+Controls for gas properties, surface tension, APIC, and sparse-grid adaptivity
+do not exist because the corresponding algorithms are not implemented.
 
 ## What's implemented
 
@@ -353,6 +384,9 @@ because the corresponding algorithms are not implemented.
 - Globally adaptive time stepping with even frame subdivision and strict
   grid-advector-bounded RK3 substeps (local CFL defaults to 1)
 - Particle re-synchronisation (un-jittering) at output frames
+- Appendix-B render reconstruction with a twice-resolution cropped density,
+  fixed Gaussian/self-quotient feature mask, 30-iteration default level-set
+  mean-curvature flow, strict derived mesh caches, and OpenVDB `0.5` isosurface
 - Stationary solid obstacles via cell/node-sampled voxelised SDF, fractional
   face apertures, and particle push-back; optionally scheduled inflow emitters
 - Uniform and right-handed solid-body liquid/inflow velocity fields, sampled
@@ -371,9 +405,8 @@ because the corresponding algorithms are not implemented.
   absence declarations for IDs, foam/spray labels, inferred detail, and AI
 
 Not (yet) implemented from the paper: two-phase air–liquid coupling, surface
-tension (CSF), APIC transfers, sparse/adaptive grids, mean-curvature-flow
-surface smoothing (Appendix B — the Geometry Nodes volume meshing stands in),
-and the paper's standard-FLIP/GFM and implicit-density-projection baselines.
+tension (CSF), APIC transfers, sparse/adaptive grids, and the paper's
+standard-FLIP/GFM and implicit-density-projection baselines.
 
 Known limitations: source, outlet, and obstacle geometry is voxelized at the
 first bake frame and remains static during the run; animated/deforming
@@ -382,7 +415,9 @@ Python BVH loop and gets slow above resolution ~128 — vectorizing it is on
 the roadmap. Temporal jitter randoms are drawn on the host for cross-backend
 determinism, costing a small per-step transfer on GPU. Exact resume checkpoints
 are intentionally uncompressed and can be substantially larger than playback
-frames.
+frames. Paper surfacing uses a dense cropped grid with `O(kψ V)` work and can
+also be memory-heavy; it is output-only, guarded by a field-size cap plus a
+conservative preflight, and does not change the solver trajectory.
 
 ### Headless / scripted baking
 
@@ -400,7 +435,7 @@ partial records are ignored and exports include only frames with valid cache
 files.
 
 `bpy.ops.stflip.resume_bake()` is also synchronous in an EXEC context. It
-requires an owned v0.7 checkpoint, unchanged simulation inputs, and a scene End
+requires an owned v0.8 checkpoint, unchanged simulation inputs, and a scene End
 frame later than the latest committed frame.
 
 ## Development

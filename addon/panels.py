@@ -2,7 +2,7 @@
 
 import bpy
 
-from .operators import current_cuda_diagnostics
+from .operators import current_cuda_diagnostics, surface_rebuild_running
 
 # Checking CUDA means importing CuPy; doing that inside draw() would stall
 # the UI (first import takes seconds) and re-run per redraw. Cache it.
@@ -268,20 +268,54 @@ class STFLIP_PT_display(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         st = context.scene.stflip
-        layout.enabled = st.bake_state != "RUNNING"
-        layout.prop(st, "create_surface")
-        col = layout.column(align=True)
+        simulation_running = st.bake_state == "RUNNING"
+        rebuilding = surface_rebuild_running()
+        layout.enabled = not simulation_running
+        controls = layout.column(align=True)
+        controls.enabled = not rebuilding
+        controls.prop(st, "create_surface")
+        col = controls.column(align=True)
         col.enabled = st.create_surface
-        col.prop(st, "particle_radius")
-        col.prop(st, "surface_voxel")
-        col.prop(st, "surface_smoothing")
-        smooth = col.column(align=True)
-        smooth.enabled = st.surface_smoothing
-        smooth.prop(st, "surface_smoothing_iterations")
-        smooth.prop(st, "surface_smoothing_factor")
-        col.label(text="Blender geometric smoothing; not paper MCF.",
-                  icon="INFO")
+        col.prop(st, "surface_method")
+        if st.surface_method == "FAST_PREVIEW":
+            col.prop(st, "particle_radius")
+            col.prop(st, "surface_voxel")
+            col.prop(st, "surface_smoothing")
+            smooth = col.column(align=True)
+            smooth.enabled = st.surface_smoothing
+            smooth.prop(st, "surface_smoothing_iterations")
+            smooth.prop(st, "surface_smoothing_factor")
+            col.label(text="Deterministic Geometry Nodes preview.",
+                      icon="INFO")
+            col.label(text="Laplacian smoothing is not paper MCF.")
+        else:
+            paper = col.column(align=True)
+            paper.prop(st, "paper_mcf_iterations")
+            paper.prop(st, "paper_mesh_adaptivity")
+            paper.prop(st, "paper_max_reconstruction_voxels")
+            paper.separator()
+            paper.label(text="Paper constants: radius 0.5Δx, voxel 0.5Δx",
+                        icon="INFO")
+            paper.label(text="Gaussian σ = 2Δx")
+            paper.label(text="Feature mask: θ = 2, ζ = 5")
+            paper.separator()
+            paper.label(text="Dense reconstruction uses NumPy or CuPy.",
+                        icon="INFO")
+            paper.label(text="Dense fields consume host RAM or CUDA VRAM.")
+            paper.label(text="OpenVDB polygonization uses CPU/RAM only.")
+            paper.separator()
+            paper.operator(
+                "stflip.rebuild_paper_surfaces",
+                icon="MOD_FLUIDSIM",
+                text="Rebuild Paper Surface Cache",
+            )
         col.operator("stflip.refresh_surface", icon="FILE_REFRESH")
+        if rebuilding:
+            layout.operator(
+                "stflip.cancel_surface_rebuild",
+                icon="CANCEL",
+                text="Cancel Surface Rebuild",
+            )
 
 
 CLASSES = (

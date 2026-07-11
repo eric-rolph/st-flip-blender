@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from numbers import Integral
 import os
 import re
 import tempfile
+import zipfile
 
 import numpy as np
 
@@ -22,9 +24,15 @@ META_NAME = "stflip_meta.json"
 METRICS_NAME = "stflip_metrics.jsonl"
 CHECKPOINT_SCHEMA = "stflip-solver-checkpoint"
 CHECKPOINT_VERSION = 1
+SURFACE_SCHEMA = "stflip-paper-surface"
+SURFACE_VERSION = 1
+SURFACE_CONFIG_SCHEMA = "stflip-paper-surface-config"
+SURFACE_CONFIG_VERSION = 2
 
 _FRAME_RE = re.compile(r"^stflip_(-?\d+)\.npz$")
 _CHECKPOINT_RE = re.compile(r"^stflip_checkpoint_(-?\d+)\.npz$")
+_SURFACE_RE = re.compile(
+    r"^stflip_surface_([0-9a-f]{64})_(-?\d+)\.npz$")
 _CHECKPOINT_KEYS = frozenset({
     "schema",
     "version",
@@ -41,6 +49,17 @@ _CHECKPOINT_KEYS = frozenset({
     "pressure_outflow_removed_total",
 })
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+_SURFACE_KEYS = frozenset({
+    "schema",
+    "version",
+    "frame",
+    "fingerprint",
+    "source_positions_sha256",
+    "mesh_sha256",
+    "vertices",
+    "triangles",
+    "quads",
+})
 
 OWNER_KEY = "cache_owner_id"
 OWNERSHIP_OWNED = "owned"
@@ -96,6 +115,258 @@ def checkpoint_path(cache_dir: str, frame: int) -> str:
     return os.path.join(cache_dir, f"stflip_checkpoint_{int(frame):06d}.npz")
 
 
+def surface_path(cache_dir: str, frame: int, fingerprint: str) -> str:
+    """Return the immutable paper-surface cache path for one configuration."""
+    if isinstance(frame, bool) or not isinstance(frame, Integral):
+        raise ValueError("surface frame must be an integer")
+    fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=False)
+    return os.path.join(
+        cache_dir,
+        f"stflip_surface_{fingerprint}_{int(frame):06d}.npz",
+    )
+
+
+class SurfaceCacheError(ValueError):
+    """A paper-surface cache entry exists but fails its strict schema."""
+
+
+def surface_config_fingerprint(config: dict) -> str:
+    """Hash one canonical, JSON-compatible reconstruction configuration."""
+    if not isinstance(config, dict):
+        raise SurfaceCacheError("surface configuration must be a mapping")
+    try:
+        encoded = json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+        raise SurfaceCacheError(
+            "surface configuration is not canonical JSON") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_surface_metadata(metadata: dict) -> str:
+    """Validate paper-cache provenance and return its configuration hash."""
+    if not isinstance(metadata, dict):
+        raise SurfaceCacheError("surface metadata must be a mapping")
+    if metadata.get("schema") != SURFACE_SCHEMA:
+        raise SurfaceCacheError("surface metadata schema is invalid")
+    version = metadata.get("version")
+    if (isinstance(version, bool) or not isinstance(version, Integral)
+            or int(version) != SURFACE_VERSION):
+        raise SurfaceCacheError("surface metadata version is unsupported")
+    if metadata.get("mode") != "PAPER_MCF":
+        raise SurfaceCacheError("surface metadata mode is invalid")
+
+    config = metadata.get("config")
+    if not isinstance(config, dict):
+        raise SurfaceCacheError("surface metadata configuration is invalid")
+    if config.get("schema") != SURFACE_CONFIG_SCHEMA:
+        raise SurfaceCacheError("surface configuration schema is invalid")
+    config_version = config.get("version")
+    if (isinstance(config_version, bool)
+            or not isinstance(config_version, Integral)
+            or int(config_version) != SURFACE_CONFIG_VERSION):
+        raise SurfaceCacheError("surface configuration version is unsupported")
+    try:
+        fingerprint = _checkpoint_fingerprint(
+            metadata.get("fingerprint"), allow_empty=False)
+    except CheckpointError as exc:
+        raise SurfaceCacheError(
+            "surface metadata fingerprint is invalid") from exc
+    if surface_config_fingerprint(config) != fingerprint:
+        raise SurfaceCacheError(
+            "surface metadata configuration fingerprint does not match")
+    return fingerprint
+
+
+def _surface_indices(value, width: int, name: str) -> np.ndarray:
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise SurfaceCacheError(f"surface {name} is not an index array") from exc
+    if array.ndim != 2 or array.shape[1:] != (width,):
+        raise SurfaceCacheError(
+            f"surface {name} must have shape (N, {width})")
+    if not np.issubdtype(array.dtype, np.integer):
+        raise SurfaceCacheError(f"surface {name} must contain integers")
+    owned = np.array(array, dtype=np.int32, order="C", copy=True)
+    if array.size and not np.array_equal(array, owned):
+        raise SurfaceCacheError(f"surface {name} indices exceed int32")
+    return owned
+
+
+def validate_surface_mesh(vertices, triangles, quads) -> tuple:
+    """Return owned canonical arrays for a Blender-compatible surface mesh."""
+    try:
+        vertices = np.asarray(vertices)
+    except (TypeError, ValueError) as exc:
+        raise SurfaceCacheError("surface vertices are not numeric") from exc
+    if (vertices.ndim != 2 or vertices.shape[1:] != (3,)
+            or not np.issubdtype(vertices.dtype, np.number)
+            or not np.isrealobj(vertices)):
+        raise SurfaceCacheError("surface vertices must have shape (N, 3)")
+    vertices = np.array(vertices, dtype=np.float32, order="C", copy=True)
+    if not bool(np.all(np.isfinite(vertices))):
+        raise SurfaceCacheError("surface vertices must be finite float32")
+    triangles = _surface_indices(triangles, 3, "triangles")
+    quads = _surface_indices(quads, 4, "quads")
+    vertex_count = int(vertices.shape[0])
+    for name, faces in (("triangles", triangles), ("quads", quads)):
+        if faces.size and (int(faces.min()) < 0
+                           or int(faces.max()) >= vertex_count):
+            raise SurfaceCacheError(
+                f"surface {name} reference missing vertices")
+    return vertices, triangles, quads
+
+
+def surface_source_fingerprint(positions) -> str:
+    """Hash the canonical float32 particle positions used by reconstruction."""
+    try:
+        array = np.asarray(positions)
+    except (TypeError, ValueError) as exc:
+        raise SurfaceCacheError("surface source positions are not numeric") from exc
+    if (array.ndim != 2 or array.shape[1:] != (3,)
+            or not np.issubdtype(array.dtype, np.number)
+            or not np.isrealobj(array)):
+        raise SurfaceCacheError(
+            "surface source positions must have shape (N, 3)")
+    owned = np.array(array, dtype="<f4", order="C", copy=True)
+    if not bool(np.all(np.isfinite(owned))):
+        raise SurfaceCacheError("surface source positions must be finite")
+    digest = hashlib.sha256()
+    digest.update(b"stflip-paper-surface-source-v1\0")
+    digest.update(np.asarray(owned.shape, dtype="<i8").tobytes())
+    digest.update(owned.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _surface_mesh_digest(vertices, triangles, quads) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"stflip-paper-surface-mesh-v1\0")
+    for label, array, dtype in (
+        (b"vertices", vertices, "<f4"),
+        (b"triangles", triangles, "<i4"),
+        (b"quads", quads, "<i4"),
+    ):
+        canonical = np.asarray(array, dtype=dtype, order="C")
+        digest.update(label + b"\0")
+        digest.update(np.asarray(canonical.shape, dtype="<i8").tobytes())
+        digest.update(canonical.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def surface_mesh_fingerprint(vertices, triangles, quads) -> str:
+    """Hash one validated mesh independently of NPZ container bytes."""
+    mesh = validate_surface_mesh(vertices, triangles, quads)
+    return _surface_mesh_digest(*mesh)
+
+
+def write_surface(
+    cache_dir: str,
+    frame: int,
+    fingerprint: str,
+    vertices,
+    triangles,
+    quads,
+    *,
+    source_positions=None,
+) -> str:
+    """Atomically cache one immutable Appendix-B output mesh."""
+    fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=False)
+    vertices, triangles, quads = validate_surface_mesh(
+        vertices, triangles, quads)
+    if source_positions is None:
+        source_positions = np.empty((0, 3), dtype=np.float32)
+    source_fingerprint = surface_source_fingerprint(source_positions)
+    mesh_fingerprint = _surface_mesh_digest(vertices, triangles, quads)
+    path = surface_path(cache_dir, frame, fingerprint)
+    fd, temporary = _atomic_path(cache_dir, ".npz")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            np.savez_compressed(
+                stream,
+                schema=np.asarray(SURFACE_SCHEMA),
+                version=np.asarray(SURFACE_VERSION, dtype=np.int64),
+                frame=np.asarray(int(frame), dtype=np.int64),
+                fingerprint=np.asarray(fingerprint),
+                source_positions_sha256=np.asarray(source_fingerprint),
+                mesh_sha256=np.asarray(mesh_fingerprint),
+                vertices=vertices,
+                triangles=triangles,
+                quads=quads,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return path
+
+
+def read_surface(
+    cache_dir: str,
+    frame: int,
+    fingerprint: str,
+    *,
+    expected_source_positions=None,
+):
+    """Read a strict cached paper mesh, returning ``None`` only if absent."""
+    fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=False)
+    path = surface_path(cache_dir, frame, fingerprint)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if set(data.files) != _SURFACE_KEYS:
+                raise SurfaceCacheError("surface archive keys do not match schema")
+            schema = data["schema"]
+            version = data["version"]
+            archived_frame = data["frame"]
+            archived_fingerprint = data["fingerprint"]
+            source_fingerprint = data["source_positions_sha256"]
+            mesh_fingerprint = data["mesh_sha256"]
+            if (schema.shape != () or schema.dtype.kind not in {"U", "S"}
+                    or str(schema.item()) != SURFACE_SCHEMA):
+                raise SurfaceCacheError("surface schema identifier is invalid")
+            if (version.shape != () or version.dtype != np.dtype(np.int64)
+                    or int(version) != SURFACE_VERSION):
+                raise SurfaceCacheError("surface schema version is unsupported")
+            if (archived_frame.shape != ()
+                    or archived_frame.dtype != np.dtype(np.int64)
+                    or int(archived_frame) != int(frame)):
+                raise SurfaceCacheError(
+                    "surface frame binding does not match filename")
+            archived_fingerprint = _checkpoint_fingerprint(
+                archived_fingerprint, allow_empty=False)
+            if archived_fingerprint != fingerprint:
+                raise SurfaceCacheError(
+                    "surface fingerprint binding does not match filename")
+            source_fingerprint = _checkpoint_fingerprint(
+                source_fingerprint, allow_empty=False)
+            if expected_source_positions is not None:
+                expected_source = surface_source_fingerprint(
+                    expected_source_positions)
+                if source_fingerprint != expected_source:
+                    raise SurfaceCacheError(
+                        "surface source particle positions do not match")
+            mesh = validate_surface_mesh(
+                data["vertices"], data["triangles"], data["quads"])
+            mesh_fingerprint = _checkpoint_fingerprint(
+                mesh_fingerprint, allow_empty=False)
+            if mesh_fingerprint != _surface_mesh_digest(*mesh):
+                raise SurfaceCacheError("surface mesh fingerprint does not match")
+            return mesh
+    except SurfaceCacheError:
+        raise
+    except (OSError, TypeError, ValueError, KeyError, EOFError,
+            zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise SurfaceCacheError(f"surface {frame} is corrupt") from exc
+
+
 def metrics_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, METRICS_NAME)
 
@@ -135,7 +406,8 @@ def read_frame(cache_dir: str, frame: int):
                     or not np.issubdtype(velocities.dtype, np.number)):
                 return None
             return positions, velocities
-    except (OSError, TypeError, ValueError, KeyError):
+    except (OSError, TypeError, ValueError, KeyError,
+            zipfile.BadZipFile, zipfile.LargeZipFile):
         return None
 
 
@@ -368,7 +640,8 @@ def read_checkpoint(
             return validate_checkpoint_state(state)
     except CheckpointError:
         raise
-    except (OSError, TypeError, ValueError, KeyError, EOFError) as exc:
+    except (OSError, TypeError, ValueError, KeyError, EOFError,
+            zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         raise CheckpointError(f"checkpoint {frame} is corrupt") from exc
 
 
@@ -583,6 +856,25 @@ def checkpoint_frames(cache_dir: str) -> list[int]:
             if read_checkpoint(cache_dir, frame) is not None:
                 out.append(frame)
         except CheckpointError:
+            continue
+    return sorted(set(out))
+
+
+def surface_frames(cache_dir: str, fingerprint: str) -> list[int]:
+    """Return strict paper-surface frames for one reconstruction config."""
+    fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=False)
+    if not os.path.isdir(cache_dir):
+        return []
+    out = []
+    for name in os.listdir(cache_dir):
+        match = _SURFACE_RE.fullmatch(name)
+        if match is None or match.group(1) != fingerprint:
+            continue
+        frame = int(match.group(2))
+        try:
+            if read_surface(cache_dir, frame, fingerprint) is not None:
+                out.append(frame)
+        except SurfaceCacheError:
             continue
     return sorted(set(out))
 

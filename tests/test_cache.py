@@ -50,6 +50,77 @@ def _checkpoint_state(n=2):
     }
 
 
+def _surface_mesh(offset=0.0):
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    vertices[:, 0] += offset
+    triangles = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    quads = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    return vertices, triangles, quads
+
+
+def _write_surface_archive(path, frame, fingerprint, **overrides):
+    vertices, triangles, quads = _surface_mesh()
+    payload = {
+        "schema": np.asarray(cache.SURFACE_SCHEMA),
+        "version": np.asarray(cache.SURFACE_VERSION, dtype=np.int64),
+        "frame": np.asarray(frame, dtype=np.int64),
+        "fingerprint": np.asarray(fingerprint),
+        "source_positions_sha256": np.asarray(
+            cache.surface_source_fingerprint(
+                np.empty((0, 3), dtype=np.float32))),
+        "mesh_sha256": np.asarray(cache.surface_mesh_fingerprint(
+            vertices, triangles, quads)),
+        "vertices": vertices.astype(np.float32),
+        "triangles": triangles.astype(np.int32),
+        "quads": quads.astype(np.int32),
+    }
+    payload.update(overrides)
+    with Path(path).open("wb") as stream:
+        np.savez_compressed(stream, **payload)
+
+
+def _paper_surface_config():
+    return {
+        "schema": cache.SURFACE_CONFIG_SCHEMA,
+        "version": cache.SURFACE_CONFIG_VERSION,
+        "algorithm": "appendix_b_feature_preserving_mcf_v1",
+        "mcf_iterations": 30,
+    }
+
+
+def _paper_surface_metadata(config=None):
+    config = _paper_surface_config() if config is None else config
+    return {
+        "schema": cache.SURFACE_SCHEMA,
+        "version": cache.SURFACE_VERSION,
+        "mode": "PAPER_MCF",
+        "config": config,
+        "fingerprint": cache.surface_config_fingerprint(config),
+    }
+
+
+def _damage_npz(path, damage):
+    path = Path(path)
+    payload = bytearray(path.read_bytes())
+    if damage == "truncated":
+        del payload[-10:]
+    else:
+        # Corrupt the first central-directory CRC while preserving a readable
+        # ZIP directory. Accessing that member must raise BadZipFile.
+        header = payload.find(b"PK\x01\x02")
+        assert header >= 0
+        payload[header + 16] ^= 0x01
+    path.write_bytes(payload)
+
+
 def test_frame_and_metadata_round_trip(tmp_path):
     positions = np.arange(15, dtype=np.float64).reshape(5, 3)
     velocities = -positions
@@ -91,6 +162,327 @@ def test_corrupt_cache_files_are_treated_as_missing(tmp_path):
 
     assert cache.read_frame(str(tmp_path), 7) is None
     assert cache.read_meta(str(tmp_path)) is None
+
+
+@pytest.mark.parametrize("damage", ["truncated", "crc"])
+def test_npz_readers_normalize_zip_container_damage(tmp_path, damage):
+    fingerprint = "6" * 64
+    positions = np.zeros((1, 3), dtype=np.float32)
+    surface = cache.write_surface(
+        str(tmp_path),
+        1,
+        fingerprint,
+        *_surface_mesh(),
+        source_positions=positions,
+    )
+    frame = cache.write_frame(str(tmp_path), 1, positions, positions)
+    checkpoint = cache.write_checkpoint(
+        str(tmp_path), 1, _checkpoint_state(1))
+    for path in (surface, frame, checkpoint):
+        _damage_npz(path, damage)
+
+    assert cache.read_frame(str(tmp_path), 1) is None
+    with pytest.raises(cache.SurfaceCacheError, match="corrupt"):
+        cache.read_surface(
+            str(tmp_path),
+            1,
+            fingerprint,
+            expected_source_positions=positions,
+        )
+    with pytest.raises(cache.CheckpointError, match="corrupt"):
+        cache.read_checkpoint(str(tmp_path), 1)
+
+
+def test_surface_metadata_validates_configuration_provenance():
+    metadata = _paper_surface_metadata()
+
+    assert cache.validate_surface_metadata(metadata) == metadata["fingerprint"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "metadata_schema",
+        "metadata_version",
+        "mode",
+        "config_schema",
+        "config_version",
+        "config_fingerprint",
+        "invalid_fingerprint",
+    ],
+)
+def test_surface_metadata_rejects_invalid_or_mismatched_provenance(mutation):
+    metadata = _paper_surface_metadata()
+    if mutation == "metadata_schema":
+        metadata["schema"] = "other-surface"
+    elif mutation == "metadata_version":
+        metadata["version"] = cache.SURFACE_VERSION + 1
+    elif mutation == "mode":
+        metadata["mode"] = "FAST_PREVIEW"
+    elif mutation == "config_schema":
+        metadata["config"]["schema"] = "other-config"
+    elif mutation == "config_version":
+        metadata["config"]["version"] = cache.SURFACE_CONFIG_VERSION + 1
+    elif mutation == "config_fingerprint":
+        metadata["config"]["mcf_iterations"] += 1
+    else:
+        metadata["fingerprint"] = "invalid"
+
+    with pytest.raises(cache.SurfaceCacheError):
+        cache.validate_surface_metadata(metadata)
+
+
+def test_surface_round_trip_returns_owned_canonical_arrays(tmp_path):
+    fingerprint = "a" * 64
+    vertices, triangles, quads = _surface_mesh()
+    expected = _surface_mesh()
+
+    path = cache.write_surface(
+        str(tmp_path), 4, fingerprint, vertices, triangles, quads)
+    vertices[:] = -99.0
+    triangles[:] = 0
+    quads[:] = 0
+
+    loaded = cache.read_surface(str(tmp_path), 4, fingerprint)
+
+    assert path == cache.surface_path(str(tmp_path), 4, fingerprint)
+    for array, dtype in zip(loaded, (np.float32, np.int32, np.int32)):
+        assert array.dtype == dtype
+        assert array.flags.c_contiguous
+        assert array.flags.owndata
+    for actual, source in zip(loaded, expected):
+        np.testing.assert_array_equal(actual, source.astype(actual.dtype))
+
+    loaded[0][0] = 123.0
+    reloaded = cache.read_surface(str(tmp_path), 4, fingerprint)
+    np.testing.assert_array_equal(
+        reloaded[0], expected[0].astype(np.float32))
+    assert not list(tmp_path.glob(".stflip-writing-*"))
+
+
+def test_surface_cache_is_bound_to_source_particle_positions(tmp_path):
+    fingerprint = "9" * 64
+    source = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32)
+    cache.write_surface(
+        str(tmp_path),
+        4,
+        fingerprint,
+        *_surface_mesh(),
+        source_positions=source,
+    )
+
+    assert cache.read_surface(
+        str(tmp_path),
+        4,
+        fingerprint,
+        expected_source_positions=source.copy(),
+    ) is not None
+    with pytest.raises(cache.SurfaceCacheError, match="source particle"):
+        cache.read_surface(
+            str(tmp_path),
+            4,
+            fingerprint,
+            expected_source_positions=source + 1.0,
+        )
+
+
+def test_surface_cache_detects_valid_but_unhashed_mesh_changes(tmp_path):
+    fingerprint = "8" * 64
+    path = cache.surface_path(str(tmp_path), 5, fingerprint)
+    _write_surface_archive(
+        path,
+        5,
+        fingerprint,
+        vertices=_surface_mesh(offset=4.0)[0].astype(np.float32),
+    )
+
+    with pytest.raises(cache.SurfaceCacheError, match="mesh fingerprint"):
+        cache.read_surface(str(tmp_path), 5, fingerprint)
+
+
+def test_surface_full_fingerprint_paths_keep_configurations_isolated(tmp_path):
+    fingerprint_a = "7" * 63 + "a"
+    fingerprint_b = "7" * 63 + "b"
+    mesh_a = _surface_mesh(offset=1.0)
+    mesh_b = _surface_mesh(offset=9.0)
+
+    path_a = cache.write_surface(
+        str(tmp_path), 42, fingerprint_a, *mesh_a)
+    original_a = Path(path_a).read_bytes()
+    path_b = cache.write_surface(
+        str(tmp_path), 42, fingerprint_b, *mesh_b)
+
+    assert path_a != path_b
+    assert Path(path_a).name == (
+        f"stflip_surface_{fingerprint_a}_000042.npz")
+    assert Path(path_b).name == (
+        f"stflip_surface_{fingerprint_b}_000042.npz")
+    assert Path(path_a).read_bytes() == original_a
+    np.testing.assert_array_equal(
+        cache.read_surface(str(tmp_path), 42, fingerprint_a)[0],
+        mesh_a[0].astype(np.float32),
+    )
+    np.testing.assert_array_equal(
+        cache.read_surface(str(tmp_path), 42, fingerprint_b)[0],
+        mesh_b[0].astype(np.float32),
+    )
+    assert cache.surface_frames(str(tmp_path), fingerprint_a) == [42]
+    assert cache.surface_frames(str(tmp_path), fingerprint_b) == [42]
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    ["", "a" * 63, "A" * 64, "g" * 64],
+)
+def test_surface_paths_require_complete_lowercase_fingerprints(
+        tmp_path, fingerprint):
+    with pytest.raises(cache.CheckpointError, match="fingerprint"):
+        cache.surface_path(str(tmp_path), 1, fingerprint)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"vertices": np.zeros((4, 2), dtype=np.float32)},
+         r"vertices.*shape"),
+        ({"vertices": np.full((4, 3), np.nan, dtype=np.float32)},
+         r"vertices.*finite"),
+        ({"triangles": np.zeros((1, 4), dtype=np.int32)},
+         r"triangles.*shape"),
+        ({"triangles": np.array([[0.0, 1.0, 2.0]], dtype=np.float32)},
+         r"triangles.*integers"),
+        ({"quads": np.zeros((1, 3), dtype=np.int32)},
+         r"quads.*shape"),
+        ({"quads": np.array([[0.0, 1.0, 2.0, 3.0]], dtype=np.float32)},
+         r"quads.*integers"),
+        ({"triangles": np.array([[-1, 1, 2]], dtype=np.int32)},
+         r"triangles.*missing vertices"),
+        ({"quads": np.array([[0, 1, 2, 4]], dtype=np.int32)},
+         r"quads.*missing vertices"),
+        ({"triangles": np.array([[0, 1, 2**32]], dtype=np.uint64)},
+         r"triangles.*exceed int32"),
+    ],
+)
+def test_surface_reader_rejects_malformed_mesh_arrays(
+        tmp_path, overrides, message):
+    fingerprint = "b" * 64
+    path = cache.surface_path(str(tmp_path), 5, fingerprint)
+    _write_surface_archive(path, 5, fingerprint, **overrides)
+
+    with pytest.raises(cache.SurfaceCacheError, match=message):
+        cache.read_surface(str(tmp_path), 5, fingerprint)
+
+
+def test_surface_writer_rejects_invalid_indices_without_creating_entry(
+        tmp_path):
+    fingerprint = "c" * 64
+    vertices, triangles, quads = _surface_mesh()
+    triangles[0, 0] = len(vertices)
+
+    with pytest.raises(cache.SurfaceCacheError, match="missing vertices"):
+        cache.write_surface(
+            str(tmp_path), 6, fingerprint, vertices, triangles, quads)
+
+    assert cache.read_surface(str(tmp_path), 6, fingerprint) is None
+    assert cache.surface_frames(str(tmp_path), fingerprint) == []
+
+
+def test_surface_rejects_renamed_frame_and_fingerprint_bindings(tmp_path):
+    fingerprint_a = "d" * 64
+    fingerprint_b = "e" * 64
+    source = Path(cache.write_surface(
+        str(tmp_path), 3, fingerprint_a, *_surface_mesh()))
+    renamed_frame = Path(cache.surface_path(
+        str(tmp_path), 4, fingerprint_a))
+    source.replace(renamed_frame)
+
+    with pytest.raises(cache.SurfaceCacheError, match="frame binding"):
+        cache.read_surface(str(tmp_path), 4, fingerprint_a)
+
+    renamed_frame.replace(source)
+    renamed_fingerprint = Path(cache.surface_path(
+        str(tmp_path), 3, fingerprint_b))
+    source.replace(renamed_fingerprint)
+    with pytest.raises(cache.SurfaceCacheError, match="fingerprint binding"):
+        cache.read_surface(str(tmp_path), 3, fingerprint_b)
+
+
+def test_missing_and_corrupt_surfaces_have_distinct_behavior(tmp_path):
+    fingerprint = "f" * 64
+    path = Path(cache.surface_path(str(tmp_path), 7, fingerprint))
+
+    assert cache.read_surface(str(tmp_path), 7, fingerprint) is None
+
+    path.write_bytes(b"not an npz")
+    with pytest.raises(cache.SurfaceCacheError, match="corrupt"):
+        cache.read_surface(str(tmp_path), 7, fingerprint)
+
+    _write_surface_archive(
+        path, 7, fingerprint, unexpected=np.asarray(1, dtype=np.int64))
+    with pytest.raises(cache.SurfaceCacheError, match="archive keys"):
+        cache.read_surface(str(tmp_path), 7, fingerprint)
+
+
+def test_failed_atomic_surface_replace_keeps_previous_mesh(
+        monkeypatch, tmp_path):
+    fingerprint = "1" * 64
+    original = _surface_mesh(offset=2.0)
+    replacement = _surface_mesh(offset=20.0)
+    cache.write_surface(str(tmp_path), 8, fingerprint, *original)
+
+    def fail_replace(source, target):
+        raise OSError("simulated surface interruption")
+
+    monkeypatch.setattr(cache.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="interruption"):
+        cache.write_surface(str(tmp_path), 8, fingerprint, *replacement)
+
+    loaded = cache.read_surface(str(tmp_path), 8, fingerprint)
+    for actual, expected in zip(loaded, original):
+        np.testing.assert_array_equal(actual, expected.astype(actual.dtype))
+    assert not list(tmp_path.glob(".stflip-writing-*"))
+
+
+def test_surface_scanner_filters_configurations_and_invalid_entries(tmp_path):
+    fingerprint = "2" * 64
+    other_fingerprint = "3" * 64
+    frames = [-100000, -1, 0, 999999, 1000000]
+    for frame in frames:
+        cache.write_surface(
+            str(tmp_path), frame, fingerprint, *_surface_mesh())
+    cache.write_surface(
+        str(tmp_path), 17, other_fingerprint, *_surface_mesh(offset=3.0))
+
+    Path(cache.surface_path(str(tmp_path), 7, fingerprint)).write_bytes(
+        b"corrupt")
+    _write_surface_archive(
+        cache.surface_path(str(tmp_path), 8, fingerprint),
+        9,
+        fingerprint,
+    )
+    (tmp_path / f"stflip_surface_{fingerprint}_not-a-frame.npz").write_bytes(
+        b"ignored")
+
+    assert cache.surface_frames(str(tmp_path), fingerprint) == frames
+    assert cache.surface_frames(str(tmp_path), other_fingerprint) == [17]
+
+
+def test_clear_removes_all_surface_configurations(tmp_path):
+    fingerprint_a = "4" * 64
+    fingerprint_b = "5" * 64
+    path_a = cache.write_surface(
+        str(tmp_path), 1, fingerprint_a, *_surface_mesh())
+    path_b = cache.write_surface(
+        str(tmp_path), 1, fingerprint_b, *_surface_mesh(offset=5.0))
+    keep = tmp_path / "keep.txt"
+    keep.write_text("unrelated", encoding="utf-8")
+
+    assert cache.clear(str(tmp_path)) == 2
+    assert not Path(path_a).exists()
+    assert not Path(path_b).exists()
+    assert keep.exists()
+    assert cache.read_surface(str(tmp_path), 1, fingerprint_a) is None
+    assert cache.surface_frames(str(tmp_path), fingerprint_b) == []
 
 
 @pytest.mark.parametrize(

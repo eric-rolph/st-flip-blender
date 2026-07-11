@@ -8,6 +8,7 @@ import hmac
 import importlib
 import json
 import math
+import numbers
 import ntpath
 import os
 from pathlib import Path
@@ -43,6 +44,11 @@ _CUDA_HOST_GRID_BYTES_PER_CELL = 96
 _CUDA_HOST_PARTICLE_BYTES = 48
 _MEMORY_HEADROOM_FRACTION = 0.75
 _SETUP_OBJECT_KEY = "stflip_generated_setup"
+_PAPER_SURFACE_FLOAT_FIELD_EQUIVALENTS = 40
+_PAPER_SURFACE_HOST_FIELD_EQUIVALENTS = 8
+_PAPER_SURFACE_SPLAT_BYTES_PER_CANDIDATE = 128
+_PAPER_SURFACE_DEVICE_BYTES_PER_PARTICLE = 12
+_PAPER_SURFACE_HOST_BYTES_PER_PARTICLE = 24
 
 
 def _value(source, *names, default=None):
@@ -152,6 +158,155 @@ def memory_guard_reason(estimate: dict, backend_name: str,
     return None
 
 
+def estimate_paper_surface_memory(
+    max_voxels: int,
+    particle_chunk_size: int | None = None,
+    particle_count: int = 0,
+) -> dict:
+    """Conservative dense Appendix-B reconstruction peak estimate.
+
+    The estimate treats the configured voxel cap as reachable. Forty live
+    float-field equivalents cover the Gaussian's worst thin-axis zero padding
+    (33 fields at the fixed radius), retained inputs/outputs, and explicit MCF
+    temporaries. Splat scratch allows 128 bytes per stencil candidate so array
+    reassignment and ufunc temporaries can overlap. Particle upload/host copies
+    are counted separately when a conservative particle bound is available.
+    Host fields additionally reserve the returned dense field, OpenVDB's grid
+    copy, and polygonization working space.
+    """
+    if (isinstance(max_voxels, bool)
+            or not isinstance(max_voxels, numbers.Integral)
+            or int(max_voxels) <= 0):
+        raise ValueError("max surface voxels must be a positive integer")
+    if particle_chunk_size is None:
+        particle_chunk_size = surface_core.DEFAULT_PARTICLE_CHUNK_SIZE
+    if (isinstance(particle_chunk_size, bool)
+            or not isinstance(particle_chunk_size, numbers.Integral)
+            or int(particle_chunk_size) <= 0):
+        raise ValueError("surface particle chunk size must be positive")
+    if (isinstance(particle_count, bool)
+            or not isinstance(particle_count, numbers.Integral)
+            or int(particle_count) < 0):
+        raise ValueError("surface particle count must be non-negative")
+
+    voxels = int(max_voxels)
+    chunk = int(particle_chunk_size)
+    particles = int(particle_count)
+    support_voxels = (
+        surface_core.SPHERE_RADIUS_DX / surface_core.VOXEL_SIZE_DX
+        + 0.5 * surface_core.SPHERE_RAMP_WIDTH_VOXELS
+    )
+    stencil_radius = int(math.ceil(support_voxels))
+    candidate_count = (2 * stencil_radius + 1) ** 3
+    splat_scratch = (
+        chunk * candidate_count * _PAPER_SURFACE_SPLAT_BYTES_PER_CANDIDATE)
+    dense_device = (
+        voxels * np.dtype(np.float32).itemsize
+        * _PAPER_SURFACE_FLOAT_FIELD_EQUIVALENTS)
+    host_working = (
+        voxels * np.dtype(np.float32).itemsize
+        * _PAPER_SURFACE_HOST_FIELD_EQUIVALENTS)
+    particle_device = (
+        particles * _PAPER_SURFACE_DEVICE_BYTES_PER_PARTICLE)
+    particle_host = particles * _PAPER_SURFACE_HOST_BYTES_PER_PARTICLE
+    return {
+        "max_voxels": voxels,
+        "particle_chunk_size": chunk,
+        "particle_count_bound": particles,
+        "stencil_candidate_count": candidate_count,
+        "splat_scratch_bytes": splat_scratch,
+        "particle_device_bytes": particle_device,
+        "particle_host_bytes": particle_host,
+        "device_working_set_bytes": (
+            dense_device + splat_scratch + particle_device),
+        "cpu_working_set_bytes": (
+            dense_device + splat_scratch + particle_host),
+        "cuda_host_working_set_bytes": host_working + particle_host,
+    }
+
+
+def paper_surface_backend_decision(
+    preferred_backend: str,
+    surface_estimate: dict,
+    *,
+    ram_available: int | None,
+    vram_available: int | None,
+    reserved_ram_bytes: int = 0,
+    reserved_vram_bytes: int = 0,
+) -> dict:
+    """Choose one backend for an entire derived Paper MCF configuration."""
+    if preferred_backend not in {"cpu", "cuda"}:
+        raise ValueError("paper surface backend must be cpu or cuda")
+
+    def nonnegative(value, name):
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral) \
+                or int(value) < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        return int(value)
+
+    reserved_ram = nonnegative(reserved_ram_bytes, "reserved RAM")
+    reserved_vram = nonnegative(reserved_vram_bytes, "reserved VRAM")
+    cpu_need = reserved_ram + int(surface_estimate["cpu_working_set_bytes"])
+    cuda_need = (
+        reserved_vram + int(surface_estimate["device_working_set_bytes"]))
+    cuda_host_need = (
+        reserved_ram
+        + int(surface_estimate["cuda_host_working_set_bytes"]))
+    safe_ram = (
+        int(ram_available * _MEMORY_HEADROOM_FRACTION)
+        if ram_available else None)
+    safe_vram = (
+        int(vram_available * _MEMORY_HEADROOM_FRACTION)
+        if vram_available else None)
+
+    def cpu_error():
+        if safe_ram is not None and cpu_need > safe_ram:
+            return (
+                f"Paper MCF plus the live bake may require "
+                f"{_format_bytes(cpu_need)} RAM, above the safe "
+                f"{_format_bytes(safe_ram)} of currently available RAM. "
+                "Lower Max Reconstruction Voxels or simulation resolution."
+            )
+        return ""
+
+    if preferred_backend == "cpu":
+        error = cpu_error()
+        return {"backend": None if error else "cpu", "warning": "",
+                "error": error}
+
+    cuda_reason = ""
+    if safe_vram is None:
+        cuda_reason = "available CUDA VRAM could not be measured"
+    elif cuda_need > safe_vram:
+        cuda_reason = (
+            f"solver plus Paper MCF may require {_format_bytes(cuda_need)} "
+            f"VRAM, above the safe {_format_bytes(safe_vram)} of currently "
+            "available VRAM"
+        )
+    elif safe_ram is not None and cuda_host_need > safe_ram:
+        cuda_reason = (
+            f"CUDA Paper MCF meshing may require "
+            f"{_format_bytes(cuda_host_need)} host RAM, above the safe "
+            f"{_format_bytes(safe_ram)}"
+        )
+    if not cuda_reason:
+        return {"backend": "cuda", "warning": "", "error": ""}
+
+    error = cpu_error()
+    if error:
+        return {
+            "backend": None,
+            "warning": "",
+            "error": f"{cuda_reason}; CPU fallback is also unsafe: {error}",
+        }
+    return {
+        "backend": "cpu",
+        "warning": (
+            f"{cuda_reason}; using CPU for the complete Paper MCF cache"),
+        "error": "",
+    }
+
+
 def _is_within(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -242,6 +397,7 @@ _activate_runtime_path(_configured_runtime_path())
 import numpy as np  # noqa: E402 - runtime path must be activated first
 
 from ..stflip import cache  # noqa: E402
+from ..stflip import surface as surface_core  # noqa: E402
 from ..stflip.backend import (  # noqa: E402
     cuda_device_name,
     cuda_diagnostics,
@@ -254,6 +410,12 @@ from .handlers import resolve_cache_dir  # noqa: E402
 
 # The live solver cannot be stored on Blender ID properties; module state it is.
 _BAKE: dict = {}
+_SURFACE_BAKE: dict = {}
+
+
+def surface_rebuild_running() -> bool:
+    """Return whether this Blender process is rebuilding paper surfaces."""
+    return bool(_SURFACE_BAKE.get("running"))
 
 
 def _canonical_json_bytes(value) -> bytes:
@@ -328,6 +490,142 @@ def simulation_fingerprint(
         _fingerprint_array(
             digest, "solid_node_sdf", solid_node_sdf, np.float32)
     return digest.hexdigest()
+
+
+def paper_surface_config(
+    dx: float,
+    iterations: int,
+    adaptivity: float,
+    backend_name: str,
+) -> dict:
+    """Canonical, versioned Appendix-B reconstruction configuration.
+
+    The paper fixes the analytical constants and leaves ``iterations`` as its
+    one reconstruction tuning parameter. It does not prescribe the sub-voxel
+    rasterizer, finite-difference details, or OpenVDB polygon reduction, so
+    those implementation choices are named and versioned explicitly.
+    """
+    dx = float(dx)
+    iterations = int(iterations)
+    adaptivity = float(adaptivity)
+    if not math.isfinite(dx) or dx <= 0.0:
+        raise ValueError("paper surface dx must be finite and positive")
+    if not 1 <= iterations <= 100:
+        raise ValueError("paper MCF iterations must be between 1 and 100")
+    if not math.isfinite(adaptivity) or not 0.0 <= adaptivity <= 1.0:
+        raise ValueError("paper mesh adaptivity must be between 0 and 1")
+    if backend_name not in {"cpu", "cuda"}:
+        raise ValueError("paper surface backend must be cpu or cuda")
+    return {
+        "schema": cache.SURFACE_CONFIG_SCHEMA,
+        "version": cache.SURFACE_CONFIG_VERSION,
+        "algorithm": "appendix_b_feature_preserving_mcf_v1",
+        "rasterizer": "linear_subvoxel_union_v1",
+        "boundary": {
+            "gaussian": "constant_zero_extension_v1",
+            "mcf": "edge_neumann_v1",
+        },
+        "padding": "ceil_sqrt_iterations_over_3_plus_2_v1",
+        "finite_difference": "centered_level_set_v1",
+        "float_precision": "float32",
+        "backend": backend_name,
+        "blender_version": str(getattr(
+            getattr(bpy, "app", None), "version_string", "unknown")),
+        "simulation_dx": dx,
+        "particle_radius_dx": surface_core.SPHERE_RADIUS_DX,
+        "reconstruction_voxel_dx": surface_core.VOXEL_SIZE_DX,
+        "sphere_ramp_width_voxels": (
+            surface_core.SPHERE_RAMP_WIDTH_VOXELS),
+        "gaussian_sigma_dx": surface_core.GAUSSIAN_SIGMA_DX,
+        "gaussian_truncate_sigma": surface_core.GAUSSIAN_TRUNCATE,
+        "feature_theta": surface_core.FEATURE_THRESHOLD,
+        "feature_zeta": surface_core.FEATURE_SLOPE,
+        "feature_epsilon": surface_core.FEATURE_EPSILON,
+        "gradient_epsilon": surface_core.NORMAL_EPSILON,
+        "isovalue": surface_core.SURFACE_ISOVALUE,
+        "mcf_iterations": iterations,
+        "mesh_adaptivity": adaptivity,
+    }
+
+
+def paper_surface_fingerprint(config: dict) -> str:
+    """Hash only derived-surface inputs; solver checkpoints stay reusable."""
+    return cache.surface_config_fingerprint(config)
+
+
+def paper_surface_metadata(
+    config: dict,
+    fingerprint: str,
+    max_voxels: int,
+    latest_frame: int | None = None,
+    state: str = "RUNNING",
+) -> dict:
+    """Describe the independently invalidatable derived surface cache."""
+    if state not in {"RUNNING", "COMPLETE", "CANCELLED", "FAILED"}:
+        raise ValueError("invalid paper surface lifecycle state")
+    return {
+        "schema": cache.SURFACE_SCHEMA,
+        "version": cache.SURFACE_VERSION,
+        "mode": "PAPER_MCF",
+        "fingerprint": fingerprint,
+        "config": config,
+        "max_reconstruction_voxels": int(max_voxels),
+        "latest_frame": latest_frame,
+        "state": state,
+    }
+
+
+def matching_resume_paper_surface_config(
+    surface_meta,
+    *,
+    requested: bool,
+    dx: float,
+    iterations: int,
+    adaptivity: float,
+) -> tuple[dict | None, str | None, str]:
+    """Resolve an existing derived cache without constraining simulation.
+
+    Resume may extend Paper surfaces only when the current UI still requests
+    Paper MCF and the active cache exactly matches today's implementation and
+    controls.  Any mismatch is a derived-output warning, not a checkpoint
+    incompatibility; the particle simulation can continue and the user can
+    rebuild all surfaces afterward.
+    """
+    if not requested:
+        return None, None, ""
+    try:
+        fingerprint = cache.validate_surface_metadata(surface_meta)
+        config = surface_meta["config"]
+        if surface_meta.get("state") == "FAILED":
+            raise cache.SurfaceCacheError(
+                "the prior paper surface cache is marked failed")
+        expected = paper_surface_config(
+            dx,
+            iterations,
+            adaptivity,
+            config.get("backend"),
+        )
+        if expected != config:
+            raise cache.SurfaceCacheError(
+                "current paper settings or implementation do not match the "
+                "stored surface cache")
+    except (KeyError, TypeError, ValueError, cache.SurfaceCacheError) as exc:
+        return (
+            None,
+            None,
+            f"Paper surfaces will not be extended during resume ({exc}); "
+            "use Rebuild Paper Surface Cache after the simulation finishes",
+        )
+    return config, fingerprint, ""
+
+
+def _mark_paper_surface_failed(metadata: dict, error) -> str:
+    """Record a derived-output failure without failing particle simulation."""
+    message = str(error).strip() or type(error).__name__
+    surface_meta = metadata.get("surface_reconstruction")
+    if isinstance(surface_meta, dict):
+        surface_meta.update({"state": "FAILED", "error": message})
+    return message
 
 
 def fingerprint_matches(expected, actual) -> bool:
@@ -1150,6 +1448,90 @@ def _measure_output_frame(frame, solver, stats, positions, velocities,
     )
 
 
+def _reconstruct_paper_surface(
+    positions_world,
+    dx: float,
+    config: dict,
+    max_voxels: int,
+    backend,
+):
+    """Build one derived Appendix-B mesh without mutating particle state."""
+    configured_backend = str(config.get("backend", ""))
+    if configured_backend not in {"cpu", "cuda"}:
+        raise ValueError("paper surface config has no valid backend")
+    if getattr(backend, "name", None) != configured_backend:
+        backend = get_backend(configured_backend)
+
+    started = time.perf_counter()
+    result = surface_core.reconstruct_surface(
+        positions_world,
+        dx,
+        iterations=int(config["mcf_iterations"]),
+        max_voxels=int(max_voxels),
+        array_module=backend.xp,
+    )
+    backend.synchronize()
+    field_wall_s = time.perf_counter() - started
+    mesh_started = time.perf_counter()
+    if int(result.diagnostics.get("particle_count", 0)) == 0:
+        vertices = np.empty((0, 3), dtype=np.float32)
+        triangles = np.empty((0, 3), dtype=np.int32)
+        quads = np.empty((0, 4), dtype=np.int32)
+    else:
+        density = backend.to_numpy(result.density)
+        vertices, triangles, quads = mesher.density_field_to_polygons(
+            density,
+            result.origin,
+            result.voxel_size,
+            isovalue=float(config["isovalue"]),
+            adaptivity=float(config["mesh_adaptivity"]),
+        )
+    mesh_wall_s = time.perf_counter() - mesh_started
+    diagnostics = dict(result.diagnostics)
+    diagnostics.update({
+        "vertex_count": int(vertices.shape[0]),
+        "triangle_count": int(triangles.shape[0]),
+        "quad_count": int(quads.shape[0]),
+        "source_positions_sha256": cache.surface_source_fingerprint(
+            positions_world),
+        "mesh_sha256": cache.surface_mesh_fingerprint(
+            vertices, triangles, quads),
+        "field_wall_s": field_wall_s,
+        "openvdb_mesh_wall_s": mesh_wall_s,
+        "total_wall_s": time.perf_counter() - started,
+    })
+    return vertices, triangles, quads, diagnostics
+
+
+def _write_paper_surface_frame(
+    cache_dir: str,
+    frame: int,
+    positions_world,
+    dx: float,
+    config: dict,
+    fingerprint: str,
+    max_voxels: int,
+    backend,
+):
+    vertices, triangles, quads, diagnostics = _reconstruct_paper_surface(
+        positions_world,
+        dx,
+        config,
+        max_voxels,
+        backend,
+    )
+    cache.write_surface(
+        cache_dir,
+        frame,
+        fingerprint,
+        vertices,
+        triangles,
+        quads,
+        source_positions=positions_world,
+    )
+    return vertices, triangles, quads, diagnostics
+
+
 def _set_surface_enabled(obj, enabled: bool) -> None:
     if obj is None:
         return
@@ -1162,8 +1544,13 @@ def _set_surface_enabled(obj, enabled: bool) -> None:
         pass
     modifier = getattr(obj, "modifiers", {}).get("STFLIP Surface")
     if modifier is not None:
-        modifier.show_viewport = enabled
-        modifier.show_render = enabled
+        try:
+            method = obj.get("stflip_surface_method", "")
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            method = getattr(obj, "stflip_surface_method", "")
+        modifier_enabled = bool(enabled) and str(method).upper() != "PAPER_MCF"
+        modifier.show_viewport = modifier_enabled
+        modifier.show_render = modifier_enabled
 
 
 def _remove_generated_setup_objects(scene) -> int:
@@ -1298,8 +1685,8 @@ class STFLIP_OT_quick_setup(bpy.types.Operator):
         return _invoke_setup_replace_confirmation(self, context, event)
 
     def execute(self, context):
-        if _BAKE.get("running"):
-            self.report({"WARNING"}, "Cancel the running bake first")
+        if _BAKE.get("running") or _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake or rebuild first")
             return {"CANCELLED"}
         scene = context.scene
         try:
@@ -1353,8 +1740,8 @@ class STFLIP_OT_whirlpool_preview(bpy.types.Operator):
         return _invoke_setup_replace_confirmation(self, context, event)
 
     def execute(self, context):
-        if _BAKE.get("running"):
-            self.report({"WARNING"}, "Cancel the running bake first")
+        if _BAKE.get("running") or _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake or rebuild first")
             return {"CANCELLED"}
         scene = context.scene
         try:
@@ -1459,8 +1846,8 @@ class STFLIP_OT_high_cfl_jet_leak(bpy.types.Operator):
         return _invoke_setup_replace_confirmation(self, context, event)
 
     def execute(self, context):
-        if _BAKE.get("running"):
-            self.report({"WARNING"}, "Cancel the running bake first")
+        if _BAKE.get("running") or _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake or rebuild first")
             return {"CANCELLED"}
         scene = context.scene
         try:
@@ -1604,6 +1991,9 @@ class STFLIP_OT_bake(bpy.types.Operator):
         if _BAKE.get("running"):
             self.report({"WARNING"}, "A bake is already running")
             return False
+        if _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the paper surface rebuild first")
+            return False
         if st.domain is None:
             message = "Set a domain object first"
             _fail_bake(st, message)
@@ -1737,6 +2127,40 @@ class STFLIP_OT_bake(bpy.types.Operator):
             backend_label = f"CUDA ({cuda_device})"
         else:
             backend_label = "CPU (NumPy)"
+
+        paper_surface_backend = backend
+        if (not is_resume and st.create_surface
+                and st.surface_method == "PAPER_MCF"):
+            surface_estimate = estimate_paper_surface_memory(
+                st.paper_max_reconstruction_voxels,
+                particle_count=estimate["particles"],
+            )
+            solver_ram = (
+                estimate["cuda_host_bytes"] if backend.name == "cuda"
+                else estimate["working_set_bytes"])
+            solver_vram = (
+                estimate["working_set_bytes"] if backend.name == "cuda"
+                else 0)
+            surface_decision = paper_surface_backend_decision(
+                backend.name,
+                surface_estimate,
+                ram_available=ram_available,
+                vram_available=(
+                    cuda_state["free_bytes"]
+                    if backend.name == "cuda" else None),
+                reserved_ram_bytes=solver_ram,
+                reserved_vram_bytes=solver_vram,
+            )
+            if surface_decision["error"]:
+                message = surface_decision["error"]
+                _fail_bake(st, message)
+                self.report({"ERROR"}, message)
+                return False
+            if surface_decision["warning"]:
+                self.report({"WARNING"}, surface_decision["warning"])
+            if surface_decision["backend"] != backend.name:
+                paper_surface_backend = get_backend(
+                    surface_decision["backend"])
 
         st.bake_status = f"Voxelizing scene for {backend_label}..."
         solid_sdf = None
@@ -1910,6 +2334,104 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "checkpoint was created by a different ST-FLIP add-on "
                 "version; rebake with the current version")
 
+        paper_config = None
+        paper_fingerprint = None
+        paper_surface_error = ""
+        if is_resume:
+            surface_meta = (
+                existing_meta.get("surface_reconstruction")
+                if isinstance(existing_meta, dict) else None
+            )
+            paper_config, paper_fingerprint, paper_surface_error = (
+                matching_resume_paper_surface_config(
+                    surface_meta,
+                    requested=bool(
+                        st.create_surface
+                        and st.surface_method == "PAPER_MCF"),
+                    dx=dx,
+                    iterations=st.paper_mcf_iterations,
+                    adaptivity=st.paper_mesh_adaptivity,
+                )
+            )
+            if paper_config is not None:
+                stored_backend = paper_config["backend"]
+                if stored_backend == "cuda" and not cuda_state["available"]:
+                    paper_surface_error = (
+                        "Stored CUDA Paper surfaces cannot be extended because "
+                        "CUDA is unavailable; use Rebuild Paper Surface Cache "
+                        "after the simulation finishes")
+                    paper_config = None
+                    paper_fingerprint = None
+                else:
+                    surface_estimate = estimate_paper_surface_memory(
+                        st.paper_max_reconstruction_voxels,
+                        particle_count=estimate["particles"],
+                    )
+                    solver_ram = (
+                        estimate["cuda_host_bytes"]
+                        if backend.name == "cuda"
+                        else estimate["working_set_bytes"])
+                    solver_vram = (
+                        estimate["working_set_bytes"]
+                        if backend.name == "cuda" else 0)
+                    surface_decision = paper_surface_backend_decision(
+                        stored_backend,
+                        surface_estimate,
+                        ram_available=ram_available,
+                        vram_available=(
+                            cuda_state["free_bytes"]
+                            if stored_backend == "cuda" else None),
+                        reserved_ram_bytes=solver_ram,
+                        reserved_vram_bytes=solver_vram,
+                    )
+                    if (surface_decision["error"]
+                            or surface_decision["backend"] != stored_backend):
+                        reason = (surface_decision["error"]
+                                  or surface_decision["warning"])
+                        paper_surface_error = (
+                            f"Stored {stored_backend.upper()} Paper surfaces "
+                            f"cannot be extended safely ({reason}); use Rebuild "
+                            "Paper Surface Cache after the simulation finishes")
+                        paper_config = None
+                        paper_fingerprint = None
+                    else:
+                        try:
+                            paper_surface_backend = (
+                                backend if backend.name == stored_backend
+                                else get_backend(stored_backend))
+                        except Exception as exc:
+                            paper_surface_error = (
+                                f"Stored {stored_backend.upper()} Paper "
+                                f"backend could not be initialized ({exc}); "
+                                "use Rebuild Paper Surface Cache after the "
+                                "simulation finishes")
+                            paper_config = None
+                            paper_fingerprint = None
+            if paper_surface_error:
+                self.report({"WARNING"}, paper_surface_error)
+        elif st.create_surface and st.surface_method == "PAPER_MCF":
+            paper_config = paper_surface_config(
+                dx,
+                st.paper_mcf_iterations,
+                st.paper_mesh_adaptivity,
+                paper_surface_backend.name,
+            )
+            paper_fingerprint = paper_surface_fingerprint(paper_config)
+        if (paper_config is not None
+                and paper_surface_backend.name != paper_config["backend"]):
+            try:
+                paper_surface_backend = get_backend(paper_config["backend"])
+            except Exception as exc:
+                if not is_resume:
+                    raise
+                paper_surface_error = (
+                    "Stored Paper backend could not be initialized "
+                    f"({exc}); use Rebuild Paper Surface Cache after the "
+                    "simulation finishes")
+                self.report({"WARNING"}, paper_surface_error)
+                paper_config = None
+                paper_fingerprint = None
+
         setup_provenance = _scene_setup_provenance(scene)
         if (isinstance(setup_provenance, dict)
                 and setup_provenance.get("kind")
@@ -1958,12 +2480,17 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "gravity": list(gravity),
                 "fps": fps,
                 "create_surface": st.create_surface,
+                "surface_method": st.surface_method,
                 "surface_particle_radius_dx": st.particle_radius,
                 "surface_voxel_size_dx": st.surface_voxel,
                 "surface_geometric_smoothing": st.surface_smoothing,
                 "surface_smoothing_iterations": (
                     st.surface_smoothing_iterations),
                 "surface_smoothing_factor": st.surface_smoothing_factor,
+                "paper_mcf_iterations": st.paper_mcf_iterations,
+                "paper_mesh_adaptivity": st.paper_mesh_adaptivity,
+                "paper_max_reconstruction_voxels": (
+                    st.paper_max_reconstruction_voxels),
                 "collect_metrics": st.collect_metrics,
                 "collect_enstrophy": bool(
                     st.collect_metrics and st.collect_enstrophy),
@@ -1992,12 +2519,18 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "last_committed_frame": scene.frame_start,
                 "error": "",
             },
-            "version": 5,
+            "version": 6,
         }
         from ..stflip.experiments import profile_provenance
 
         new_meta["experiment_profile"] = profile_provenance(
             st.experiment_profile, st)
+        if paper_config is not None:
+            new_meta["surface_reconstruction"] = paper_surface_metadata(
+                paper_config,
+                paper_fingerprint,
+                st.paper_max_reconstruction_voxels,
+            )
         if st.collect_metrics:
             from ..stflip.metrics import METRICS_SCHEMA, SCHEMA_VERSION
 
@@ -2015,7 +2548,8 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 scene.frame_start,
                 scene.frame_end,
             )
-            if cache.read_frame(cache_dir, latest_frame) is None:
+            latest_particles = cache.read_frame(cache_dir, latest_frame)
+            if latest_particles is None:
                 raise ValueError(
                     f"committed output frame {latest_frame} is missing or corrupt")
             checkpoint_state = cache.read_checkpoint(
@@ -2048,6 +2582,55 @@ class STFLIP_OT_bake(bpy.types.Operator):
             collect_enstrophy = bool(
                 collect_metrics
                 and meta["metrics"].get("enstrophy_enabled", False))
+            paper_mesh = None
+            if paper_config is None:
+                # A resumed simulation extends the authoritative frame range.
+                # An old derived cache can no longer be advertised as complete
+                # when the current surface mode/config is not being extended.
+                meta.pop("surface_reconstruction", None)
+            if paper_config is not None:
+                try:
+                    cached_surface = cache.read_surface(
+                        cache_dir,
+                        latest_frame,
+                        paper_fingerprint,
+                        expected_source_positions=latest_particles[0],
+                    )
+                    if cached_surface is None:
+                        vertices, triangles, quads, surface_diagnostics = (
+                            _write_paper_surface_frame(
+                                cache_dir,
+                                latest_frame,
+                                latest_particles[0],
+                                dx,
+                                paper_config,
+                                paper_fingerprint,
+                                st.paper_max_reconstruction_voxels,
+                                paper_surface_backend,
+                            )
+                        )
+                        paper_mesh = (vertices, triangles, quads)
+                    else:
+                        paper_mesh = cached_surface
+                        surface_diagnostics = None
+                    meta["surface_reconstruction"].update({
+                        "latest_frame": latest_frame,
+                        "state": "RUNNING",
+                        "max_reconstruction_voxels": int(
+                            st.paper_max_reconstruction_voxels),
+                    })
+                    meta["surface_reconstruction"].pop("error", None)
+                    if surface_diagnostics is not None:
+                        meta["surface_reconstruction"][
+                            "latest_diagnostics"] = surface_diagnostics
+                except Exception as exc:
+                    paper_surface_error = _mark_paper_surface_failed(meta, exc)
+                    self.report(
+                        {"WARNING"},
+                        "Paper surface resume failed, but particle simulation "
+                        f"will continue: {paper_surface_error}",
+                    )
+                    paper_config = None
             cache.write_meta(cache_dir, meta)
             current_frame = latest_frame
         else:
@@ -2069,6 +2652,36 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 solver.checkpoint_state(),
                 fingerprint=fingerprint,
             )
+            paper_mesh = None
+            if paper_config is not None:
+                world_positions = (
+                    pos + origin[None, :].astype(np.float32))
+                try:
+                    vertices, triangles, quads, surface_diagnostics = (
+                        _write_paper_surface_frame(
+                            cache_dir,
+                            current_frame,
+                            world_positions,
+                            dx,
+                            paper_config,
+                            paper_fingerprint,
+                            st.paper_max_reconstruction_voxels,
+                            paper_surface_backend,
+                        )
+                    )
+                    paper_mesh = (vertices, triangles, quads)
+                    meta["surface_reconstruction"].update({
+                        "latest_frame": current_frame,
+                        "latest_diagnostics": surface_diagnostics,
+                    })
+                except Exception as exc:
+                    paper_surface_error = _mark_paper_surface_failed(meta, exc)
+                    self.report(
+                        {"WARNING"},
+                        "Paper surface generation failed, but particle "
+                        f"simulation will continue: {paper_surface_error}",
+                    )
+                    paper_config = None
             if collect_metrics:
                 record = _measure_output_frame(
                     current_frame, solver, None, pos, vel, None, False)
@@ -2088,6 +2701,12 @@ class STFLIP_OT_bake(bpy.types.Operator):
             backend_label=backend_label,
             collect_metrics=collect_metrics,
             collect_enstrophy=collect_enstrophy,
+            paper_surface_config=paper_config,
+            paper_surface_fingerprint=paper_fingerprint,
+            paper_surface_backend=paper_surface_backend,
+            paper_surface_max_voxels=int(
+                st.paper_max_reconstruction_voxels),
+            paper_surface_error=paper_surface_error,
             running=True,
             cancel_requested=False,
             resumed=is_resume,
@@ -2097,16 +2716,52 @@ class STFLIP_OT_bake(bpy.types.Operator):
             existing_obj=st.particle_object)
         st.particle_object = particle_obj
         if st.create_surface:
-            st.surface_object = mesher.ensure_surface_object(
-                particle_obj, dx, st.particle_radius, st.surface_voxel,
-                existing_obj=st.surface_object)
-            mesher.configure_surface_smoothing(
-                st.surface_object,
-                st.surface_smoothing,
-                st.surface_smoothing_iterations,
-                st.surface_smoothing_factor,
-            )
-            _set_surface_enabled(st.surface_object, True)
+            if st.surface_method == "PAPER_MCF":
+                if paper_mesh is not None:
+                    try:
+                        st.surface_object = mesher.ensure_paper_surface_object(
+                            *paper_mesh,
+                            existing_obj=st.surface_object,
+                        )
+                        _set_surface_enabled(st.surface_object, True)
+                    except Exception as exc:
+                        self.report(
+                            {"WARNING"},
+                            "Paper surface cache is valid, but its viewport "
+                            f"object could not be updated: {exc}",
+                        )
+                else:
+                    stale_surface = st.surface_object
+                    if stale_surface is None:
+                        candidate = bpy.data.objects.get(getattr(
+                            mesher,
+                            "SURFACE_OBJ",
+                            "STFLIP Liquid Surface",
+                        ))
+                        if (candidate is not None
+                                and candidate.name in scene.objects):
+                            stale_surface = candidate
+                            st.surface_object = candidate
+                    stale_surface = mesher.scene_exclusive_output(
+                        scene, stale_surface)
+                    if stale_surface is None:
+                        st.surface_object = None
+                    _set_surface_enabled(stale_surface, False)
+            else:
+                st.surface_object = mesher.restore_preview_surface(
+                    particle_obj,
+                    dx,
+                    st.particle_radius,
+                    st.surface_voxel,
+                    existing_obj=st.surface_object,
+                )
+                mesher.configure_surface_smoothing(
+                    st.surface_object,
+                    st.surface_smoothing,
+                    st.surface_smoothing_iterations,
+                    st.surface_smoothing_factor,
+                )
+                _set_surface_enabled(st.surface_object, True)
         else:
             stale_surface = st.surface_object
             if stale_surface is None:
@@ -2153,14 +2808,45 @@ class STFLIP_OT_bake(bpy.types.Operator):
             compute_wall_s = None
         b["frame"] += 1
         pos, vel = solver.get_render_particles()
+        world_positions = pos + b["origin"][None, :]
         cache.write_frame(b["cache_dir"], b["frame"],
-                          pos + b["origin"][None, :], vel)
+                          world_positions, vel)
         cache.write_checkpoint(
             b["cache_dir"],
             b["frame"],
             solver.checkpoint_state(),
             fingerprint=b["meta"]["checkpoint"]["fingerprint"],
         )
+        paper_config = b.get("paper_surface_config")
+        if paper_config is not None:
+            try:
+                _vertices, _triangles, _quads, surface_diagnostics = (
+                    _write_paper_surface_frame(
+                        b["cache_dir"],
+                        b["frame"],
+                        world_positions,
+                        solver.p.dx,
+                        paper_config,
+                        b["paper_surface_fingerprint"],
+                        b["paper_surface_max_voxels"],
+                        b.get("paper_surface_backend", solver.be),
+                    )
+                )
+                b["meta"]["surface_reconstruction"].update({
+                    "latest_frame": b["frame"],
+                    "state": "RUNNING",
+                    "latest_diagnostics": surface_diagnostics,
+                })
+            except Exception as exc:
+                b["paper_surface_error"] = _mark_paper_surface_failed(
+                    b["meta"], exc)
+                b["paper_surface_config"] = None
+                self.report(
+                    {"WARNING"},
+                    "Paper surface generation failed at frame "
+                    f"{b['frame']}, but the particle bake will continue: "
+                    f"{b['paper_surface_error']}",
+                )
         if b.get("collect_metrics"):
             record = _measure_output_frame(
                 b["frame"], solver, stats, pos, vel, compute_wall_s,
@@ -2268,6 +2954,10 @@ class STFLIP_OT_bake(bpy.types.Operator):
             error = error or "bake ended before the requested frame range"
         if isinstance(meta, dict):
             meta["checkpoint"]["state"] = outcome
+            surface_meta = meta.get("surface_reconstruction")
+            if (isinstance(surface_meta, dict)
+                    and surface_meta.get("state") != "FAILED"):
+                surface_meta["state"] = outcome
             meta["bake_lifecycle"] = {
                 "state": outcome,
                 "last_committed_frame": committed,
@@ -2279,9 +2969,13 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 outcome = "FAILED"
                 error = f"could not persist bake lifecycle: {exc}"
         if outcome == "COMPLETE":
+            paper_error = str(_BAKE.get("paper_surface_error", "")).strip()
+            status = f"Bake complete ({count} frames) on {backend_label}"
+            if paper_error:
+                status += "; Paper surfaces need Rebuild Paper Surface Cache"
             _set_bake_lifecycle(
                 st, "COMPLETE",
-                f"Bake complete ({count} frames) on {backend_label}",
+                status,
                 progress=1.0,
             )
         elif outcome == "FAILED":
@@ -2349,6 +3043,307 @@ class STFLIP_OT_cancel_bake(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class STFLIP_OT_rebuild_paper_surfaces(bpy.types.Operator):
+    """Rebuild every committed frame's derived Appendix-B surface cache."""
+
+    bl_idname = "stflip.rebuild_paper_surfaces"
+    bl_label = "Rebuild Paper Surface Cache"
+    bl_options = {"REGISTER"}
+
+    _timer = None
+
+    def _setup(self, context) -> bool:
+        if _BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the simulation bake first")
+            return False
+        if _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "A paper surface rebuild is already running")
+            return False
+        scene = context.scene
+        st = scene.stflip
+        if not st.create_surface or st.surface_method != "PAPER_MCF":
+            self.report({"ERROR"}, "Enable Create Surface and select Paper MCF")
+            return False
+        cache_dir = resolve_cache_dir(scene)
+        meta = cache.read_meta(cache_dir)
+        ownership_check = getattr(handlers, "scene_cache_ownership", None)
+        ownership = (
+            ownership_check(scene, meta)
+            if ownership_check is not None else "legacy")
+        if ownership not in {"owned", "legacy"}:
+            self.report(
+                {"ERROR"},
+                f"Cannot rebuild surfaces: cache ownership is {ownership}",
+            )
+            return False
+        try:
+            dx = float(meta["dx"])
+        except (KeyError, TypeError, ValueError):
+            self.report({"ERROR"}, "Cache metadata has no valid cell size")
+            return False
+        frames = cache.committed_frames(cache_dir, meta)
+        if not frames:
+            self.report({"ERROR"}, "No committed particle frames are available")
+            return False
+        lo = meta.get("frame_start")
+        hi = meta.get("frame_end_baked")
+        if (isinstance(lo, bool) or isinstance(hi, bool)
+                or not isinstance(lo, numbers.Integral)
+                or not isinstance(hi, numbers.Integral)
+                or int(hi) < int(lo)
+                or frames != list(range(int(lo), int(hi) + 1))):
+            self.report(
+                {"ERROR"},
+                "Cannot rebuild surfaces: committed particle frames are "
+                "missing or corrupt",
+            )
+            return False
+
+        cuda_state = (current_cuda_diagnostics()
+                      if st.backend != "cpu" else {"available": False})
+        backend_name = (
+            "cuda" if st.backend != "cpu" and cuda_state.get("available")
+            else "cpu")
+        if st.backend == "cuda" and backend_name != "cuda":
+            self.report(
+                {"WARNING"},
+                "CUDA reconstruction unavailable; rebuilding surfaces on CPU",
+            )
+        max_voxels = int(st.paper_max_reconstruction_voxels)
+        particle_bound = 0
+        cached_settings = meta.get("settings")
+        if isinstance(cached_settings, dict):
+            try:
+                particle_bound = estimate_bake_memory(
+                    cached_settings["grid_dims"],
+                    cached_settings["particles_per_cell"],
+                )["particles"]
+            except (KeyError, TypeError, ValueError):
+                particle_bound = 0
+        surface_meta = meta.get("surface_reconstruction")
+        latest_diagnostics = (
+            surface_meta.get("latest_diagnostics")
+            if isinstance(surface_meta, dict) else None)
+        observed_particles = (
+            latest_diagnostics.get("particle_count")
+            if isinstance(latest_diagnostics, dict) else None)
+        if (not isinstance(observed_particles, bool)
+                and isinstance(observed_particles, numbers.Integral)
+                and int(observed_particles) >= 0):
+            particle_bound = max(particle_bound, int(observed_particles))
+        surface_decision = paper_surface_backend_decision(
+            backend_name,
+            estimate_paper_surface_memory(
+                max_voxels, particle_count=particle_bound),
+            ram_available=_system_available_memory_bytes(),
+            vram_available=(
+                cuda_state.get("free_bytes")
+                if backend_name == "cuda" else None),
+        )
+        if surface_decision["error"]:
+            self.report({"ERROR"}, surface_decision["error"])
+            return False
+        if surface_decision["warning"]:
+            self.report({"WARNING"}, surface_decision["warning"])
+        backend_name = surface_decision["backend"]
+        backend = get_backend(backend_name)
+        config = paper_surface_config(
+            dx,
+            st.paper_mcf_iterations,
+            st.paper_mesh_adaptivity,
+            backend.name,
+        )
+        fingerprint = paper_surface_fingerprint(config)
+        _SURFACE_BAKE.update({
+            "running": True,
+            "cancel_requested": False,
+            "scene": scene,
+            "cache_dir": cache_dir,
+            "meta": meta,
+            "frames": frames,
+            "index": 0,
+            "dx": dx,
+            "backend": backend,
+            "config": config,
+            "fingerprint": fingerprint,
+            "max_voxels": max_voxels,
+            "latest_diagnostics": None,
+        })
+        st.bake_status = (
+            f"Rebuilding paper surfaces on {backend.name}: 0/{len(frames)}")
+        return True
+
+    def _process_next(self) -> bool:
+        state = _SURFACE_BAKE
+        if state["index"] >= len(state["frames"]):
+            return False
+        frame = state["frames"][state["index"]]
+        particle_frame = cache.read_frame(state["cache_dir"], frame)
+        if particle_frame is None:
+            raise ValueError(f"committed particle frame {frame} is corrupt")
+        _vertices, _triangles, _quads, diagnostics = (
+            _write_paper_surface_frame(
+                state["cache_dir"],
+                frame,
+                particle_frame[0],
+                state["dx"],
+                state["config"],
+                state["fingerprint"],
+                state["max_voxels"],
+                state["backend"],
+            )
+        )
+        state["latest_diagnostics"] = diagnostics
+        state["index"] += 1
+        state["scene"].stflip.bake_status = (
+            "Rebuilding paper surfaces: "
+            f"{state['index']}/{len(state['frames'])} (frame {frame})")
+        return state["index"] < len(state["frames"])
+
+    def _finish(self, context, outcome: str, error: str = ""):
+        state = _SURFACE_BAKE
+        scene = state.get("scene", context.scene)
+        st = scene.stflip
+        result = {"CANCELLED"}
+        try:
+            if self._timer is not None:
+                try:
+                    context.window_manager.event_timer_remove(self._timer)
+                except Exception:
+                    # A window can disappear while a modal operator is
+                    # finishing.  Timer cleanup must not hide the rebuild
+                    # result or leave the global rebuild state wedged.
+                    pass
+                self._timer = None
+
+            if outcome == "COMPLETE":
+                try:
+                    frames = state["frames"]
+                    surface_meta = paper_surface_metadata(
+                        state["config"],
+                        state["fingerprint"],
+                        state["max_voxels"],
+                        latest_frame=frames[-1],
+                        state="COMPLETE",
+                    )
+                    if state.get("latest_diagnostics") is not None:
+                        surface_meta["latest_diagnostics"] = state[
+                            "latest_diagnostics"]
+                    state["meta"]["surface_reconstruction"] = surface_meta
+                    cache.write_meta(state["cache_dir"], state["meta"])
+                except Exception as exc:
+                    message = f"Paper surface cache activation failed: {exc}"
+                    st.bake_status = message
+                    self.report({"ERROR"}, message)
+                    return {"CANCELLED"}
+
+                # Metadata activation above is the durable transaction.  A
+                # missing UI context or viewport object must not invalidate a
+                # complete cache that playback can load on the next frame.
+                st.bake_status = (
+                    f"Paper surface cache complete ({len(frames)} frames; "
+                    f"{state['backend'].name})")
+                result = {"FINISHED"}
+                if (context.scene == scene
+                        and bool(st.create_surface)
+                        and st.surface_method == "PAPER_MCF"):
+                    try:
+                        lo, hi = frames[0], frames[-1]
+                        frame = min(max(int(scene.frame_current), lo), hi)
+                        particle_frame = cache.read_frame(
+                            state["cache_dir"], frame)
+                        if particle_frame is None:
+                            raise ValueError(
+                                f"committed particle frame {frame} is corrupt")
+                        paper_mesh = cache.read_surface(
+                            state["cache_dir"],
+                            frame,
+                            state["fingerprint"],
+                            expected_source_positions=particle_frame[0],
+                        )
+                        if paper_mesh is None:
+                            raise ValueError(
+                                f"paper surface frame {frame} is unavailable")
+                        st.surface_object = mesher.ensure_paper_surface_object(
+                            *paper_mesh,
+                            existing_obj=st.surface_object,
+                        )
+                        _set_surface_enabled(st.surface_object, True)
+                    except Exception as exc:
+                        try:
+                            stale_surface = mesher.scene_exclusive_output(
+                                scene, st.surface_object)
+                            _set_surface_enabled(stale_surface, False)
+                        except Exception:
+                            pass
+                        self.report(
+                            {"WARNING"},
+                            "Paper surface cache is active, but the viewport "
+                            f"could not be refreshed: {exc}",
+                        )
+            elif outcome == "FAILED":
+                st.bake_status = f"Paper surface rebuild failed: {error}"
+            else:
+                st.bake_status = (
+                    "Paper surface rebuild cancelled; previous active cache "
+                    "was preserved")
+        finally:
+            _SURFACE_BAKE.clear()
+        return result
+
+    def invoke(self, context, event):
+        try:
+            if not self._setup(context):
+                return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Surface rebuild setup failed: {exc}")
+            _SURFACE_BAKE.clear()
+            return {"CANCELLED"}
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        try:
+            if not self._setup(context):
+                return {"CANCELLED"}
+            while self._process_next():
+                pass
+        except Exception as exc:
+            self.report({"ERROR"}, f"Surface rebuild failed: {exc}")
+            return self._finish(context, "FAILED", str(exc))
+        return self._finish(context, "COMPLETE")
+
+    def modal(self, context, event):
+        if event.type == "ESC" or _SURFACE_BAKE.get("cancel_requested"):
+            return self._finish(context, "CANCELLED")
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        try:
+            more = self._process_next()
+        except Exception as exc:
+            self.report({"ERROR"}, f"Surface rebuild failed: {exc}")
+            return self._finish(context, "FAILED", str(exc))
+        return {"RUNNING_MODAL"} if more else self._finish(context, "COMPLETE")
+
+
+class STFLIP_OT_cancel_surface_rebuild(bpy.types.Operator):
+    bl_idname = "stflip.cancel_surface_rebuild"
+    bl_label = "Cancel Surface Rebuild"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if not _SURFACE_BAKE.get("running"):
+            self.report({"INFO"}, "No paper surface rebuild is running")
+            return {"CANCELLED"}
+        _SURFACE_BAKE["cancel_requested"] = True
+        scene = _SURFACE_BAKE.get("scene", context.scene)
+        scene.stflip.bake_status = (
+            "Cancelling after the current surface frame...")
+        return {"FINISHED"}
+
+
 class STFLIP_OT_refresh_surface(bpy.types.Operator):
     """Refresh surfacing controls for an existing valid bake."""
     bl_idname = "stflip.refresh_surface"
@@ -2356,8 +3351,8 @@ class STFLIP_OT_refresh_surface(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        if _BAKE.get("running"):
-            self.report({"WARNING"}, "Cancel the running bake first")
+        if _BAKE.get("running") or _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake or rebuild first")
             return {"CANCELLED"}
         scene = context.scene
         st = scene.stflip
@@ -2401,19 +3396,74 @@ class STFLIP_OT_refresh_surface(bpy.types.Operator):
             self.report({"INFO"}, "Surface display disabled")
             return {"FINISHED"}
 
-        st.surface_object = mesher.ensure_surface_object(
-            particle_obj,
-            dx,
-            st.particle_radius,
-            st.surface_voxel,
-            existing_obj=st.surface_object,
-        )
-        mesher.configure_surface_smoothing(
-            st.surface_object,
-            st.surface_smoothing,
-            st.surface_smoothing_iterations,
-            st.surface_smoothing_factor,
-        )
+        if st.surface_method == "PAPER_MCF":
+            surface_meta = meta.get("surface_reconstruction")
+            active_config = (
+                surface_meta.get("config")
+                if isinstance(surface_meta, dict) else None)
+            active_fingerprint = (
+                surface_meta.get("fingerprint")
+                if isinstance(surface_meta, dict) else None)
+            backend_name = (
+                active_config.get("backend")
+                if isinstance(active_config, dict) else "cpu")
+            requested_config = paper_surface_config(
+                dx,
+                st.paper_mcf_iterations,
+                st.paper_mesh_adaptivity,
+                backend_name,
+            )
+            if (not isinstance(active_config, dict)
+                    or paper_surface_fingerprint(requested_config)
+                    != active_fingerprint):
+                self.report(
+                    {"ERROR"},
+                    "Paper surface settings are not cached; use Rebuild "
+                    "Paper Surface Cache",
+                )
+                return {"CANCELLED"}
+            lo = int(meta.get("frame_start", scene.frame_start))
+            hi = int(meta.get("frame_end_baked", lo))
+            frame = min(max(int(scene.frame_current), lo), hi)
+            particle_frame = cache.read_frame(resolve_cache_dir(scene), frame)
+            if particle_frame is None:
+                self.report(
+                    {"ERROR"}, f"Particle frame {frame} is missing or corrupt")
+                return {"CANCELLED"}
+            try:
+                paper_mesh = cache.read_surface(
+                    resolve_cache_dir(scene),
+                    frame,
+                    active_fingerprint,
+                    expected_source_positions=particle_frame[0],
+                )
+            except cache.SurfaceCacheError as exc:
+                self.report({"ERROR"}, f"Paper surface cache is corrupt: {exc}")
+                return {"CANCELLED"}
+            if paper_mesh is None:
+                self.report(
+                    {"ERROR"},
+                    f"Paper surface frame {frame} is missing; rebuild the cache",
+                )
+                return {"CANCELLED"}
+            st.surface_object = mesher.ensure_paper_surface_object(
+                *paper_mesh,
+                existing_obj=st.surface_object,
+            )
+        else:
+            st.surface_object = mesher.restore_preview_surface(
+                particle_obj,
+                dx,
+                st.particle_radius,
+                st.surface_voxel,
+                existing_obj=st.surface_object,
+            )
+            mesher.configure_surface_smoothing(
+                st.surface_object,
+                st.surface_smoothing,
+                st.surface_smoothing_iterations,
+                st.surface_smoothing_factor,
+            )
         _set_surface_enabled(st.surface_object, True)
         self.report({"INFO"}, "Surface controls refreshed from baked particles")
         return {"FINISHED"}
@@ -2426,6 +3476,9 @@ class STFLIP_OT_free_bake(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
+        if _BAKE.get("running") or _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake or rebuild first")
+            return {"CANCELLED"}
         scene = context.scene
         ensure_cache_id = getattr(handlers, "ensure_scene_cache_id", None)
         if ensure_cache_id is not None:
@@ -2457,6 +3510,9 @@ class STFLIP_OT_install_gpu(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
+        if _BAKE.get("running") or _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake or rebuild first")
+            return {"CANCELLED"}
         st = context.scene.stflip
         root = _runtime_root(create=True)
         if root is None:
@@ -2558,6 +3614,8 @@ CLASSES = (
     STFLIP_OT_bake,
     STFLIP_OT_resume_bake,
     STFLIP_OT_cancel_bake,
+    STFLIP_OT_rebuild_paper_surfaces,
+    STFLIP_OT_cancel_surface_rebuild,
     STFLIP_OT_refresh_surface,
     STFLIP_OT_free_bake,
     STFLIP_OT_install_gpu,
