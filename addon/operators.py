@@ -456,6 +456,25 @@ def _build_solver(params, backend_name: str):
     return backend, solver
 
 
+def _measure_output_frame(frame, solver, stats, positions, velocities,
+                          compute_wall_s, include_enstrophy):
+    """Build one bpy-free diagnostic record from an output-frame snapshot."""
+    from ..stflip.metrics import measure_frame
+
+    mac_grids = solver._grids if include_enstrophy and solver._grids else None
+    return measure_frame(
+        frame=frame,
+        simulation_time_s=solver.time,
+        params=solver.p,
+        stats=stats,
+        positions_local=positions,
+        velocities=velocities,
+        compute_wall_s=compute_wall_s,
+        mac_grids=mac_grids,
+        array_module=solver.be.xp if mac_grids is not None else None,
+    )
+
+
 def _set_surface_enabled(obj, enabled: bool) -> None:
     if obj is None:
         return
@@ -633,6 +652,12 @@ class STFLIP_OT_bake(bpy.types.Operator):
             "backend_requested": st.backend,
             "backend": backend.name,
             "cuda_device": cuda_device,
+            "scene_units": {
+                "length_unit": "blender_unit",
+                "system": scene.unit_settings.system,
+                "scale_length": scene.unit_settings.scale_length,
+            },
+            "experiment_profile": None,
             "settings": {
                 "resolution": st.resolution,
                 "grid_dims": list(dims),
@@ -655,6 +680,9 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "create_surface": st.create_surface,
                 "surface_particle_radius_dx": st.particle_radius,
                 "surface_voxel_size_dx": st.surface_voxel,
+                "collect_metrics": st.collect_metrics,
+                "collect_enstrophy": bool(
+                    st.collect_metrics and st.collect_enstrophy),
             },
             "liquid_sources": [
                 {"name": obj.name,
@@ -668,11 +696,28 @@ class STFLIP_OT_bake(bpy.types.Operator):
             ],
             "version": 2,
         }
-        cache.write_meta(cache_dir, meta)
+        from ..stflip.experiments import profile_provenance
+
+        meta["experiment_profile"] = profile_provenance(
+            st.experiment_profile, st)
+        if st.collect_metrics:
+            from ..stflip.metrics import METRICS_SCHEMA, SCHEMA_VERSION
+
+            meta["metrics"] = {
+                "schema": METRICS_SCHEMA,
+                "version": SCHEMA_VERSION,
+                "file": cache.METRICS_NAME,
+                "enstrophy_enabled": st.collect_enstrophy,
+            }
 
         pos, vel = solver.get_render_particles()
         cache.write_frame(cache_dir, scene.frame_start,
                           pos + origin[None, :].astype(np.float32), vel)
+        if st.collect_metrics:
+            record = _measure_output_frame(
+                scene.frame_start, solver, None, pos, vel, None, False)
+            cache.append_metric(cache_dir, record)
+        cache.write_meta(cache_dir, meta)
 
         particle_obj = mesher.ensure_particle_object(
             existing_obj=st.particle_object)
@@ -697,6 +742,9 @@ class STFLIP_OT_bake(bpy.types.Operator):
                      cache_dir=cache_dir, meta=meta,
                      frame=scene.frame_start, end=scene.frame_end,
                      backend_label=backend_label,
+                     collect_metrics=st.collect_metrics,
+                     collect_enstrophy=(st.collect_metrics
+                                        and st.collect_enstrophy),
                      running=True)
         scene.frame_set(scene.frame_start)
         st.bake_status = (
@@ -709,11 +757,23 @@ class STFLIP_OT_bake(bpy.types.Operator):
         if b["frame"] >= b["end"]:
             return False
         solver: STFLIPSolver = b["solver"]
+        compute_started = time.perf_counter()
         stats = solver.step_frame()
+        if b.get("collect_metrics"):
+            solver.be.synchronize()
+            compute_wall_s = time.perf_counter() - compute_started
+        else:
+            compute_wall_s = None
         b["frame"] += 1
         pos, vel = solver.get_render_particles()
         cache.write_frame(b["cache_dir"], b["frame"],
                           pos + b["origin"][None, :], vel)
+        if b.get("collect_metrics"):
+            record = _measure_output_frame(
+                b["frame"], solver, stats, pos, vel, compute_wall_s,
+                b.get("collect_enstrophy", False),
+            )
+            cache.append_metric(b["cache_dir"], record)
         b["meta"]["frame_end_baked"] = b["frame"]
         cache.write_meta(b["cache_dir"], b["meta"])
         scene.stflip.bake_status = (

@@ -11,6 +11,8 @@ from bpy.props import (
     StringProperty,
 )
 
+from ..stflip.experiments import PROFILE_ENUM_ITEMS
+
 
 class STFLIPObjectSettings(bpy.types.PropertyGroup):
     role: EnumProperty(
@@ -36,6 +38,22 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
 
 
 class STFLIPSettings(bpy.types.PropertyGroup):
+    experiment_profile: EnumProperty(
+        name="Experiment Profile",
+        items=PROFILE_ENUM_ITEMS,
+        default="CUSTOM",
+        description="Paper-inspired parameter snapshot; profiles do not "
+                    "replace the scene geometry or unsupported baselines",
+    )
+    collect_metrics: BoolProperty(
+        name="Record Frame Metrics", default=False,
+        description="Write strict per-frame diagnostics to the bake cache",
+    )
+    collect_enstrophy: BoolProperty(
+        name="Compute Enstrophy", default=False,
+        description="Compute the paper's vorticity diagnostic from the MAC "
+                    "grid; adds grid-wide work and GPU synchronization",
+    )
     domain: PointerProperty(
         name="Domain", type=bpy.types.Object,
         description="Axis-aligned box defining the simulation region",
