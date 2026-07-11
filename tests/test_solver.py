@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from stflip import Params, STFLIPSolver, cuda_diagnostics
+from stflip.metrics import estimate_mac_grid_metrics, measure_frame
 
 
 def _dam_break(n=24, cfl=8.0, st=True, seed=0, ppc=8):
@@ -64,6 +65,58 @@ def test_dam_break_runs_and_stays_finite():
         assert pos[:, ax].max() <= size[ax]
     # The column should have collapsed: fluid spread beyond the initial third.
     assert pos[:, 0].max() > size[0] * 0.5
+
+
+def test_frame_stats_report_each_substep_without_extra_vmax_samples():
+    s = _dam_break(n=8, cfl=0.25, ppc=1)
+    s.vel[:] = s.be.xp.asarray((4.0, 0.0, 0.0), dtype=s.be.xp.float32)
+
+    stats = s.step_frame()
+
+    assert stats.steps > 1
+    assert len(stats.dt_values) == stats.steps
+    assert len(stats.particle_cfl_estimated_values) == stats.steps
+    assert len(stats.particle_cfl_actual_values) == stats.steps
+    assert len(stats.pcg_iters) == stats.steps
+    assert len(stats.pcg_rel_residuals) == stats.steps
+    assert np.all(np.isfinite(stats.particle_cfl_estimated_values))
+    assert np.all(np.isfinite(stats.particle_cfl_actual_values))
+    assert np.all(np.isfinite(stats.pcg_rel_residuals))
+    assert stats.particle_cfl_estimated_values[0] == pytest.approx(
+        4.0 * stats.dt_values[0] / s.p.dx)
+    assert stats.particle_cfl_actual_values[-1] == pytest.approx(
+        stats.max_speed * stats.dt_values[-1] / s.p.dx)
+    for i in range(1, stats.steps):
+        # The post-step reduction from i-1 is reused to estimate step i.
+        previous_speed = (
+            stats.particle_cfl_actual_values[i - 1] / stats.dt_values[i - 1]
+        )
+        estimated_speed = (
+            stats.particle_cfl_estimated_values[i] / stats.dt_values[i]
+        )
+        assert estimated_speed == pytest.approx(previous_speed)
+
+
+def test_actual_particle_cfl_can_exceed_estimate_under_acceleration():
+    n = 8
+    p = Params(
+        resolution=(n, n, n), dx=1.0 / n,
+        gravity=(0.0, 0.0, -40.0), frame_dt=0.05,
+        cfl_target=0.1, particles_per_cell=1,
+        st_enabled=False, seed=17,
+    )
+    s = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[2:6, 2:6, 4:6] = True
+    s.add_liquid_mask(mask)
+
+    stats = s.step_frame()
+
+    assert stats.steps == 1
+    assert stats.particle_cfl_estimated_values == pytest.approx([0.0])
+    assert stats.particle_cfl_actual_values[0] > p.cfl_target
+    assert stats.particle_cfl_actual_values[0] > (
+        stats.particle_cfl_estimated_values[0])
 
 
 def test_jitter_residual_bound():
@@ -242,3 +295,32 @@ def test_gpu_backend_parity():
             rtol=2e-5,
             atol=2e-6,
         )
+
+    cpu_record = measure_frame(
+        frame=2, simulation_time_s=s_cpu.time, params=s_cpu.p,
+        stats=cpu_stats, positions_local=pos_c, velocities=vel_c,
+        compute_wall_s=None,
+    )
+    gpu_record = measure_frame(
+        frame=2, simulation_time_s=s_gpu.time, params=s_gpu.p,
+        stats=gpu_stats, positions_local=pos_g, velocities=vel_g,
+        compute_wall_s=None,
+    )
+    for field in (
+        "particle_cfl_estimated_max",
+        "particle_cfl_actual_max",
+        "speed_max_solver_units_per_s",
+        "kinetic_energy_particle_estimate",
+    ):
+        assert gpu_record[field] == pytest.approx(
+            cpu_record[field], rel=3e-5, abs=2e-6)
+
+    cpu_grid_metrics = estimate_mac_grid_metrics(
+        s_cpu._grids, s_cpu.p.dx)
+    gpu_grid_metrics = estimate_mac_grid_metrics(
+        s_gpu._grids, s_gpu.p.dx, array_module=cupy)
+    assert gpu_grid_metrics["phase_threshold_volume_fraction_estimate"] \
+        == pytest.approx(
+            cpu_grid_metrics["phase_threshold_volume_fraction_estimate"])
+    assert gpu_grid_metrics["mac_grid_enstrophy_estimate"] == pytest.approx(
+        cpu_grid_metrics["mac_grid_enstrophy_estimate"], rel=2e-4, abs=2e-6)

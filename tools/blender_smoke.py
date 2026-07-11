@@ -66,10 +66,10 @@ def run(backend: str = "cuda") -> dict:
         _finished(bpy.ops.stflip.quick_setup(), "quick setup")
 
         settings = scene.stflip
+        settings.experiment_profile = "ENSTROPHY_CFL_10_FLIP_99"
+        _finished(
+            bpy.ops.stflip.apply_experiment_profile(), "apply profile")
         settings.resolution = 8
-        settings.particles_per_cell = 1
-        settings.cfl_target = 8.0
-        settings.seed = 1234
         settings.backend = backend
         settings.cache_dir = str(cache_dir)
         settings.create_surface = True
@@ -80,8 +80,33 @@ def run(backend: str = "cuda") -> dict:
             raise AssertionError(
                 f"requested {backend!r}, bake used {meta['backend']!r}"
             )
-        if meta.get("version") != 2 or meta.get("settings", {}).get("seed") != 1234:
+        if meta.get("version") != 2 or meta.get("settings", {}).get("seed") != 0:
             raise AssertionError("cache metadata lacks the v2 settings snapshot")
+        provenance = meta.get("experiment_profile", {})
+        if provenance.get("matched") != settings.experiment_profile:
+            raise AssertionError("applied profile provenance was not preserved")
+        from bl_ext.user_default.st_flip.stflip import cache as stflip_cache
+
+        metrics = stflip_cache.read_metrics(
+            str(cache_dir), stflip_cache.baked_frames(str(cache_dir)))
+        if [row["frame"] for row in metrics] != [1, 2]:
+            raise AssertionError("expected one metric record per cached frame")
+        if metrics[-1]["compute_wall_s"] is None:
+            raise AssertionError("evolved frame lacks synchronized solver timing")
+        if metrics[-1]["mac_grid_enstrophy_estimate"] is None:
+            raise AssertionError("enstrophy diagnostic was not recorded")
+        csv_path = cache_dir / "smoke_metrics.csv"
+        json_path = cache_dir / "smoke_metrics.json"
+        _finished(
+            bpy.ops.stflip.export_metrics(
+                filepath=str(csv_path), export_format="CSV"),
+            "CSV metrics export",
+        )
+        _finished(
+            bpy.ops.stflip.export_metrics(
+                filepath=str(json_path), export_format="JSON"),
+            "JSON metrics export",
+        )
 
         particles = settings.particle_object
         surface = settings.surface_object
@@ -102,6 +127,8 @@ def run(backend: str = "cuda") -> dict:
             "particles": len(particles.data.vertices),
             "velocity_attribute": True,
             "surface": surface.name,
+            "metric_frames": len(metrics),
+            "metrics_exports": [csv_path.name, json_path.name],
             "elapsed_s": time.perf_counter() - started,
         }
     finally:

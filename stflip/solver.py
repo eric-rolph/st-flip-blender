@@ -68,7 +68,13 @@ class Params:
 class FrameStats:
     steps: int = 0
     dt_values: list = field(default_factory=list)
+    # This solver's adaptive step uses maximum particle speed. These names are
+    # deliberately not "grid CFL": the paper's diagnostic may be computed
+    # from a different MaxVelocity implementation in another host solver.
+    particle_cfl_estimated_values: list = field(default_factory=list)
+    particle_cfl_actual_values: list = field(default_factory=list)
     pcg_iters: list = field(default_factory=list)
+    pcg_rel_residuals: list = field(default_factory=list)
     n_particles: int = 0
     max_speed: float = 0.0
 
@@ -418,10 +424,11 @@ class STFLIPSolver:
         # Solve sum_f k_f (p_c - p_nb)/dx^2 = -(div u*)_c on liquid cells.
         rhs = -(div) * liquid
         kx2, ky2, kz2 = kx / p.dx**2, ky / p.dx**2, kz / p.dx**2
-        pr, iters, _rel = pressure.solve(
+        pr, iters, rel = pressure.solve(
             xp, rhs, kx2, ky2, kz2, liquid, tol=p.pcg_tol,
             max_iter=p.pcg_max_iter)
         stats.pcg_iters.append(iters)
+        stats.pcg_rel_residuals.append(rel)
 
         pm = pr * liquid
         gradx = (pm[1:, :, :] - pm[:-1, :, :]) / p.dx
@@ -485,21 +492,24 @@ class STFLIPSolver:
         stats = FrameStats()
         self._seed_inflows()
         t_rem = p.frame_dt
+        vmax = (float(xp.max(_norm_rows(xp, self.vel)))
+                if self.pos.shape[0] else 0.0)
         while t_rem > 1e-9 * p.frame_dt:
             if self.pos.shape[0] == 0:
                 break
-            vmax = float(xp.max(_norm_rows(xp, self.vel)))
-            vmax = max(vmax, 1e-6)
-            dt = min(p.cfl_target * p.dx / vmax, t_rem)
+            dt = min(p.cfl_target * p.dx / max(vmax, 1e-6), t_rem)
             # Subdivide the remaining frame time into even parts (Alg. 1 l.7).
             dt = t_rem / math.ceil(t_rem / dt)
+            stats.particle_cfl_estimated_values.append(vmax * dt / p.dx)
             self._step(dt, stats)
+            vmax = (float(xp.max(_norm_rows(xp, self.vel)))
+                    if self.pos.shape[0] else 0.0)
+            stats.particle_cfl_actual_values.append(vmax * dt / p.dx)
             stats.steps += 1
             stats.dt_values.append(dt)
             t_rem -= dt
         stats.n_particles = int(self.pos.shape[0])
-        if self.pos.shape[0]:
-            stats.max_speed = float(xp.max(_norm_rows(xp, self.vel)))
+        stats.max_speed = vmax
         return stats
 
     def _seed_inflows(self) -> None:

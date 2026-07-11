@@ -109,6 +109,33 @@ class STFLIP_PT_solver(bpy.types.Panel):
         layout.prop(st, "cache_dir")
 
 
+class STFLIP_PT_experiment(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "Experiment Diagnostics"
+    bl_parent_id = "STFLIP_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.stflip
+
+        layout.prop(st, "experiment_profile")
+        row = layout.row()
+        row.enabled = st.experiment_profile != "CUSTOM"
+        row.operator("stflip.apply_experiment_profile", icon="PRESET")
+        layout.label(text="Profiles set parameters, not scene geometry.",
+                     icon="INFO")
+
+        layout.separator()
+        layout.prop(st, "collect_metrics")
+        sub = layout.column()
+        sub.enabled = st.collect_metrics
+        sub.prop(st, "collect_enstrophy")
+        layout.operator("stflip.export_metrics", icon="EXPORT")
+
+
 class STFLIP_PT_display(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -131,6 +158,7 @@ CLASSES = (
     STFLIP_PT_main,
     STFLIP_PT_object,
     STFLIP_PT_solver,
+    STFLIP_PT_experiment,
     STFLIP_PT_display,
 )
 

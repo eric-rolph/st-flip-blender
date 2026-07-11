@@ -1,8 +1,8 @@
 """Blender-facing layer of the ST-FLIP addon."""
 
-from . import handlers, operators, panels, properties
+from . import experiment, handlers, operators, panels, properties
 
-_MODULES = (properties, operators, panels, handlers)
+_MODULES = (properties, operators, experiment, panels, handlers)
 
 
 def register():

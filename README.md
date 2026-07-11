@@ -99,12 +99,47 @@ settings.
 | Adaptive Attenuation | §3.10 | Less jitter noise on calm surfaces |
 | Interface Steepness (η) | Eq. 13 | Lower = steeper/stronger leveling; higher = finer detail/noise |
 | FLIP Fraction | §4 | FLIP/PIC blend (default 0.98) |
-| Random Seed | §3.5 | Reproducible particle placement and temporal jitter |
+| Random Seed | §3.10 | Reproducible particle placement and temporal jitter; seed 0 is an add-on default, not a published paper value |
 | Initial / Inflow Velocity | §4.8 | Uniform velocity per liquid or inflow mesh; general spatial fields are not supported |
+
+### Experiment profiles and diagnostics
+
+The **Experiment Diagnostics** panel provides parameter-only, paper-inspired
+profiles. They apply reproducible solver settings to the current Blender
+scene; they do **not** recreate the paper's geometry, reference solvers, or
+surface reconstruction:
+
+- Laminar dam break (§4.1): target CFL 1, 3, 5, 10, or 20.
+- Standard dam break (§4.3): target CFL 1, 2, 4, 8, or 16, plus an explicitly
+  labeled instantaneous-P2G ablation that is not standard FLIP/GFM.
+- Enstrophy (§4.4): ST-FLIP analogs for `(CFL, FLIP)` pairs `(1, .99)`,
+  `(5, .99)`, `(10, .99)`, `(1, .95)`, and `(1, .90)`. The paper's CFL 1
+  comparison curves use the unavailable standard-FLIP/GFM solver.
+- Particle count (§4.5): the ST-FLIP/CFL 10 branch at 1, 2, 4, 8, or 16
+  particles/cell plus the 50-PPC reference. The paper's standard-FLIP/CFL 1
+  branch is unavailable.
+
+Enable **Record Frame Metrics** before baking to append strict schema-v1
+records to `stflip_metrics.jsonl` in the cache. The export button produces an
+atomic, self-contained CSV or JSON file. Evolved output frames record
+solver-only wall time, time-step and observed particle-CFL summaries, PCG
+iteration/residual summaries, particle count, speed, center of mass, momentum,
+and equal-particle-mass kinetic-energy and volume estimates. **Compute
+Enstrophy** additionally records
+`0.5 * integral(|curl(u)|^2) dV` and a `phi >= 0.5` phase-threshold volume
+estimate from the MAC grid.
+
+Distances and derived quantities remain in raw Blender/solver units; the
+scene unit system and scale are saved alongside them. Particle-volume and
+phase-threshold volume are explicitly estimates, not the paper's unspecified
+volume estimator or normalization. The observed CFL fields use this solver's
+maximum particle speed and are therefore not labeled as paper-equivalent grid
+CFL. Enstrophy adds an O(grid) diagnostic and synchronization, but it is timed
+outside the reported solver-only wall time.
 
 ### Paper coverage
 
-Version 0.2 implements the paper's **single-phase, free-surface ST-FLIP
+Version 0.3 implements the paper's **single-phase, free-surface ST-FLIP
 core**; it is not a full reproduction of every solver variant and production
 example in the paper.
 
@@ -112,7 +147,7 @@ example in the paper.
 |---|---|
 | One-sided temporal kernel, slab P2G, residual jitter, phase field, variable-coefficient projection | Implemented |
 | Large target CFL and instantaneous-P2G temporal ablation | Implemented; target CFL 0.5–30 |
-| Reproducible manual reruns over particle count, `γ`, `η`, and FLIP/PIC blend | Controls implemented; no automated sweep or paper-metric pipeline |
+| Reproducible reruns over paper-inspired CFL, particle-count, and FLIP/PIC parameter matrices | ST-FLIP-side profiles and auditable frame diagnostics implemented; no true FLIP/GFM branches, automated batch runner, or exact scene presets |
 | Single-phase liquid scenes with static mesh obstacles and inflows | Implemented |
 | Fractional solid face apertures from Eq. 14–16 | Partial; obstacle faces use binary open/closed masks |
 | Paper render reconstruction (`0.5Δx` spheres, 2× grid, MCF) | Partial; radius/voxel defaults match the first two values, but Geometry Nodes replaces MCF |
@@ -127,9 +162,9 @@ Experiment-level coverage is narrower than method-level coverage:
 
 | Paper experiment | Reproduction level |
 |---|---|
-| Laminar/standard dam breaks over large CFL values | Partial: qualitative dam-break setup and CFL control, without the paper's GFM/APIC baselines, exact presets, or volume/energy metrics |
+| Laminar/standard dam breaks over large CFL values | Partial: parameter profiles, qualitative setup, and raw diagnostics, without exact geometry, GFM/APIC baselines, or the paper's unspecified normalization |
 | Static-obstacle wake and thin-obstacle inflow jet | Partial: static obstacles and inflows are supported, but solid apertures are binary |
-| Particle-count and FLIP-blend studies | Controls and deterministic seed are available; RMSE, enstrophy, and batch-sweep tooling are not |
+| Particle-count and FLIP-blend studies | ST-FLIP-side parameter profiles, deterministic seed, and enstrophy diagnostic are available; true FLIP/GFM branches, SDF RMSE, and batch-sweep tooling are not |
 | Kleefsman obstacle validation | Missing water-height gauges and experimental-data comparison |
 | MCF reconstruction study | Missing MCF and normal-RMSE evaluation |
 | Whirlpool, rotational fields, and outflow scenes | Missing general spatial velocity fields and outflow boundaries |
@@ -163,6 +198,8 @@ because the corresponding algorithms are not implemented.
 - Particle re-synchronisation (un-jittering) at output frames
 - Solid obstacles via voxelised SDF with push-back; inflow emitters
 - NumPy CPU + CuPy CUDA backends sharing one code path
+- Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
+  atomic CSV/JSON export; optional discrete MAC-grid enstrophy
 
 Not (yet) implemented from the paper: two-phase air–liquid coupling, surface
 tension (CSF), APIC transfers, sparse/adaptive grids, mean-curvature-flow
@@ -182,6 +219,12 @@ works from scripts and `blender -b`:
 ```bash
 blender -b scene.blend --python-expr "import bpy; bpy.ops.stflip.bake()"
 ```
+
+For a diagnostic bake, set `scene.stflip.collect_metrics = True` (and
+optionally `collect_enstrophy = True`) before invoking the synchronous bake.
+The canonical JSONL remains usable after an interrupted bake; malformed or
+partial records are ignored and exports include only frames with valid cache
+files.
 
 ## Development
 
