@@ -619,11 +619,12 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
         st.bake_status = f"Voxelizing scene for {backend_label}..."
         solid_sdf = None
+        solid_node_sdf = None
         if obstacles:
-            solid_sdf = voxelize.sdf_from_objects(
+            solid_sdf, solid_node_sdf = voxelize.solid_sdfs_from_objects(
                 obstacles, deps, origin, dx, dims)
         if solid_sdf is not None:
-            solver.set_solid_sdf(solid_sdf)
+            solver.set_solid_sdf(solid_sdf, solid_node_sdf)
 
         not_solid = (solid_sdf > 0.0) if solid_sdf is not None else None
         seeded = 0
@@ -644,6 +645,8 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
         cache_dir = resolve_cache_dir(scene)
         cache.clear(cache_dir)
+        from ..stflip import __version__ as stflip_version
+
         meta = {
             "frame_start": scene.frame_start,
             "frame_end": scene.frame_end,
@@ -652,6 +655,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
             "backend_requested": st.backend,
             "backend": backend.name,
             "cuda_device": cuda_device,
+            "addon_version": stflip_version,
             "scene_units": {
                 "length_unit": "blender_unit",
                 "system": scene.unit_settings.system,
@@ -694,7 +698,11 @@ class STFLIP_OT_bake(bpy.types.Operator):
                  "velocity": list(obj.stflip.inflow_velocity)}
                 for obj in inflows
             ],
-            "version": 2,
+            "solid_boundary": {
+                **solver.solid_aperture_stats(),
+                "obstacle_count": len(obstacles),
+            },
+            "version": 3,
         }
         from ..stflip.experiments import profile_provenance
 

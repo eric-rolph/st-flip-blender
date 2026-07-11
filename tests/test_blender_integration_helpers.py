@@ -281,7 +281,7 @@ def test_world_bvh_transforms_evaluated_vertices_before_distance_queries(
     obj = types.SimpleNamespace(evaluated_get=lambda depsgraph: evaluated)
     voxelize = _load_voxelize(monkeypatch, FakeBVH)
 
-    bvh, orientation = voxelize._world_bvh(obj, object())
+    bvh, orientation, bounds = voxelize._world_bvh(obj, object())
 
     assert bvh is not None
     assert orientation == -1.0
@@ -289,6 +289,8 @@ def test_world_bvh_transforms_evaluated_vertices_before_distance_queries(
     vertices, polygons, all_triangles = calls[0]
     expected = [FakeMatrix() @ vertex.co for vertex in mesh.vertices]
     assert np.allclose(vertices, expected)
+    assert np.allclose(bounds[0], np.min(expected, axis=0))
+    assert np.allclose(bounds[1], np.max(expected, axis=0))
     assert polygons == [(0, 1, 2)]
     assert all_triangles is False
 

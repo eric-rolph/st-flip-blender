@@ -139,7 +139,7 @@ outside the reported solver-only wall time.
 
 ### Paper coverage
 
-Version 0.3 implements the paper's **single-phase, free-surface ST-FLIP
+Version 0.4 implements the paper's **single-phase, free-surface ST-FLIP
 core**; it is not a full reproduction of every solver variant and production
 example in the paper.
 
@@ -149,7 +149,7 @@ example in the paper.
 | Large target CFL and instantaneous-P2G temporal ablation | Implemented; target CFL 0.5–30 |
 | Reproducible reruns over paper-inspired CFL, particle-count, and FLIP/PIC parameter matrices | ST-FLIP-side profiles and auditable frame diagnostics implemented; no true FLIP/GFM branches, automated batch runner, or exact scene presets |
 | Single-phase liquid scenes with static mesh obstacles and inflows | Implemented |
-| Fractional solid face apertures from Eq. 14–16 | Partial; obstacle faces use binary open/closed masks |
+| Fractional solid face apertures in Eq. 14–17 | Implemented for stationary mesh obstacles using an add-on-specific node-SDF reconstruction; moving/deforming solids remain unsupported |
 | Paper render reconstruction (`0.5Δx` spheres, 2× grid, MCF) | Partial; radius/voxel defaults match the first two values, but Geometry Nodes replaces MCF |
 | Two-phase liquid/gas coupling | Not implemented |
 | APIC and implicit-density-projection comparison solvers | Not implemented |
@@ -163,7 +163,7 @@ Experiment-level coverage is narrower than method-level coverage:
 | Paper experiment | Reproduction level |
 |---|---|
 | Laminar/standard dam breaks over large CFL values | Partial: parameter profiles, qualitative setup, and raw diagnostics, without exact geometry, GFM/APIC baselines, or the paper's unspecified normalization |
-| Static-obstacle wake and thin-obstacle inflow jet | Partial: static obstacles and inflows are supported, but solid apertures are binary |
+| Static-obstacle wake and thin-obstacle inflow jet | Partial: stationary obstacles use fractional face apertures and inflows are supported, but the paper's exact geometry and jet parameters are unpublished |
 | Particle-count and FLIP-blend studies | ST-FLIP-side parameter profiles, deterministic seed, and enstrophy diagnostic are available; true FLIP/GFM branches, SDF RMSE, and batch-sweep tooling are not |
 | Kleefsman obstacle validation | Missing water-height gauges and experimental-data comparison |
 | MCF reconstruction study | Missing MCF and normal-RMSE evaluation |
@@ -190,13 +190,15 @@ because the corresponding algorithms are not implemented.
   one-sided temporal kernel (Eq. 19)
 - 4D→3D slab-integrated P2G with weight-accumulator phase field (Eq. 8–13)
 - Variational variable-coefficient pressure projection, matrix-free
-  Jacobi-PCG (Eq. 14–16), with binary rather than fractional solid apertures
+  Jacobi-PCG (Eq. 14–17), including node-SDF-derived fractional solid face
+  apertures, `div(alpha * u)`, and aperture-weighted PPE coefficients
 - Temporal jitter with residual carryover and the Appendix A boundedness
   guarantee (tested), adaptive γ attenuation
 - Globally adaptive time stepping with even frame subdivision, sub-stepped
   RK3 advection at local CFL ≤ 1
 - Particle re-synchronisation (un-jittering) at output frames
-- Solid obstacles via voxelised SDF with push-back; inflow emitters
+- Stationary solid obstacles via cell/node-sampled voxelised SDF, fractional
+  face apertures, and particle push-back; inflow emitters
 - NumPy CPU + CuPy CUDA backends sharing one code path
 - Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy

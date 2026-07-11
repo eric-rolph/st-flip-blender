@@ -1,5 +1,8 @@
+import re
+import tomllib
 import zipfile
 
+from stflip import __version__
 from tools.build_extension import ROOT, build, package_files
 
 
@@ -25,3 +28,16 @@ def test_built_archive_has_blender_extension_layout(tmp_path):
         assert "__init__.py" in names
         assert all(not name.startswith("st-flip-blender/") for name in names)
         assert archive.testzip() is None
+
+
+def test_release_version_is_consistent_across_package_surfaces():
+    manifest = tomllib.loads(
+        (ROOT / "blender_manifest.toml").read_text("utf-8"))
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))
+    entrypoint = (ROOT / "__init__.py").read_text("utf-8")
+    match = re.search(r'"version": \((\d+), (\d+), (\d+)\)', entrypoint)
+
+    assert match is not None
+    entrypoint_version = ".".join(match.groups())
+    assert manifest["version"] == project["project"]["version"] \
+        == entrypoint_version == __version__

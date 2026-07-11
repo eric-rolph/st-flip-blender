@@ -33,6 +33,11 @@ def test_pcg_converges_and_solves():
 def test_operator_symmetry():
     rng = np.random.default_rng(0)
     rhs, kx, ky, kz, liquid = _setup(n=8)
+    # Non-binary coefficients exercise the fractional-aperture operator; the
+    # same face value must contribute symmetrically to its two incident cells.
+    kx *= rng.uniform(0.05, 1.0, size=kx.shape)
+    ky *= rng.uniform(0.05, 1.0, size=ky.shape)
+    kz *= rng.uniform(0.05, 1.0, size=kz.shape)
     x = rng.standard_normal(liquid.shape) * liquid
     y = rng.standard_normal(liquid.shape) * liquid
     ax = pressure.apply_laplacian(np, x, kx, ky, kz, liquid)

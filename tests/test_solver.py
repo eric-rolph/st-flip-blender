@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from stflip import Params, STFLIPSolver, cuda_diagnostics
+from stflip import FrameStats, Params, STFLIPSolver, cuda_diagnostics
+from stflip.apertures import weighted_divergence
 from stflip.metrics import estimate_mac_grid_metrics, measure_frame
 
 
@@ -207,6 +208,138 @@ def test_solid_obstacle_blocks_particles():
     assert inside.mean() < 0.02  # essentially no particles deep in the solid
 
 
+def test_cell_sdf_only_keeps_binary_aperture_fallback():
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+    )
+    s = STFLIPSolver(p, "cpu")
+    s.set_solid_sdf(np.ones(p.resolution, dtype=np.float32))
+
+    alpha_u, alpha_v, alpha_w, solid = s._solid_face_apertures()
+    assert not np.any(s.be.to_numpy(solid))
+    for alpha in (alpha_u, alpha_v, alpha_w):
+        host = s.be.to_numpy(alpha)
+        assert set(np.unique(host)) <= {0.0, 1.0}
+
+    stats = s.solid_aperture_stats()
+    assert stats == {
+        "model": "binary_cell_center",
+        "total_face_count": 36,
+        "blocked_face_count": 24,
+        "fractional_face_count": 0,
+        "open_face_count": 12,
+    }
+
+
+def test_fractional_node_sdf_closes_domain_faces_and_reports_counts():
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+    )
+    s = STFLIPSolver(p, "cpu")
+    cell_sdf = np.ones(p.resolution, dtype=np.float32)
+    node_sdf = np.empty((3, 3, 3), dtype=np.float32)
+    node_sdf[:, 0, :] = -0.5
+    node_sdf[:, 1, :] = 0.5
+    node_sdf[:, 2, :] = 1.5
+    s.set_solid_sdf(cell_sdf, node_sdf)
+
+    alpha_u, alpha_v, alpha_w, solid = (
+        tuple(s.be.to_numpy(value) for value in s._solid_face_apertures())
+    )
+    assert not np.any(solid)
+    assert np.all(alpha_u[[0, -1], :, :] == 0.0)
+    assert np.all(alpha_v[:, [0, -1], :] == 0.0)
+    assert np.all(alpha_w[:, :, [0, -1]] == 0.0)
+    assert np.any((alpha_u > 0.0) & (alpha_u < 1.0))
+
+    stats = s.solid_aperture_stats()
+    assert stats["model"] == "fractional_node_sdf"
+    assert stats["total_face_count"] == 36
+    assert stats["blocked_face_count"] >= 24
+    assert stats["fractional_face_count"] > 0
+    assert (
+        stats["blocked_face_count"]
+        + stats["fractional_face_count"]
+        + stats["open_face_count"]
+        == stats["total_face_count"]
+    )
+
+
+def test_extrapolation_does_not_cross_zero_aperture_faces():
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+    )
+    s = STFLIPSolver(p, "cpu")
+    u = np.zeros((5, 1, 1), dtype=np.float32)
+    u[0, 0, 0] = 2.0
+    valid = np.zeros_like(u, dtype=bool)
+    valid[0, 0, 0] = True
+    allowed = np.ones_like(u, dtype=bool)
+    allowed[2, 0, 0] = False
+
+    result, result_valid = s._extrapolate(
+        u, valid, layers=5, allowed=allowed)
+
+    assert result[1, 0, 0] == pytest.approx(2.0)
+    assert result[2, 0, 0] == pytest.approx(0.0)
+    assert result[3, 0, 0] == pytest.approx(0.0)
+    assert not result_valid[2, 0, 0]
+    assert not result_valid[3, 0, 0]
+
+
+def test_fractional_projection_removes_aperture_weighted_divergence():
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1, st_enabled=False, flip_blend=0.0,
+        cfl_target=1.0, pcg_tol=1e-8, pcg_max_iter=200,
+    )
+    s = STFLIPSolver(p, "cpu")
+    cell_sdf = np.ones(p.resolution, dtype=np.float32)
+    node_sdf = np.empty((3, 3, 3), dtype=np.float32)
+    node_sdf[:, 0, :] = -0.5
+    node_sdf[:, 1, :] = 0.5
+    node_sdf[:, 2, :] = 1.5
+    s.set_solid_sdf(cell_sdf, node_sdf)
+    alpha_u, alpha_v, alpha_w, _ = s._solid_face_apertures()
+
+    u = np.zeros((3, 2, 2), dtype=np.float32)
+    v = np.zeros((2, 3, 2), dtype=np.float32)
+    w = np.zeros((2, 2, 3), dtype=np.float32)
+    # This internal face has alpha=0.5.  Correct projection requires alpha
+    # in the PPE/divergence but not in the pressure acceleration itself.
+    u[1, 0, :] = 1.0
+    grids = {
+        "u": u,
+        "v": v,
+        "w": w,
+        "u_valid": np.ones_like(u, dtype=bool),
+        "v_valid": np.ones_like(v, dtype=bool),
+        "w_valid": np.ones_like(w, dtype=bool),
+        "u_phi": np.ones_like(u),
+        "v_phi": np.ones_like(v),
+        "w_phi": np.ones_like(w),
+        "c_phi": np.ones(p.resolution, dtype=np.float32),
+    }
+    before = weighted_divergence(
+        u, v, w, alpha_u, alpha_v, alpha_w, p.dx)
+    assert np.linalg.norm(before.ravel()) > 0.0
+    s._p2g = lambda _dt_prev: grids
+
+    frame_stats = FrameStats()
+    s._step(0.1, frame_stats)
+
+    after = weighted_divergence(
+        s._grids["u"], s._grids["v"], s._grids["w"],
+        alpha_u, alpha_v, alpha_w, p.dx,
+    )
+    assert frame_stats.pcg_iters and frame_stats.pcg_iters[0] > 0
+    assert np.linalg.norm(after.ravel()) <= (
+        5e-6 * np.linalg.norm(before.ravel()))
+
+
 def test_no_energy_kick_for_zero_temporal_weight_particles():
     """Regression: an isolated particle whose time sample lands in the
     temporal kernel's zero tail deposits ~no mass, invalidating its own
@@ -232,7 +365,6 @@ def test_no_energy_kick_for_zero_temporal_weight_particles():
     s.dt_resid = xp.concatenate(
         [s.dt_resid, xp.asarray([0.49995 * dt], dtype=xp.float32)])
 
-    from stflip.solver import FrameStats
     s._step(dt, FrameStats())
     speed = float(np.linalg.norm(s.be.to_numpy(s.vel)[-1]))
     assert speed < 1.3, f"isolated particle gained energy: |v| = {speed:.3f}"
@@ -246,6 +378,19 @@ def test_gpu_backend_parity():
 
     s_cpu = _dam_break(n=16, seed=7)
     s_gpu = STFLIPSolver(s_cpu.p, "cuda")
+    # A fractional cut near the far x wall exercises node-SDF aperture math,
+    # alpha-weighted projection, and setup statistics on both backends without
+    # intersecting the two-frame dam-break front.
+    node_x = 13.25 - np.arange(17, dtype=np.float32)[:, None, None]
+    node_sdf = np.broadcast_to(node_x, (17, 17, 17)).copy()
+    cell_x = 13.25 - (
+        np.arange(16, dtype=np.float32) + 0.5
+    )[:, None, None]
+    cell_sdf = np.broadcast_to(cell_x, (16, 16, 16)).copy()
+    s_cpu.set_solid_sdf(cell_sdf, node_sdf)
+    s_gpu.set_solid_sdf(cell_sdf, node_sdf)
+    assert s_cpu.solid_aperture_stats() == s_gpu.solid_aperture_stats()
+    assert s_gpu.solid_aperture_stats()["fractional_face_count"] > 0
     mask = np.zeros((16, 16, 16), dtype=bool)
     mask[:5, :, :8] = True
     s_gpu.add_liquid_mask(mask)
