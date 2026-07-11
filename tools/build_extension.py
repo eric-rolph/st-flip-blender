@@ -74,6 +74,7 @@ def build(output: Path | None = None, root: Path = ROOT) -> Path:
         for path in package_files(root):
             relative = path.relative_to(root).as_posix()
             info = zipfile.ZipInfo(relative, date_time=(2026, 1, 1, 0, 0, 0))
+            info.create_system = 3  # fixed Unix metadata on every build host
             info.compress_type = zipfile.ZIP_STORED
             info.external_attr = 0o644 << 16
             archive.writestr(info, package_payload(path))

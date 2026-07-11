@@ -28,6 +28,7 @@ def test_built_archive_has_blender_extension_layout(tmp_path):
         assert "__init__.py" in names
         assert all(not name.startswith("st-flip-blender/") for name in names)
         assert b"\r\n" not in archive.read("addon/operators.py")
+        assert all(info.create_system == 3 for info in archive.infolist())
         assert archive.testzip() is None
 
 
