@@ -15,7 +15,9 @@ The module is bpy-free and runs on NumPy or CuPy via stflip.backend.
 
 from __future__ import annotations
 
+import copy
 import math
+import numbers
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -64,11 +66,88 @@ class Params:
     cfl_local: float = 1.0            # advection sub-step bound
     seed: int = 0
 
+    def __post_init__(self) -> None:
+        """Validate and normalize all public solver parameters eagerly.
+
+        Invalid values otherwise tend to fail much later in array allocation,
+        pressure projection, or the adaptive-step loop.  Keeping this check on
+        the bpy-free boundary also gives CPU and CUDA callers identical errors.
+        """
+        try:
+            resolution = tuple(self.resolution)
+        except TypeError as exc:
+            raise ValueError("resolution must contain three positive integers") from exc
+        if (
+            len(resolution) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Integral)
+                or int(value) <= 0
+                for value in resolution
+            )
+        ):
+            raise ValueError("resolution must contain three positive integers")
+        self.resolution = tuple(int(value) for value in resolution)
+
+        try:
+            gravity = tuple(float(value) for value in self.gravity)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("gravity must contain three finite values") from exc
+        if len(gravity) != 3 or not all(math.isfinite(value) for value in gravity):
+            raise ValueError("gravity must contain three finite values")
+        self.gravity = gravity
+
+        scalar_rules = {
+            "dx": (0.0, None),
+            "rho": (0.0, None),
+            "frame_dt": (0.0, None),
+            "cfl_target": (0.0, None),
+            "flip_blend": (0.0, 1.0),
+            "jitter_strength": (0.0, 1.0),
+            "eta_phi": (0.0, None),
+            "eps_m": (0.0, None),
+            "eps_rho_rel": (0.0, None),
+            "pcg_tol": (0.0, None),
+            "cfl_local": (0.0, None),
+        }
+        for name, (lower, upper) in scalar_rules.items():
+            try:
+                value = float(getattr(self, name))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be finite") from exc
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+            if upper is None:
+                if value <= lower:
+                    raise ValueError(f"{name} must be positive")
+            elif not lower <= value <= upper:
+                raise ValueError(f"{name} must be between {lower} and {upper}")
+            setattr(self, name, value)
+
+        for name in ("particles_per_cell", "pcg_max_iter"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Integral)
+                or int(value) <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+            setattr(self, name, int(value))
+        for name in ("st_enabled", "adaptive_gamma"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a boolean")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, numbers.Integral):
+            raise ValueError("seed must be an integer")
+        self.seed = int(self.seed)
+        if self.seed < 0:
+            raise ValueError("seed must not be negative")
+
 
 @dataclass
 class FrameStats:
     steps: int = 0
     dt_values: list = field(default_factory=list)
+    inactive_time_s: float = 0.0
     # This solver's adaptive step uses maximum particle speed. These names are
     # deliberately not "grid CFL": the paper's diagnostic may be computed
     # from a different MaxVelocity implementation in another host solver.
@@ -78,6 +157,9 @@ class FrameStats:
     pcg_rel_residuals: list = field(default_factory=list)
     n_particles: int = 0
     max_speed: float = 0.0
+    particles_removed: int = 0
+    volume_outflow_removed: int = 0
+    pressure_outflow_removed: int = 0
 
 
 class STFLIPSolver:
@@ -102,6 +184,7 @@ class STFLIPSolver:
         self._clamp_lo = xp.asarray([eps] * 3, dtype=xp.float32)
         self._clamp_hi = xp.asarray([s - eps for s in self.size],
                                     dtype=xp.float32)
+        self._domain_size_dev = xp.asarray(self.size, dtype=xp.float32)
 
         # Solid signed distance, cell-centred; positive outside solids.  A
         # node-centred SDF is optional: when present it defines fractional
@@ -111,17 +194,145 @@ class STFLIPSolver:
         self._solid_node_sdf = None
         self._sdf_grad = None
         self._solid_faces = None  # apertures + fully-solid cells, built lazily
+        self._solid_exterior_apertures = None
 
         # Masks stay on-device for occupancy checks; immutable velocity fields
         # stay on the host so each refill is sampled deterministically at its
         # newly jittered particle positions.
         self._inflows: list[tuple[object, VelocityField]] = []
+        # Outflow masks are lazy: two dense 512^3 boolean allocations would
+        # otherwise cost ~256 MiB on every no-outflow CUDA simulation.
+        self._volume_outflow = None
+        self._pressure_outflow = None
+        self._has_volume_outflow = False
+        self._has_pressure_outflow = False
+        self._pressure_outflow_faces = None
+        self._outflow_geometry_stats_cache = None
+        self._outflow_removed_total = 0
+        self._volume_outflow_removed_total = 0
+        self._pressure_outflow_removed_total = 0
         self._rng = np.random.default_rng(params.seed)
         self._dt_prev = params.frame_dt / max(params.cfl_target, 1.0)
         self.time = 0.0
 
         self._grids: dict = {}
         self.m0 = self._calibrate_m0()
+
+    def checkpoint_state(self) -> dict:
+        """Return an owned, backend-neutral snapshot sufficient to restart.
+
+        Grid velocities, aperture caches, and gradients are derived from the
+        configured scene plus particle state and are rebuilt on the next step.
+        The NumPy RNG state and previous adaptive timestep are trajectory state
+        and therefore must be captured alongside particle arrays.
+        """
+        return {
+            "pos": np.array(
+                self.be.to_numpy(self.pos), dtype=np.float32, order="C",
+                copy=True),
+            "vel": np.array(
+                self.be.to_numpy(self.vel), dtype=np.float32, order="C",
+                copy=True),
+            "dt_resid": np.array(
+                self.be.to_numpy(self.dt_resid), dtype=np.float32, order="C",
+                copy=True),
+            "time": float(self.time),
+            "dt_prev": float(self._dt_prev),
+            "rng_state": copy.deepcopy(self._rng.bit_generator.state),
+            "outflow_removed_total": int(self._outflow_removed_total),
+            "volume_outflow_removed_total": int(
+                self._volume_outflow_removed_total),
+            "pressure_outflow_removed_total": int(
+                self._pressure_outflow_removed_total),
+        }
+
+    def restore_state(self, state: dict) -> None:
+        """Strictly restore a snapshot into this configured solver instance."""
+        required = {
+            "pos", "vel", "dt_resid", "time", "dt_prev", "rng_state",
+            "outflow_removed_total", "volume_outflow_removed_total",
+            "pressure_outflow_removed_total",
+        }
+        if not isinstance(state, dict) or set(state) != required:
+            raise ValueError("checkpoint state has an incompatible schema")
+
+        def particle_array(name, shape=None):
+            try:
+                array = np.asarray(state[name])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"checkpoint {name} must be a float32 array") from exc
+            if array.dtype != np.dtype(np.float32):
+                raise ValueError(f"checkpoint {name} must be a float32 array")
+            if shape is not None and array.shape != shape:
+                raise ValueError(f"checkpoint {name} has an incompatible shape")
+            if not bool(np.all(np.isfinite(array))):
+                raise ValueError(f"checkpoint {name} contains non-finite values")
+            return np.array(array, dtype=np.float32, order="C", copy=True)
+
+        pos = particle_array("pos")
+        if pos.ndim != 2 or pos.shape[1:] != (3,):
+            raise ValueError("checkpoint pos must have shape (N, 3)")
+        vel = particle_array("vel", pos.shape)
+        dt_resid = particle_array("dt_resid", (pos.shape[0],))
+        domain_size = np.asarray(self.size, dtype=np.float32)
+        if np.any(pos < 0.0) or np.any(pos > domain_size[None, :]):
+            raise ValueError("checkpoint particles lie outside the solver domain")
+
+        def finite_scalar(name, *, positive=False):
+            value = state[name]
+            if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                raise ValueError(f"checkpoint {name} must be finite")
+            result = float(value)
+            if not math.isfinite(result) or result < 0.0:
+                raise ValueError(f"checkpoint {name} must be finite")
+            if positive and result <= 0.0:
+                raise ValueError(f"checkpoint {name} must be positive")
+            return result
+
+        time_value = finite_scalar("time")
+        dt_prev = finite_scalar("dt_prev", positive=True)
+
+        counters = {}
+        for name in (
+            "outflow_removed_total",
+            "volume_outflow_removed_total",
+            "pressure_outflow_removed_total",
+        ):
+            value = state[name]
+            if (isinstance(value, bool)
+                    or not isinstance(value, numbers.Integral)
+                    or int(value) < 0):
+                raise ValueError(
+                    f"checkpoint {name} must be a non-negative integer")
+            counters[name] = int(value)
+        if counters["outflow_removed_total"] != (
+                counters["volume_outflow_removed_total"]
+                + counters["pressure_outflow_removed_total"]):
+            raise ValueError("checkpoint outflow counters are inconsistent")
+
+        if not isinstance(state["rng_state"], dict):
+            raise ValueError("checkpoint rng_state is invalid")
+        restored_rng = np.random.default_rng()
+        try:
+            restored_rng.bit_generator.state = copy.deepcopy(state["rng_state"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("checkpoint rng_state is invalid") from exc
+
+        # Commit only after the complete state validates, so a rejected restore
+        # cannot leave a running solver partially mutated.
+        self.pos = self.be.from_numpy(pos)
+        self.vel = self.be.from_numpy(vel)
+        self.dt_resid = self.be.from_numpy(dt_resid)
+        self.time = time_value
+        self._dt_prev = dt_prev
+        self._rng = restored_rng
+        self._outflow_removed_total = counters["outflow_removed_total"]
+        self._volume_outflow_removed_total = counters[
+            "volume_outflow_removed_total"]
+        self._pressure_outflow_removed_total = counters[
+            "pressure_outflow_removed_total"]
+        self._grids = {}
 
     # ------------------------------------------------------------------ setup
 
@@ -139,19 +350,52 @@ class STFLIPSolver:
         the previous binary rule: a face is blocked when either adjacent
         cell is solid.
         """
-        assert sdf_cells.shape == self.shape
+        cells = self._validate_sdf_array(sdf_cells, self.shape, "sdf_cells")
+        nodes = None
+        if node_sdf is not None:
+            expected = tuple(n + 1 for n in self.shape)
+            nodes = self._validate_sdf_array(node_sdf, expected, "node_sdf")
+
         xp = self.be.xp
-        self.sdf = self.be.from_numpy(sdf_cells.astype(np.float32))
-        if node_sdf is None:
+        self.sdf = self.be.from_numpy(cells)
+        if nodes is None:
             self._solid_node_sdf = None
         else:
-            expected = tuple(n + 1 for n in self.shape)
-            assert node_sdf.shape == expected
-            self._solid_node_sdf = self.be.from_numpy(
-                node_sdf.astype(np.float32))
-        gx, gy, gz = xp.gradient(self.sdf, self.p.dx)
-        self._sdf_grad = (gx, gy, gz)
+            self._solid_node_sdf = self.be.from_numpy(nodes)
+        self._sdf_grad = tuple(
+            xp.gradient(self.sdf, self.p.dx, axis=axis)
+            if extent > 1
+            else xp.zeros_like(self.sdf)
+            for axis, extent in enumerate(self.shape)
+        )
         self._solid_faces = None  # rebuild on next step
+        self._solid_exterior_apertures = None
+        self._pressure_outflow_faces = None
+        self._outflow_geometry_stats_cache = None
+
+    @staticmethod
+    def _validate_sdf_array(value, expected_shape, name: str) -> np.ndarray:
+        try:
+            array = np.asarray(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name} must be a finite numeric array with shape "
+                f"{expected_shape}"
+            ) from exc
+        if array.shape != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}")
+        if not np.issubdtype(array.dtype, np.number):
+            raise TypeError(f"{name} must contain numeric values")
+        try:
+            finite = bool(np.all(np.isfinite(array)))
+        except TypeError as exc:
+            raise TypeError(f"{name} must contain numeric values") from exc
+        if not finite:
+            raise ValueError(f"{name} must contain only finite values")
+        owned = np.array(array, dtype=np.float32, order="C", copy=True)
+        if not np.all(np.isfinite(owned)):
+            raise ValueError(f"{name} values exceed the float32 finite range")
+        return owned
 
     def add_liquid_mask(
         self,
@@ -175,6 +419,53 @@ class STFLIPSolver:
             (self.be.from_numpy(mask),
              field)
         )
+
+    def add_outflow(self, cell_mask: np.ndarray, mode: str = "VOLUME") -> None:
+        """Register a particle sink or an exterior pressure/open boundary.
+
+        ``VOLUME`` removes particles entering any marked cell, with the mask
+        tested after every local RK advection substep. ``PRESSURE`` opens only
+        the simulation-domain faces intersected by marked boundary cells,
+        imposes exterior ``p = 0`` at half-cell distance, and removes particles
+        after they cross one of those faces.
+        """
+        if not isinstance(mode, str):
+            raise ValueError("outflow mode must be 'VOLUME' or 'PRESSURE'")
+        normalized = mode.strip().upper()
+        if normalized not in {"VOLUME", "PRESSURE"}:
+            raise ValueError("outflow mode must be 'VOLUME' or 'PRESSURE'")
+        mask = self._validate_cell_mask(cell_mask)
+        if normalized == "PRESSURE" and np.any(mask) and not (
+            np.any(mask[0])
+            or np.any(mask[-1])
+            or np.any(mask[:, 0])
+            or np.any(mask[:, -1])
+            or np.any(mask[:, :, 0])
+            or np.any(mask[:, :, -1])
+        ):
+            raise ValueError(
+                "PRESSURE outflow mask must intersect the domain exterior"
+            )
+        has_cells = bool(np.any(mask))
+        if not has_cells:
+            return
+        device_mask = self.be.from_numpy(mask)
+        if normalized == "VOLUME":
+            self._volume_outflow = (
+                device_mask
+                if self._volume_outflow is None
+                else self._volume_outflow | device_mask
+            )
+            self._has_volume_outflow = True
+        else:
+            self._pressure_outflow = (
+                device_mask
+                if self._pressure_outflow is None
+                else self._pressure_outflow | device_mask
+            )
+            self._has_pressure_outflow = True
+            self._pressure_outflow_faces = None
+        self._outflow_geometry_stats_cache = None
 
     def _validate_cell_mask(self, cell_mask: np.ndarray) -> np.ndarray:
         try:
@@ -327,6 +618,14 @@ class STFLIPSolver:
             alpha_w[:, :, 1:-1] = (
                 ~(solid_c[:, :, 1:] | solid_c[:, :, :-1])
             ).astype(xp.float32)
+            exterior = (
+                (~solid_c[0]).astype(xp.float32),
+                (~solid_c[-1]).astype(xp.float32),
+                (~solid_c[:, 0]).astype(xp.float32),
+                (~solid_c[:, -1]).astype(xp.float32),
+                (~solid_c[:, :, 0]).astype(xp.float32),
+                (~solid_c[:, :, -1]).astype(xp.float32),
+            )
         else:
             alpha_u, alpha_v, alpha_w = (
                 apertures.face_apertures_from_node_sdf(
@@ -337,6 +636,14 @@ class STFLIPSolver:
             alpha_u = xp.clip(alpha_u, 0.0, 1.0).astype(xp.float32)
             alpha_v = xp.clip(alpha_v, 0.0, 1.0).astype(xp.float32)
             alpha_w = xp.clip(alpha_w, 0.0, 1.0).astype(xp.float32)
+            exterior = (
+                alpha_u[0].copy(),
+                alpha_u[-1].copy(),
+                alpha_v[:, 0].copy(),
+                alpha_v[:, -1].copy(),
+                alpha_w[:, :, 0].copy(),
+                alpha_w[:, :, -1].copy(),
+            )
 
             # The simulation domain is a closed box even when every node on
             # an exterior face is outside the embedded solid.
@@ -347,6 +654,7 @@ class STFLIPSolver:
             alpha_w[:, :, 0] = 0.0
             alpha_w[:, :, -1] = 0.0
 
+        self._solid_exterior_apertures = exterior
         self._solid_faces = (alpha_u, alpha_v, alpha_w, solid_c)
         return self._solid_faces
 
@@ -354,6 +662,177 @@ class STFLIPSolver:
         """Compatibility view of the fully blocked solid faces."""
         alpha_u, alpha_v, alpha_w, solid_c = self._solid_face_apertures()
         return alpha_u <= 0.0, alpha_v <= 0.0, alpha_w <= 0.0, solid_c
+
+    def _pressure_face_masks(self):
+        """Full MAC masks for exterior faces opened by PRESSURE outflows."""
+        if self._pressure_outflow_faces is not None:
+            return self._pressure_outflow_faces
+        xp = self.be.xp
+        nx, ny, nz = self.shape
+        _, _, _, solid_c = self._solid_face_apertures()
+        boundary_cells = self._pressure_outflow & (~solid_c)
+        exterior = self._solid_exterior_apertures
+        face_u = xp.zeros((nx + 1, ny, nz), dtype=bool)
+        face_v = xp.zeros((nx, ny + 1, nz), dtype=bool)
+        face_w = xp.zeros((nx, ny, nz + 1), dtype=bool)
+        face_u[0] = boundary_cells[0] & (exterior[0] > 0.0)
+        face_u[-1] = boundary_cells[-1] & (exterior[1] > 0.0)
+        face_v[:, 0] = boundary_cells[:, 0] & (exterior[2] > 0.0)
+        face_v[:, -1] = boundary_cells[:, -1] & (exterior[3] > 0.0)
+        face_w[:, :, 0] = boundary_cells[:, :, 0] & (exterior[4] > 0.0)
+        face_w[:, :, -1] = boundary_cells[:, :, -1] & (exterior[5] > 0.0)
+        self._pressure_outflow_faces = (face_u, face_v, face_w)
+        return self._pressure_outflow_faces
+
+    def _active_face_apertures(self):
+        """Solid apertures with explicitly opened pressure-outflow faces."""
+        xp = self.be.xp
+        alpha_u, alpha_v, alpha_w, solid_c = self._solid_face_apertures()
+        if not self._has_pressure_outflow:
+            return alpha_u, alpha_v, alpha_w, solid_c
+        pressure_u, pressure_v, pressure_w = self._pressure_face_masks()
+        if not self.be.is_gpu and not bool(
+            xp.any(pressure_u) | xp.any(pressure_v) | xp.any(pressure_w)
+        ):
+            return alpha_u, alpha_v, alpha_w, solid_c
+        exterior = self._solid_exterior_apertures
+        active_u = alpha_u.copy()
+        active_v = alpha_v.copy()
+        active_w = alpha_w.copy()
+        active_u[0] = xp.where(pressure_u[0], exterior[0], active_u[0])
+        active_u[-1] = xp.where(pressure_u[-1], exterior[1], active_u[-1])
+        active_v[:, 0] = xp.where(
+            pressure_v[:, 0], exterior[2], active_v[:, 0]
+        )
+        active_v[:, -1] = xp.where(
+            pressure_v[:, -1], exterior[3], active_v[:, -1]
+        )
+        active_w[:, :, 0] = xp.where(
+            pressure_w[:, :, 0], exterior[4], active_w[:, :, 0]
+        )
+        active_w[:, :, -1] = xp.where(
+            pressure_w[:, :, -1], exterior[5], active_w[:, :, -1]
+        )
+        return active_u, active_v, active_w, solid_c
+
+    def outflow_stats(self) -> dict:
+        """Return registered mask/open-face counts and cumulative removals."""
+        if self._outflow_geometry_stats_cache is None:
+            if not (self._has_volume_outflow or self._has_pressure_outflow):
+                counts = [0] * 8
+            else:
+                xp = self.be.xp
+                zero = xp.asarray(0, dtype=xp.int64)
+                if self._has_pressure_outflow:
+                    face_u, face_v, face_w = self._pressure_face_masks()
+                    face_counts = (
+                        face_u[0].sum(),
+                        face_u[-1].sum(),
+                        face_v[:, 0].sum(),
+                        face_v[:, -1].sum(),
+                        face_w[:, :, 0].sum(),
+                        face_w[:, :, -1].sum(),
+                    )
+                else:
+                    face_counts = (zero,) * 6
+                device_counts = xp.stack((
+                    self._volume_outflow.sum()
+                    if self._has_volume_outflow else zero,
+                    self._pressure_outflow.sum()
+                    if self._has_pressure_outflow else zero,
+                    *face_counts,
+                ))
+                counts = [
+                    int(value)
+                    for value in self.be.to_numpy(device_counts).tolist()
+                ]
+            side_counts = dict(zip(
+                ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max"),
+                counts[2:],
+                strict=True,
+            ))
+            self._outflow_geometry_stats_cache = {
+                "volume_cell_count": counts[0],
+                "pressure_cell_count": counts[1],
+                "pressure_open_face_count": sum(side_counts.values()),
+                "pressure_open_face_counts": side_counts,
+            }
+        geometry = self._outflow_geometry_stats_cache
+        return {
+            **geometry,
+            "pressure_open_face_counts": dict(
+                geometry["pressure_open_face_counts"]
+            ),
+            "particles_removed_total": self._outflow_removed_total,
+            "volume_outflow_removed_total": (
+                self._volume_outflow_removed_total
+            ),
+            "pressure_outflow_removed_total": (
+                self._pressure_outflow_removed_total
+            ),
+        }
+
+    def _apply_outflow_filter(
+        self,
+        positions,
+        volume_removed,
+        pressure_removed,
+        stats: FrameStats | None = None,
+    ) -> dict[str, int]:
+        """Apply one shared keep mask to every particle-state array."""
+        xp = self.be.xp
+        keep = ~(volume_removed | pressure_removed)
+        counts = self.be.to_numpy(xp.stack((
+            volume_removed.sum(), pressure_removed.sum()
+        )))
+        volume_count, pressure_count = (int(value) for value in counts.tolist())
+        removed = volume_count + pressure_count
+        self.pos = positions[keep]
+        self.vel = self.vel[keep]
+        self.dt_resid = self.dt_resid[keep]
+        if stats is not None:
+            stats.volume_outflow_removed += volume_count
+            stats.pressure_outflow_removed += pressure_count
+            stats.particles_removed += removed
+        self._volume_outflow_removed_total += volume_count
+        self._pressure_outflow_removed_total += pressure_count
+        self._outflow_removed_total += removed
+        return {
+            "particles_removed": removed,
+            "volume_outflow_removed": volume_count,
+            "pressure_outflow_removed": pressure_count,
+        }
+
+    def cull_outflows(self) -> dict[str, int]:
+        """Immediately remove particles already captured by outflow regions.
+
+        This is intended for setup-time cleanup before exporting the initial
+        frame. VOLUME masks take precedence; remaining particles already
+        outside the domain are removed only when every crossed side is an
+        opened PRESSURE face. The operation is idempotent and updates the same
+        cumulative counters as stepping.
+        """
+        if not (self._has_volume_outflow or self._has_pressure_outflow):
+            return {
+                "particles_removed": 0,
+                "volume_outflow_removed": 0,
+                "pressure_outflow_removed": 0,
+            }
+        xp = self.be.xp
+        zero = xp.zeros((self.pos.shape[0],), dtype=bool)
+        volume_removed = (
+            self._positions_in_mask(self._volume_outflow, self.pos)
+            if self._has_volume_outflow
+            else zero
+        )
+        pressure_removed = (
+            (~volume_removed) & self._pressure_exit_allowed(self.pos)
+            if self._has_pressure_outflow
+            else zero
+        )
+        return self._apply_outflow_filter(
+            self.pos, volume_removed, pressure_removed
+        )
 
     def solid_aperture_stats(self) -> dict[str, int | str]:
         """Summarize the active solid-boundary representation.
@@ -488,28 +967,186 @@ class STFLIPSolver:
     def _clamp_domain(self, pos):
         return self.be.xp.clip(pos, self._clamp_lo, self._clamp_hi)
 
-    def _advect(self, grids, pos, dt_act):
+    def _grid_velocity_bound(self, grids):
+        """Strict bound on the magnitude of the sampled MAC advector.
+
+        Trilinear interpolation is a convex combination for each component,
+        so the norm of any sampled velocity is bounded by the Euclidean norm
+        of the three component-wise absolute maxima.
+        """
+        xp = self.be.xp
+        maxima = [xp.max(xp.abs(grids[name])) for name in ("u", "v", "w")]
+        return xp.sqrt(sum(value * value for value in maxima))
+
+    def _positions_in_mask(self, mask, pos):
+        xp = self.be.xp
+        in_domain = xp.all((pos >= 0.0) & (pos < self._domain_size_dev), axis=1)
+        hi = xp.asarray(self.shape, dtype=xp.int32) - 1
+        indices = xp.clip((pos / self.p.dx).astype(xp.int32), 0, hi)
+        selected = mask[indices[:, 0], indices[:, 1], indices[:, 2]]
+        return in_domain & selected
+
+    def _segments_hit_mask(self, mask, start, end):
+        """Exact grid traversal for swept particle segments.
+
+        A vectorized Amanatides-Woo traversal visits every positive-length
+        voxel entered by each segment. The fixed iteration bound follows from
+        the strict local-CFL displacement bound, avoiding a GPU synchronization
+        to discover a data-dependent loop count.
+        """
+        xp = self.be.xp
+        hit = self._positions_in_mask(mask, start) | self._positions_in_mask(
+            mask, end
+        )
+        if start.shape[0] == 0:
+            return hit
+        delta = end - start
+        moving = xp.abs(delta) > 1e-30
+        safe_delta = xp.where(moving, delta, 1.0)
+        direction = xp.sign(delta).astype(xp.int32)
+        cell = xp.floor(start / self.p.dx).astype(xp.int32)
+        next_boundary = xp.where(
+            direction > 0,
+            (cell + 1).astype(xp.float32) * self.p.dx,
+            cell.astype(xp.float32) * self.p.dx,
+        )
+        beyond_segment = xp.asarray(2.0, dtype=xp.float32)
+        t_max = xp.where(
+            moving, (next_boundary - start) / safe_delta, beyond_segment
+        ).astype(xp.float32)
+        t_delta = xp.where(
+            moving, self.p.dx / xp.abs(safe_delta), 0.0
+        ).astype(xp.float32)
+        hi = xp.asarray(self.shape, dtype=xp.int32) - 1
+        max_crossings = int(math.ceil(math.sqrt(3.0) * self.p.cfl_local)) + 3
+        for _ in range(max_crossings):
+            t_next = xp.min(t_max, axis=1)
+            active = (~hit) & (t_next <= 1.0 + 1e-6)
+            tolerance = 1e-6 * xp.maximum(1.0, xp.abs(t_next))
+            advance = active[:, None] & (
+                xp.abs(t_max - t_next[:, None]) <= tolerance[:, None]
+            )
+            cell = cell + direction * advance.astype(xp.int32)
+            inside = active & xp.all((cell >= 0) & (cell <= hi), axis=1)
+            lookup = xp.clip(cell, 0, hi)
+            entered = mask[lookup[:, 0], lookup[:, 1], lookup[:, 2]]
+            hit = hit | (inside & entered)
+            t_max = t_max + xp.where(advance, t_delta, 0.0)
+        return hit
+
+    def _pressure_exit_allowed(self, pos, start=None):
+        """Whether every crossed domain side is an opened outflow face.
+
+        During advection, tangential face indices are evaluated at the actual
+        segment/boundary intersection. ``start=None`` supports setup-time
+        culling of particles that are already outside.
+        """
+        xp = self.be.xp
+        face_u, face_v, face_w = self._pressure_face_masks()
+        nx, ny, nz = self.shape
+
+        def boundary_cells(axis: int, boundary: float):
+            if start is None:
+                intersection = pos
+            else:
+                delta = pos - start
+                denominator = delta[:, axis]
+                safe = xp.where(xp.abs(denominator) > 1e-30, denominator, 1.0)
+                t = (boundary - start[:, axis]) / safe
+                intersection = start + t[:, None] * delta
+            cell = xp.floor(intersection / self.p.dx).astype(xp.int32)
+            return (
+                xp.clip(cell[:, 0], 0, nx - 1),
+                xp.clip(cell[:, 1], 0, ny - 1),
+                xp.clip(cell[:, 2], 0, nz - 1),
+            )
+
+        low_x = pos[:, 0] < 0.0
+        high_x = pos[:, 0] >= self.size[0]
+        low_y = pos[:, 1] < 0.0
+        high_y = pos[:, 1] >= self.size[1]
+        low_z = pos[:, 2] < 0.0
+        high_z = pos[:, 2] >= self.size[2]
+        outside = low_x | high_x | low_y | high_y | low_z | high_z
+        _, iy_x0, iz_x0 = boundary_cells(0, 0.0)
+        _, iy_x1, iz_x1 = boundary_cells(0, self.size[0])
+        ix_y0, _, iz_y0 = boundary_cells(1, 0.0)
+        ix_y1, _, iz_y1 = boundary_cells(1, self.size[1])
+        ix_z0, iy_z0, _ = boundary_cells(2, 0.0)
+        ix_z1, iy_z1, _ = boundary_cells(2, self.size[2])
+        blocked = (
+            (low_x & (~face_u[0, iy_x0, iz_x0]))
+            | (high_x & (~face_u[-1, iy_x1, iz_x1]))
+            | (low_y & (~face_v[ix_y0, 0, iz_y0]))
+            | (high_y & (~face_v[ix_y1, -1, iz_y1]))
+            | (low_z & (~face_w[ix_z0, iy_z0, 0]))
+            | (high_z & (~face_w[ix_z1, iy_z1, -1]))
+        )
+        return outside & (~blocked)
+
+    def _advect(self, grids, pos, dt_act, *, track_outflows: bool = False):
         """Sub-stepped RK3 (Ralston) through the grid velocity field.
 
-        dt_act is per-particle and may be negative (used for un-jittering)."""
+        ``dt_act`` is per-particle and may be negative (used for
+        un-jittering).  When ``track_outflows`` is true, the returned tuple is
+        ``(positions, volume_removed, pressure_removed)``; sink tests occur at
+        every local-CFL substep before closed-domain clamping.
+        """
         xp = self.be.xp
         p = self.p
-        speed = _norm_rows(xp, self.vel) if self.vel.shape[0] else dt_act * 0
+        speed_bound = self._grid_velocity_bound(grids)
         nsub = xp.ceil(
-            speed * xp.abs(dt_act) / (p.dx * p.cfl_local)).astype(xp.int32)
+            speed_bound * xp.abs(dt_act) / (p.dx * p.cfl_local)
+        ).astype(xp.int32)
         # Never cap this count: a global cap can violate the documented local
         # CFL bound when large global CFL targets and temporal jitter combine.
         nsub = xp.maximum(nsub, 1)
         h = dt_act / nsub.astype(xp.float32)
         max_n = int(nsub.max()) if nsub.size else 0
+        if not track_outflows:
+            # Preserve the legacy allocation-free path when no sink
+            # classification is requested (the normal no-outflow case).
+            for s in range(max_n):
+                he = xp.where(s < nsub, h, 0.0).astype(xp.float32)[:, None]
+                k1 = self._sample_faces(grids, pos)
+                k2 = self._sample_faces(grids, pos + 0.5 * he * k1)
+                k3 = self._sample_faces(grids, pos + 0.75 * he * k2)
+                pos = pos + he * (
+                    2.0 * k1 + 3.0 * k2 + 4.0 * k3
+                ) / 9.0
+                pos = self._clamp_domain(self._push_out_of_solids(pos))
+            return pos
+
+        volume_removed = xp.zeros((pos.shape[0],), dtype=bool)
+        pressure_removed = xp.zeros((pos.shape[0],), dtype=bool)
+        alive = xp.ones((pos.shape[0],), dtype=bool)
+        if self._has_volume_outflow and pos.shape[0]:
+            volume_removed = self._positions_in_mask(
+                self._volume_outflow, pos
+            )
+            alive = ~volume_removed
         for s in range(max_n):
-            he = xp.where(s < nsub, h, 0.0).astype(xp.float32)[:, None]
+            he = xp.where((s < nsub) & alive, h, 0.0).astype(xp.float32)[:, None]
             k1 = self._sample_faces(grids, pos)
             k2 = self._sample_faces(grids, pos + 0.5 * he * k1)
             k3 = self._sample_faces(grids, pos + 0.75 * he * k2)
-            pos = pos + he * (2.0 * k1 + 3.0 * k2 + 4.0 * k3) / 9.0
-            pos = self._clamp_domain(self._push_out_of_solids(pos))
-        return pos
+            proposed = pos + he * (2.0 * k1 + 3.0 * k2 + 4.0 * k3) / 9.0
+            if self._has_volume_outflow:
+                hit_volume = alive & self._segments_hit_mask(
+                    self._volume_outflow, pos, proposed
+                )
+                volume_removed = volume_removed | hit_volume
+                alive = alive & (~hit_volume)
+            collision_adjusted = self._push_out_of_solids(proposed)
+            if self._has_pressure_outflow:
+                exited = alive & self._pressure_exit_allowed(
+                    collision_adjusted, start=pos
+                )
+                pressure_removed = pressure_removed | exited
+                alive = alive & (~exited)
+            constrained = self._clamp_domain(collision_adjusted)
+            pos = xp.where(alive[:, None], constrained, collision_adjusted)
+        return pos, volume_removed, pressure_removed
 
     # ------------------------------------------------------------------- step
 
@@ -519,7 +1156,7 @@ class STFLIPSolver:
         dt_prev = self._dt_prev
 
         grids = self._p2g(dt_prev)
-        alpha_u, alpha_v, alpha_w, solid_c = self._solid_face_apertures()
+        alpha_u, alpha_v, alpha_w, solid_c = self._active_face_apertures()
         open_u = alpha_u > 0.0
         open_v = alpha_v > 0.0
         open_w = alpha_w > 0.0
@@ -583,6 +1220,42 @@ class STFLIPSolver:
         grids["w"][:, :, 1:-1] -= xp.where(
             open_w[:, :, 1:-1], correction, 0.0)
 
+        if self._has_pressure_outflow:
+            # Exterior pressure-outflow faces place p=0 half a cell from the
+            # adjacent cell centre. The factor two matches the half-cell
+            # pressure gradient and the boundary terms in pressure.py.
+            pressure_u, pressure_v, pressure_w = self._pressure_face_masks()
+            grids["u"][0] -= xp.where(
+                pressure_u[0],
+                dt * inv_rho_u[0] * (2.0 * pm[0] / p.dx),
+                0.0,
+            )
+            grids["u"][-1] -= xp.where(
+                pressure_u[-1],
+                dt * inv_rho_u[-1] * (-2.0 * pm[-1] / p.dx),
+                0.0,
+            )
+            grids["v"][:, 0] -= xp.where(
+                pressure_v[:, 0],
+                dt * inv_rho_v[:, 0] * (2.0 * pm[:, 0] / p.dx),
+                0.0,
+            )
+            grids["v"][:, -1] -= xp.where(
+                pressure_v[:, -1],
+                dt * inv_rho_v[:, -1] * (-2.0 * pm[:, -1] / p.dx),
+                0.0,
+            )
+            grids["w"][:, :, 0] -= xp.where(
+                pressure_w[:, :, 0],
+                dt * inv_rho_w[:, :, 0] * (2.0 * pm[:, :, 0] / p.dx),
+                0.0,
+            )
+            grids["w"][:, :, -1] -= xp.where(
+                pressure_w[:, :, -1],
+                dt * inv_rho_w[:, :, -1] * (-2.0 * pm[:, :, -1] / p.dx),
+                0.0,
+            )
+
         grids["u"] = xp.where(open_u, grids["u"], 0.0)
         grids["v"] = xp.where(open_v, grids["v"], 0.0)
         grids["w"] = xp.where(open_w, grids["w"], 0.0)
@@ -629,7 +1302,16 @@ class STFLIPSolver:
         dt_act = xp.clip(dt + self.dt_resid + jit, 0.0, 2.0 * dt)
         self.dt_resid = (dt + self.dt_resid - dt_act).astype(xp.float32)
 
-        self.pos = self._advect(grids, self.pos, dt_act)
+        has_outflows = self._has_volume_outflow or self._has_pressure_outflow
+        if has_outflows and self.pos.shape[0]:
+            advected, volume_removed, pressure_removed = self._advect(
+                grids, self.pos, dt_act, track_outflows=True
+            )
+            self._apply_outflow_filter(
+                advected, volume_removed, pressure_removed, stats
+            )
+        else:
+            self.pos = self._advect(grids, self.pos, dt_act)
         self._grids = grids
         self._dt_prev = dt
         self.time += dt
@@ -645,6 +1327,12 @@ class STFLIPSolver:
                 if self.pos.shape[0] else 0.0)
         while t_rem > 1e-9 * p.frame_dt:
             if self.pos.shape[0] == 0:
+                # No state remains to evolve. Advancing the clock directly
+                # avoids an otherwise catastrophic empty O(grid) projection
+                # and extrapolation pass on production-resolution domains.
+                self.time += t_rem
+                stats.inactive_time_s += t_rem
+                t_rem = 0.0
                 break
             dt = min(p.cfl_target * p.dx / max(vmax, 1e-6), t_rem)
             # Subdivide the remaining frame time into even parts (Alg. 1 l.7).
@@ -675,10 +1363,20 @@ class STFLIPSolver:
             self.be.scatter_add(counts, flat, xp.ones_like(flat, dtype=xp.float32))
         counts = counts.reshape(self.shape)
         for mask, velocity_field in self._inflows:
-            refill = self.be.to_numpy(
-                mask & (counts < 0.5 * self.p.particles_per_cell))
+            refill_device = mask & (
+                counts < 0.5 * self.p.particles_per_cell
+            )
+            refill = self.be.to_numpy(refill_device)
             cells = np.argwhere(refill)
-            self._seed_cells(cells, velocity_field)
+            seeded = self._seed_cells(cells, velocity_field)
+            if seeded:
+                # Later sources in registration order observe particles just
+                # seeded by earlier sources, preventing overlapping masks from
+                # filling the same cell twice. Each selected cell receives ppc
+                # particles, exactly matching _seed_cells.
+                counts = counts + refill_device.astype(
+                    xp.float32
+                ) * self.p.particles_per_cell
 
     # ----------------------------------------------------------------- export
 
@@ -687,5 +1385,15 @@ class STFLIPSolver:
         velocities, as host arrays."""
         if self.pos.shape[0] == 0 or not self._grids:
             return (self.be.to_numpy(self.pos), self.be.to_numpy(self.vel))
+        has_outflows = self._has_volume_outflow or self._has_pressure_outflow
+        if has_outflows:
+            pos, volume_removed, pressure_removed = self._advect(
+                self._grids,
+                self.pos.copy(),
+                self.dt_resid,
+                track_outflows=True,
+            )
+            keep = ~(volume_removed | pressure_removed)
+            return self.be.to_numpy(pos[keep]), self.be.to_numpy(self.vel[keep])
         pos = self._advect(self._grids, self.pos.copy(), self.dt_resid)
         return self.be.to_numpy(pos), self.be.to_numpy(self.vel)

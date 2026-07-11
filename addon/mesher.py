@@ -11,6 +11,8 @@ import bpy
 GROUP_NAME = "STFLIP_Surface"
 SURFACE_OBJ = "STFLIP Liquid Surface"
 PARTICLE_OBJ = "STFLIP Particles"
+SURFACE_MODIFIER = "STFLIP Surface"
+SMOOTH_MODIFIER = "STFLIP Geometric Smoothing"
 GROUP_SCHEMA_KEY = "stflip_schema_version"
 GROUP_SCHEMA_VERSION = 2
 
@@ -176,22 +178,204 @@ def _bound_scene_object(property_name):
     return getattr(settings, property_name, None) if settings is not None else None
 
 
+def _id_key(value):
+    """Return a stable identity key for Blender RNA values and test doubles."""
+    try:
+        return ("RNA", int(value.as_pointer()))
+    except (AttributeError, ReferenceError, TypeError, ValueError):
+        return ("PY", id(value))
+
+
+def _object_in_scene(scene, obj):
+    objects = getattr(scene, "objects", None)
+    if objects is None or obj is None:
+        return False
+    try:
+        candidate = objects.get(obj.name)
+        if candidate is not None:
+            return _id_key(candidate) == _id_key(obj)
+    except (AttributeError, ReferenceError, TypeError):
+        pass
+    try:
+        return obj in objects
+    except (ReferenceError, TypeError):
+        return False
+
+
+def _scenes():
+    try:
+        return list(bpy.data.scenes)
+    except (AttributeError, ReferenceError, TypeError):
+        return []
+
+
+def _collection_values(collection):
+    values = getattr(collection, "values", None)
+    try:
+        return list(values()) if values is not None else list(collection)
+    except (AttributeError, ReferenceError, TypeError):
+        return []
+
+
+def _all_objects():
+    objects = _collection_values(getattr(bpy.data, "objects", ()))
+    if not objects:
+        objects = []
+        seen = set()
+        for scene in _scenes():
+            candidates = _collection_values(getattr(scene, "objects", ()))
+            for candidate in candidates:
+                key = _id_key(candidate)
+                if key not in seen:
+                    seen.add(key)
+                    objects.append(candidate)
+    return objects
+
+
+def output_is_exclusive(scene, obj):
+    """Whether an output object and its mesh are safe for this scene to edit.
+
+    Blender copies scene pointer properties verbatim. A normal ``Scene.copy``
+    therefore leaves both scenes pointing at the same output object and mesh.
+    Cached-frame playback mutates mesh vertices in place, so accepting either
+    a cross-scene object or a mesh used by another object would make one scene
+    overwrite another scene's visible bake.
+    """
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+    mesh = getattr(obj, "data", None)
+    if mesh is None:
+        return False
+    if (getattr(obj, "library", None) is not None
+            or getattr(mesh, "library", None) is not None):
+        return False
+    # Generated outputs normally have one object link and one mesh user. These
+    # ID counters are constant-time and keep frame playback independent of the
+    # number of scenes/objects in ordinary files. Only ambiguous multi-user
+    # datablocks need the more expensive ownership scans below.
+    try:
+        if int(obj.users) <= 1 and int(mesh.users) <= 1:
+            return True
+    except (AttributeError, ReferenceError, TypeError, ValueError):
+        pass
+    scene_key = _id_key(scene)
+    try:
+        users_scene = list(obj.users_scene)
+    except (AttributeError, ReferenceError, TypeError):
+        users_scene = []
+    if users_scene:
+        if any(_id_key(user) != scene_key for user in users_scene):
+            return False
+    else:
+        for other_scene in _scenes():
+            if _id_key(other_scene) == scene_key:
+                continue
+            if _object_in_scene(other_scene, obj):
+                return False
+    # The normal playback path has one mesh user, so avoid scanning every
+    # Blender object on every frame. More than one ID user needs the scan to
+    # distinguish a second object from a harmless fake-user flag.
+    try:
+        if int(mesh.users) <= 1:
+            return True
+    except (AttributeError, ReferenceError, TypeError, ValueError):
+        pass
+    for candidate in _all_objects():
+        if _id_key(candidate) == _id_key(obj):
+            continue
+        candidate_mesh = getattr(candidate, "data", None)
+        if (candidate_mesh is not None
+                and _id_key(candidate_mesh) == _id_key(mesh)):
+            return False
+    return True
+
+
+def _scene_collections(scene):
+    root = getattr(scene, "collection", None)
+    if root is None:
+        return []
+    result = []
+    stack = [root]
+    seen = set()
+    while stack:
+        collection = stack.pop()
+        key = _id_key(collection)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(collection)
+        try:
+            stack.extend(list(collection.children))
+        except (AttributeError, ReferenceError, TypeError):
+            pass
+    return result
+
+
+def _detach_rejected_output(scene, obj):
+    """Unlink a copied output from collections owned only by ``scene``.
+
+    Generated outputs are linked directly to the scene's root collection. A
+    copied scene gets a distinct root containing the same objects, so unlinking
+    there is safe and prevents both the stale shared output and its fresh local
+    replacement from being visible together. Shared child collections are
+    deliberately left untouched because unlinking from one would affect every
+    scene that uses it.
+    """
+    if scene is None or obj is None:
+        return
+    current = _scene_collections(scene)
+    other_keys = {
+        _id_key(collection)
+        for other_scene in _scenes()
+        if _id_key(other_scene) != _id_key(scene)
+        for collection in _scene_collections(other_scene)
+    }
+    for collection in current:
+        if _id_key(collection) in other_keys:
+            continue
+        objects = getattr(collection, "objects", None)
+        try:
+            linked = objects is not None and obj.name in objects
+        except (AttributeError, ReferenceError, TypeError):
+            linked = False
+        if not linked:
+            continue
+        try:
+            objects.unlink(obj)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+
+
+def scene_exclusive_output(scene, obj):
+    """Return a safe local output, detaching a copied/shared one if needed."""
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return None
+    if output_is_exclusive(scene, obj):
+        return obj
+    _detach_rejected_output(scene, obj)
+    return None
+
+
 def _mesh_output(existing_obj, property_name, fallback_name):
     """Prefer a scene binding, then a same-scene legacy-named output.
 
     Blender object datablocks are global. Reusing a canonical name from a
     different scene would make both scenes write into the same output mesh.
     """
+    scene = getattr(bpy.context, "scene", None)
     obj = existing_obj
     if obj is None:
         obj = _bound_scene_object(property_name)
     if obj is not None and getattr(obj, "type", None) == "MESH":
-        return obj
+        local = scene_exclusive_output(scene, obj)
+        if local is not None:
+            return local
     obj = bpy.data.objects.get(fallback_name)
-    scene = getattr(bpy.context, "scene", None)
     if (obj is not None and getattr(obj, "type", None) == "MESH"
             and scene is not None and obj.name in scene.objects):
-        return obj
+        local = scene_exclusive_output(scene, obj)
+        if local is not None:
+            return local
     return None
 
 
@@ -221,9 +405,9 @@ def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
     else:
         _link_if_needed(obj)
 
-    mod = obj.modifiers.get("STFLIP Surface")
+    mod = obj.modifiers.get(SURFACE_MODIFIER)
     if mod is None:
-        mod = obj.modifiers.new("STFLIP Surface", "NODES")
+        mod = obj.modifiers.new(SURFACE_MODIFIER, "NODES")
     mod.node_group = ng
 
     for name, value in (("Points Object", particle_obj),
@@ -236,6 +420,37 @@ def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
     obj.update_tag()
     _bind_scene_object("surface_object", obj)
     return obj
+
+
+def configure_surface_smoothing(obj, enabled: bool, iterations: int,
+                                factor: float):
+    """Configure Blender-only post-process smoothing on a surface object.
+
+    This intentionally uses Blender's Laplacian Smooth modifier.  It improves
+    the viewport/render mesh without changing cached particles and must not be
+    confused with the paper's unavailable mean-curvature-flow reconstruction.
+    """
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return None
+    modifier = obj.modifiers.get(SMOOTH_MODIFIER)
+    if modifier is None:
+        modifier = obj.modifiers.new(SMOOTH_MODIFIER, "LAPLACIANSMOOTH")
+    modifier.iterations = max(1, int(iterations))
+    modifier.lambda_factor = float(factor)
+    if hasattr(modifier, "lambda_border"):
+        modifier.lambda_border = float(factor)
+    if hasattr(modifier, "use_volume_preserve"):
+        modifier.use_volume_preserve = True
+    modifier.show_viewport = bool(enabled)
+    modifier.show_render = bool(enabled)
+    # Keep geometric smoothing after the generated Geometry Nodes surface.
+    try:
+        index = list(obj.modifiers).index(modifier)
+        obj.modifiers.move(index, len(obj.modifiers) - 1)
+    except (AttributeError, RuntimeError, ValueError):
+        pass
+    obj.update_tag()
+    return modifier
 
 
 def ensure_particle_object(existing_obj=None):

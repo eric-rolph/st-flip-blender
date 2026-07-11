@@ -25,11 +25,15 @@ def _params():
 def _stats():
     return SimpleNamespace(
         steps=2,
+        inactive_time_s=0.05,
         dt_values=[0.1, 0.2],
         particle_cfl_estimated_values=[1.0, 2.0],
         particle_cfl_actual_values=[1.5, 2.5],
         pcg_iters=[3, 4],
         pcg_rel_residuals=[0.05, 0.2],
+        particles_removed=5,
+        volume_outflow_removed=3,
+        pressure_outflow_removed=2,
     )
 
 
@@ -51,7 +55,11 @@ def test_particle_metrics_and_solver_diagnostics_have_expected_formulas():
     assert record["schema_version"] == SCHEMA_VERSION
     assert record["target_cfl"] == 8.0
     assert record["particle_count"] == 2
+    assert record["particles_removed"] == 5
+    assert record["volume_outflow_removed"] == 3
+    assert record["pressure_outflow_removed"] == 2
     assert record["solver_steps"] == 2
+    assert record["inactive_time_s"] == pytest.approx(0.05)
     assert record["dt_min_s"] == pytest.approx(0.1)
     assert record["dt_mean_s"] == pytest.approx(0.15)
     assert record["dt_max_s"] == pytest.approx(0.2)
@@ -98,6 +106,7 @@ def test_empty_initial_frame_uses_zero_estimates_and_null_diagnostics():
     assert record["kinetic_energy_particle_estimate"] == 0.0
     assert record["center_of_mass_local_x_solver_units"] is None
     assert record["dt_mean_s"] is None
+    assert record["inactive_time_s"] == 0.0
     assert record["pcg_converged_all"] is None
 
 
@@ -199,3 +208,54 @@ def test_strict_record_validation_rejects_extra_and_nonfinite_values():
     record["compute_wall_s"] = float("nan")
     with pytest.raises(ValueError, match="finite"):
         validate_frame_record(record)
+
+
+def test_outflow_metric_counts_must_be_nonnegative_and_consistent():
+    empty = np.empty((0, 3), dtype=np.float32)
+    stats = _stats()
+    stats.particles_removed = 4
+    with pytest.raises(ValueError, match="sum"):
+        measure_frame(
+            frame=1,
+            simulation_time_s=0.0,
+            params=_params(),
+            stats=stats,
+            positions_local=empty,
+            velocities=empty,
+        )
+    stats.particles_removed = -1
+    stats.volume_outflow_removed = -3
+    with pytest.raises(ValueError, match="negative"):
+        measure_frame(
+            frame=1,
+            simulation_time_s=0.0,
+            params=_params(),
+            stats=stats,
+            positions_local=empty,
+            velocities=empty,
+        )
+
+
+def test_inactive_time_metric_must_be_finite_and_nonnegative():
+    empty = np.empty((0, 3), dtype=np.float32)
+    stats = _stats()
+    stats.inactive_time_s = -0.1
+    with pytest.raises(ValueError, match="inactive_time_s"):
+        measure_frame(
+            frame=1,
+            simulation_time_s=0.0,
+            params=_params(),
+            stats=stats,
+            positions_local=empty,
+            velocities=empty,
+        )
+    stats.inactive_time_s = np.inf
+    with pytest.raises(ValueError, match="inactive_time_s"):
+        measure_frame(
+            frame=1,
+            simulation_time_s=0.0,
+            params=_params(),
+            stats=stats,
+            positions_local=empty,
+            velocities=empty,
+        )

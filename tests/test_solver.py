@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from stflip import cache
 from stflip import (
     FrameStats,
     Params,
@@ -37,6 +38,56 @@ def test_m0_calibration_close_to_ppc():
     s = _dam_break()
     # Normalised kernels: expected accumulator ~ particles-per-cell.
     assert 0.7 * 8 <= s.m0 <= 1.3 * 8
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("resolution", (4, 0, 4)),
+        ("resolution", (4, 4.5, 4)),
+        ("dx", 0.0),
+        ("dx", np.nan),
+        ("gravity", (0.0, np.inf, 0.0)),
+        ("rho", -1.0),
+        ("frame_dt", 0.0),
+        ("cfl_target", np.inf),
+        ("particles_per_cell", 1.5),
+        ("flip_blend", 1.01),
+        ("jitter_strength", -0.01),
+        ("eta_phi", 0.0),
+        ("eps_m", np.nan),
+        ("eps_rho_rel", 0.0),
+        ("pcg_tol", 0.0),
+        ("pcg_max_iter", 0),
+        ("cfl_local", np.inf),
+        ("seed", 1.5),
+        ("seed", -1),
+    ),
+)
+def test_params_reject_invalid_values(name, value):
+    with pytest.raises((TypeError, ValueError)):
+        Params(**{name: value})
+
+
+def test_solid_sdf_inputs_are_shape_and_finite_validated_atomically():
+    p = Params(resolution=(3, 3, 3), dx=0.25)
+    solver = STFLIPSolver(p, "cpu")
+    original = solver.be.to_numpy(solver.sdf).copy()
+
+    with pytest.raises(ValueError, match="sdf_cells must have shape"):
+        solver.set_solid_sdf(np.ones((2, 3, 3), dtype=np.float32))
+    bad_cells = np.ones(p.resolution, dtype=np.float32)
+    bad_cells[1, 1, 1] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        solver.set_solid_sdf(bad_cells)
+    cells = np.ones(p.resolution, dtype=np.float32)
+    nodes = np.ones((4, 4, 4), dtype=np.float32)
+    nodes[0, 0, 0] = np.inf
+    with pytest.raises(ValueError, match="finite"):
+        solver.set_solid_sdf(cells, nodes)
+
+    np.testing.assert_array_equal(solver.be.to_numpy(solver.sdf), original)
+    assert solver._solid_node_sdf is None
 
 
 def test_phase_field_uses_eq13_transition_scale():
@@ -196,6 +247,35 @@ def test_inflow_owns_its_cell_mask_after_registration():
     np.testing.assert_array_equal(seeded_cell, (0, 0, 0))
 
 
+def test_overlapping_inflows_use_registration_order_precedence():
+    p = Params(
+        resolution=(3, 1, 1), dx=1.0,
+        gravity=(0.0, 0.0, 0.0), particles_per_cell=1, seed=8,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    first = np.zeros(p.resolution, dtype=bool)
+    first[0:2, 0, 0] = True
+    second = np.zeros(p.resolution, dtype=bool)
+    second[1:3, 0, 0] = True
+    solver.add_inflow(first, (1.0, 0.0, 0.0))
+    solver.add_inflow(second, (2.0, 0.0, 0.0))
+
+    solver._seed_inflows()
+
+    cells = np.floor(solver.pos[:, 0] / p.dx).astype(int)
+    assert cells.tolist() == [0, 1, 2]
+    np.testing.assert_array_equal(
+        solver.vel,
+        np.asarray(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+    )
+    # Occupancy from the first call prevents either source from reseeding.
+    solver._seed_inflows()
+    assert solver.pos.shape[0] == 3
+
+
 def test_dam_break_runs_and_stays_finite():
     s = _dam_break()
     n0 = s.pos.shape[0]
@@ -325,14 +405,451 @@ def test_advection_local_cfl_is_not_clipped_at_40_substeps():
     )
     s = SampleCountingSolver(p, "cpu")
     s.pos = s.be.xp.asarray([[1.5, 1.5, 1.5]], dtype=s.be.xp.float32)
-    # ceil(41 cells / cfl_local) requires 41 RK substeps. Each Ralston RK3
-    # substep samples the velocity field three times.
-    s.vel = s.be.xp.asarray([[41.0, 0.0, 0.0]], dtype=s.be.xp.float32)
+    # The sampled grid—not the unrelated particle-carried velocity—bounds the
+    # advector. ceil(41 cells / cfl_local) requires 41 RK substeps, each with
+    # three Ralston RK3 samples.
+    s.vel = s.be.xp.asarray([[0.0, 0.0, 0.0]], dtype=s.be.xp.float32)
+    grids = {
+        "u": np.full((5, 4, 4), 41.0, dtype=np.float32),
+        "v": np.zeros((4, 5, 4), dtype=np.float32),
+        "w": np.zeros((4, 4, 5), dtype=np.float32),
+    }
     dt_act = s.be.xp.asarray([1.0], dtype=s.be.xp.float32)
 
-    s._advect({}, s.pos.copy(), dt_act)
+    s._advect(grids, s.pos.copy(), dt_act)
 
     assert s.sample_calls == 3 * 41
+
+
+def test_advection_local_cfl_does_not_use_particle_velocity():
+    class SampleCountingSolver(STFLIPSolver):
+        sample_calls = 0
+
+        def _sample_faces(self, grids, pos):
+            self.sample_calls += 1
+            return self.be.xp.zeros_like(pos)
+
+    p = Params(
+        resolution=(4, 4, 4), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        cfl_local=1.0,
+    )
+    s = SampleCountingSolver(p, "cpu")
+    s.pos = np.asarray([[1.5, 1.5, 1.5]], dtype=np.float32)
+    s.vel = np.asarray([[1000.0, 0.0, 0.0]], dtype=np.float32)
+    grids = {
+        "u": np.full((5, 4, 4), 2.0, dtype=np.float32),
+        "v": np.zeros((4, 5, 4), dtype=np.float32),
+        "w": np.zeros((4, 4, 5), dtype=np.float32),
+    }
+
+    s._advect(grids, s.pos.copy(), np.asarray([1.0], dtype=np.float32))
+
+    assert s.sample_calls == 3 * 2
+
+
+def _constant_advection_grids(shape, velocity):
+    nx, ny, nz = shape
+    u_value, v_value, w_value = velocity
+    return {
+        "u": np.full((nx + 1, ny, nz), u_value, dtype=np.float32),
+        "v": np.full((nx, ny + 1, nz), v_value, dtype=np.float32),
+        "w": np.full((nx, ny, nz + 1), w_value, dtype=np.float32),
+    }
+
+
+def test_volume_outflow_is_checked_at_every_local_advection_substep():
+    p = Params(
+        resolution=(6, 2, 2), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        cfl_local=1.0,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    sink = np.zeros(p.resolution, dtype=bool)
+    sink[3, 0, 0] = True
+    solver.add_outflow(sink, "VOLUME")
+    positions = np.asarray([[1.5, 0.5, 0.5]], dtype=np.float32)
+
+    result, volume_removed, pressure_removed = solver._advect(
+        _constant_advection_grids(p.resolution, (4.0, 0.0, 0.0)),
+        positions,
+        np.asarray([1.0], dtype=np.float32),
+        track_outflows=True,
+    )
+
+    # A final-position-only test would see x=5.5 and miss the one-cell sink.
+    assert result[0, 0] == pytest.approx(3.5)
+    assert volume_removed.tolist() == [True]
+    assert pressure_removed.tolist() == [False]
+
+
+def test_volume_outflow_uses_swept_voxel_traversal_for_diagonal_motion():
+    p = Params(
+        resolution=(3, 3, 1), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        cfl_local=1.0,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    sink = np.zeros(p.resolution, dtype=bool)
+    sink[1, 1, 0] = True
+    solver.add_outflow(sink, "VOLUME")
+
+    _, removed, _ = solver._advect(
+        _constant_advection_grids(p.resolution, (0.3, -0.3, 0.0)),
+        np.asarray([[0.9, 1.2, 0.5]], dtype=np.float32),
+        np.asarray([1.0], dtype=np.float32),
+        track_outflows=True,
+    )
+    assert removed.tolist() == [True]
+
+    _, nearby_removed, _ = solver._advect(
+        _constant_advection_grids(p.resolution, (0.3, -0.1, 0.0)),
+        np.asarray([[0.9, 2.2, 0.5]], dtype=np.float32),
+        np.asarray([1.0], dtype=np.float32),
+        track_outflows=True,
+    )
+    assert nearby_removed.tolist() == [False]
+
+
+def test_swept_voxel_traversal_is_warning_free_for_stationary_segments():
+    p = Params(resolution=(2, 2, 2), dx=1.0)
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    point = np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32)
+
+    with np.errstate(all="raise"):
+        hit = solver._segments_hit_mask(mask, point, point)
+
+    assert hit.tolist() == [False]
+
+
+def test_pressure_outflow_allows_only_its_opened_exterior_face():
+    p = Params(
+        resolution=(4, 3, 3), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        cfl_local=1.0,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    opening = np.zeros(p.resolution, dtype=bool)
+    opening[0, 1, 1] = True
+    solver.add_outflow(opening, "pressure")
+    positions = np.asarray(
+        [[0.25, 1.5, 1.5], [0.25, 0.5, 0.5]], dtype=np.float32
+    )
+
+    result, volume_removed, pressure_removed = solver._advect(
+        _constant_advection_grids(p.resolution, (-2.0, 0.0, 0.0)),
+        positions,
+        np.ones((2,), dtype=np.float32),
+        track_outflows=True,
+    )
+
+    assert volume_removed.tolist() == [False, False]
+    assert pressure_removed.tolist() == [True, False]
+    assert result[0, 0] < 0.0
+    assert result[1, 0] >= 0.0
+    stats = solver.outflow_stats()
+    assert stats["pressure_open_face_count"] == 1
+    assert stats["pressure_open_face_counts"] == {
+        "x_min": 1,
+        "x_max": 0,
+        "y_min": 0,
+        "y_max": 0,
+        "z_min": 0,
+        "z_max": 0,
+    }
+
+
+def test_pressure_exit_uses_segment_boundary_intersection_coordinates():
+    p = Params(
+        resolution=(3, 3, 1), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        cfl_local=1.0,
+    )
+    start = np.asarray([[0.2, 1.6, 0.5]], dtype=np.float32)
+    grids = _constant_advection_grids(p.resolution, (-0.4, 0.6, 0.0))
+
+    open_at_intersection = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[0, 1, 0] = True
+    open_at_intersection.add_outflow(mask, "PRESSURE")
+    exited_pos, _, exited = open_at_intersection._advect(
+        grids, start.copy(), np.asarray([1.0], dtype=np.float32),
+        track_outflows=True,
+    )
+    assert exited.tolist() == [True]
+    assert exited_pos[0, 0] < 0.0
+
+    open_only_at_endpoint = STFLIPSolver(p, "cpu")
+    mask[:] = False
+    mask[0, 2, 0] = True
+    open_only_at_endpoint.add_outflow(mask, "PRESSURE")
+    clamped_pos, _, exited = open_only_at_endpoint._advect(
+        grids, start.copy(), np.asarray([1.0], dtype=np.float32),
+        track_outflows=True,
+    )
+    assert exited.tolist() == [False]
+    assert clamped_pos[0, 0] >= 0.0
+
+
+def test_pressure_outflow_requires_an_exterior_intersection():
+    p = Params(resolution=(3, 3, 3), dx=1.0)
+    solver = STFLIPSolver(p, "cpu")
+    interior = np.zeros(p.resolution, dtype=bool)
+    interior[1, 1, 1] = True
+
+    with pytest.raises(ValueError, match="intersect the domain exterior"):
+        solver.add_outflow(interior, "PRESSURE")
+    with pytest.raises(ValueError, match="VOLUME.*PRESSURE"):
+        solver.add_outflow(interior, "DELETE")
+
+
+def test_cull_outflows_filters_all_state_and_updates_cumulative_stats():
+    p = Params(
+        resolution=(3, 3, 3), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    volume = np.zeros(p.resolution, dtype=bool)
+    volume[1, 0, 0] = True
+    pressure = np.zeros(p.resolution, dtype=bool)
+    pressure[0, 1, 1] = True
+    solver.add_outflow(volume, "VOLUME")
+    solver.add_outflow(pressure, "PRESSURE")
+    solver.pos = np.asarray(
+        [[1.5, 0.5, 0.5], [-0.1, 1.5, 1.5], [2.5, 2.5, 2.5]],
+        dtype=np.float32,
+    )
+    solver.vel = np.asarray(
+        [[10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    solver.dt_resid = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
+
+    removed = solver.cull_outflows()
+
+    assert removed == {
+        "particles_removed": 2,
+        "volume_outflow_removed": 1,
+        "pressure_outflow_removed": 1,
+    }
+    np.testing.assert_array_equal(solver.pos, [[2.5, 2.5, 2.5]])
+    np.testing.assert_array_equal(solver.vel, [[30.0, 0.0, 0.0]])
+    np.testing.assert_allclose(solver.dt_resid, [0.3])
+    stats = solver.outflow_stats()
+    assert stats["particles_removed_total"] == 2
+    assert stats["volume_outflow_removed_total"] == 1
+    assert stats["pressure_outflow_removed_total"] == 1
+
+    assert solver.cull_outflows() == {
+        "particles_removed": 0,
+        "volume_outflow_removed": 0,
+        "pressure_outflow_removed": 0,
+    }
+    assert solver.outflow_stats()["particles_removed_total"] == 2
+
+
+def test_render_resync_filters_pressure_exits_without_mutating_solver_state():
+    p = Params(
+        resolution=(3, 2, 2), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    opening = np.zeros(p.resolution, dtype=bool)
+    opening[0, 0, 0] = True
+    solver.add_outflow(opening, "PRESSURE")
+    solver.pos = np.asarray([[0.2, 0.5, 0.5]], dtype=np.float32)
+    solver.vel = np.asarray([[-1.0, 0.0, 0.0]], dtype=np.float32)
+    solver.dt_resid = np.asarray([0.5], dtype=np.float32)
+    solver._grids = _constant_advection_grids(
+        p.resolution, (-1.0, 0.0, 0.0)
+    )
+    raw_state = (
+        solver.pos.copy(), solver.vel.copy(), solver.dt_resid.copy()
+    )
+    before = solver.outflow_stats()
+
+    positions, velocities = solver.get_render_particles()
+
+    assert positions.shape == velocities.shape == (0, 3)
+    np.testing.assert_array_equal(solver.pos, raw_state[0])
+    np.testing.assert_array_equal(solver.vel, raw_state[1])
+    np.testing.assert_array_equal(solver.dt_resid, raw_state[2])
+    assert solver.outflow_stats() == before
+
+
+def test_step_filters_all_particle_arrays_and_reports_volume_removal():
+    p = Params(
+        resolution=(6, 2, 2), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        frame_dt=1.0, cfl_target=4.0, cfl_local=1.0,
+        particles_per_cell=1, st_enabled=False, flip_blend=1.0,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    solver.pos = np.asarray(
+        [[1.5, 0.5, 0.5], [1.5, 1.5, 1.5]], dtype=np.float32
+    )
+    solver.vel = np.asarray(
+        [[4.0, 11.0, 12.0], [4.0, 21.0, 22.0]], dtype=np.float32
+    )
+    solver.dt_resid = np.asarray([0.0, 1.5], dtype=np.float32)
+    sink = np.zeros(p.resolution, dtype=bool)
+    sink[3, 0, 0] = True
+    solver.add_outflow(sink, "VOLUME")
+    grids = _constant_advection_grids(p.resolution, (4.0, 0.0, 0.0))
+    for name in ("u", "v", "w"):
+        grids[f"{name}_valid"] = np.ones_like(grids[name], dtype=bool)
+        grids[f"{name}_phi"] = np.ones_like(grids[name], dtype=np.float32)
+    grids["c_phi"] = np.zeros(p.resolution, dtype=np.float32)
+    solver._p2g = lambda _dt_prev: grids
+    stats = FrameStats()
+
+    solver._step(1.0, stats)
+
+    assert solver.pos.shape == (1, 3)
+    assert solver.vel.shape == (1, 3)
+    assert solver.dt_resid.shape == (1,)
+    np.testing.assert_array_equal(solver.vel[0], (4.0, 21.0, 22.0))
+    assert solver.dt_resid[0] == pytest.approx(0.5)
+    assert stats.particles_removed == 1
+    assert stats.volume_outflow_removed == 1
+    assert stats.pressure_outflow_removed == 0
+    assert solver.outflow_stats()["particles_removed_total"] == 1
+
+
+def test_step_frame_finishes_clock_after_outflow_removes_every_particle():
+    p = Params(
+        resolution=(2, 2, 2), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        frame_dt=1.0, cfl_target=1.0, particles_per_cell=1,
+        st_enabled=False,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    solver.pos = np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32)
+    solver.vel = np.asarray([[4.0, 0.0, 0.0]], dtype=np.float32)
+    solver.dt_resid = np.zeros((1,), dtype=np.float32)
+    sink = np.zeros(p.resolution, dtype=bool)
+    sink[0, 0, 0] = True
+    solver.add_outflow(sink, "VOLUME")
+
+    stats = solver.step_frame()
+
+    assert solver.pos.shape[0] == 0
+    assert solver.time == pytest.approx(1.0)
+    assert sum(stats.dt_values) + stats.inactive_time_s == pytest.approx(
+        p.frame_dt
+    )
+    assert stats.dt_values == pytest.approx([0.25])
+    assert stats.inactive_time_s == pytest.approx(0.75)
+    assert stats.steps == 1
+    assert len(stats.pcg_iters) == stats.steps
+    assert len(stats.particle_cfl_estimated_values) == stats.steps
+    assert len(stats.particle_cfl_actual_values) == stats.steps
+    assert stats.particles_removed == 1
+
+
+def test_empty_frame_fast_forwards_without_grid_work():
+    p = Params(
+        resolution=(8, 8, 8), dx=0.125, frame_dt=0.5,
+        gravity=(0.0, 0.0, 0.0), particles_per_cell=1,
+    )
+    solver = STFLIPSolver(p, "cpu")
+
+    def forbidden_step(dt, stats):
+        raise AssertionError("empty frame must not execute a grid step")
+
+    solver._step = forbidden_step
+    stats = solver.step_frame()
+
+    assert solver.time == pytest.approx(0.5)
+    assert stats.steps == 0
+    assert stats.dt_values == []
+    assert stats.inactive_time_s == pytest.approx(0.5)
+
+
+def test_step_without_outflows_uses_untracked_legacy_advection_path():
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1, st_enabled=False,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[0, 0, 0] = True
+    solver.add_liquid_mask(mask)
+    tracking_values = []
+
+    def fake_advect(grids, pos, dt_act, *, track_outflows=False):
+        tracking_values.append(track_outflows)
+        return pos
+
+    solver._advect = fake_advect
+    solver._step(0.1, FrameStats())
+
+    assert tracking_values == [False]
+
+
+def test_no_outflow_solver_keeps_dense_masks_lazy_and_stats_transfer_free():
+    solver = STFLIPSolver(
+        Params(resolution=(8, 8, 8), dx=0.125, particles_per_cell=1),
+        "cpu",
+    )
+    assert solver._volume_outflow is None
+    assert solver._pressure_outflow is None
+
+    def forbidden_transfer(values):
+        raise AssertionError("empty outflow stats must not transfer arrays")
+
+    solver.be.to_numpy = forbidden_transfer
+    stats = solver.outflow_stats()
+
+    assert stats["volume_cell_count"] == 0
+    assert stats["pressure_cell_count"] == 0
+    assert stats["pressure_open_face_count"] == 0
+
+
+def test_outflow_geometry_stats_are_cached_until_geometry_changes():
+    p = Params(resolution=(2, 2, 2), dx=1.0)
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[0, 0, 0] = True
+    solver.add_outflow(mask, "PRESSURE")
+    original = solver.be.to_numpy
+    transfers = 0
+
+    def counting_transfer(values):
+        nonlocal transfers
+        transfers += 1
+        return original(values)
+
+    solver.be.to_numpy = counting_transfer
+    first = solver.outflow_stats()
+    second = solver.outflow_stats()
+    assert first == second
+    assert transfers == 1
+
+    second_mask = np.zeros(p.resolution, dtype=bool)
+    second_mask[-1, -1, -1] = True
+    solver.add_outflow(second_mask, "PRESSURE")
+    solver.outflow_stats()
+    assert transfers == 2
+
+
+def test_pressure_outflow_projection_uses_half_cell_exterior_dirichlet():
+    p = Params(
+        resolution=(2, 3, 3), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1, st_enabled=False, flip_blend=0.0,
+        pcg_tol=1e-8, pcg_max_iter=200,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    opening = np.zeros(p.resolution, dtype=bool)
+    opening[0, 1, 1] = True
+    solver.add_outflow(opening, "PRESSURE")
+    grids = _constant_advection_grids(p.resolution, (0.0, 0.0, 0.0))
+    grids["u"][0, 1, 1] = -1.0
+    for name in ("u", "v", "w"):
+        grids[f"{name}_valid"] = np.ones_like(grids[name], dtype=bool)
+        grids[f"{name}_phi"] = np.ones_like(grids[name], dtype=np.float32)
+    grids["c_phi"] = np.ones(p.resolution, dtype=np.float32)
+    solver._p2g = lambda _dt_prev: grids
+    stats = FrameStats()
+
+    solver._step(0.1, stats)
+
+    assert stats.pcg_iters[0] > 0
+    assert solver._grids["u"][0, 1, 1] == pytest.approx(0.0, abs=2e-5)
 
 
 def test_solid_obstacle_blocks_particles():
@@ -412,6 +929,48 @@ def test_fractional_node_sdf_closes_domain_faces_and_reports_counts():
         + stats["open_face_count"]
         == stats["total_face_count"]
     )
+
+
+def test_pressure_outflow_restores_only_geometric_exterior_aperture():
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    cell_sdf = np.ones(p.resolution, dtype=np.float32)
+    node_sdf = np.empty((3, 3, 3), dtype=np.float32)
+    node_sdf[:, 0, :] = -0.5
+    node_sdf[:, 1, :] = 0.5
+    node_sdf[:, 2, :] = 1.5
+    solver.set_solid_sdf(cell_sdf, node_sdf)
+    opening = np.zeros(p.resolution, dtype=bool)
+    opening[0, 0, 0] = True
+    solver.add_outflow(opening, "PRESSURE")
+
+    alpha_u, _, _, _ = solver._active_face_apertures()
+
+    assert alpha_u[0, 0, 0] == pytest.approx(0.5)
+    assert solver._pressure_face_masks()[0][0, 0, 0]
+
+
+def test_pressure_outflow_cannot_open_zero_aperture_fractional_face():
+    p = Params(
+        resolution=(2, 2, 2), dx=0.5, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    cell_sdf = np.ones(p.resolution, dtype=np.float32)
+    node_sdf = np.ones((3, 3, 3), dtype=np.float32)
+    node_sdf[0] = -1.0
+    solver.set_solid_sdf(cell_sdf, node_sdf)
+    opening = np.zeros(p.resolution, dtype=bool)
+    opening[0, 0, 0] = True
+    solver.add_outflow(opening, "PRESSURE")
+
+    alpha_u, _, _, _ = solver._active_face_apertures()
+
+    assert alpha_u[0, 0, 0] == 0.0
+    assert not solver._pressure_face_masks()[0][0, 0, 0]
 
 
 def test_extrapolation_does_not_cross_zero_aperture_faces():
@@ -517,6 +1076,140 @@ def test_no_energy_kick_for_zero_temporal_weight_particles():
     assert speed < 1.3, f"isolated particle gained energy: |v| = {speed:.3f}"
 
 
+def _checkpoint_solver(*, seed_particles):
+    params = Params(
+        resolution=(6, 6, 6),
+        dx=1.0 / 6.0,
+        gravity=(0.0, 0.0, -0.2),
+        frame_dt=1.0 / 30.0,
+        cfl_target=2.0,
+        particles_per_cell=1,
+        seed=2026,
+    )
+    solver = STFLIPSolver(params, "cpu")
+    sdf = np.ones(params.resolution, dtype=np.float32)
+    sdf[4, 2, 1] = -0.1
+    solver.set_solid_sdf(sdf)
+
+    inflow = np.zeros(params.resolution, dtype=bool)
+    inflow[1, 4, 3] = True
+    solver.add_inflow(inflow, (0.15, -0.05, 0.0))
+    outflow = np.zeros(params.resolution, dtype=bool)
+    outflow[0, 0, 0] = True
+    solver.add_outflow(outflow, "VOLUME")
+    if seed_particles:
+        liquid = np.zeros(params.resolution, dtype=bool)
+        liquid[0, 0, 0] = True
+        liquid[2:4, 1:3, 2:4] = True
+        solver.add_liquid_mask(liquid, (0.05, 0.0, 0.0))
+        assert solver.cull_outflows()["volume_outflow_removed"] == 1
+    return solver
+
+
+def test_checkpoint_restore_matches_uninterrupted_future_frames_exactly():
+    uninterrupted = _checkpoint_solver(seed_particles=True)
+    uninterrupted.step_frame()
+    snapshot = uninterrupted.checkpoint_state()
+
+    restored = _checkpoint_solver(seed_particles=False)
+    restored.restore_state(snapshot)
+
+    restored_snapshot = restored.checkpoint_state()
+    for name in ("pos", "vel", "dt_resid"):
+        np.testing.assert_array_equal(restored_snapshot[name], snapshot[name])
+    for name in (
+        "time", "dt_prev", "rng_state", "outflow_removed_total",
+        "volume_outflow_removed_total", "pressure_outflow_removed_total",
+    ):
+        assert restored_snapshot[name] == snapshot[name]
+
+    for _ in range(2):
+        expected_stats = uninterrupted.step_frame()
+        actual_stats = restored.step_frame()
+        assert actual_stats == expected_stats
+        expected = uninterrupted.checkpoint_state()
+        actual = restored.checkpoint_state()
+        for name in ("pos", "vel", "dt_resid"):
+            np.testing.assert_array_equal(actual[name], expected[name])
+        for name in (
+            "time", "dt_prev", "rng_state", "outflow_removed_total",
+            "volume_outflow_removed_total",
+            "pressure_outflow_removed_total",
+        ):
+            assert actual[name] == expected[name]
+
+
+def test_partial_cache_resume_extends_without_reseeding(tmp_path):
+    cache_dir = str(tmp_path)
+    partial = _checkpoint_solver(seed_particles=True)
+    pos, vel = partial.get_render_particles()
+    cache.write_frame(cache_dir, 1, pos, vel)
+    cache.write_checkpoint(cache_dir, 1, partial.checkpoint_state())
+    metadata = {
+        "frame_start": 1,
+        "frame_end": 2,
+        "frame_end_baked": 1,
+        "checkpoint": {
+            "schema": cache.CHECKPOINT_SCHEMA,
+            "version": cache.CHECKPOINT_VERSION,
+            "fingerprint": "d" * 64,
+            "latest_frame": 1,
+            "state": "CANCELLED",
+        },
+    }
+    cache.write_meta(cache_dir, metadata)
+    assert cache.resumable_frames(cache_dir) == [1]
+
+    uninterrupted = _checkpoint_solver(seed_particles=False)
+    uninterrupted.restore_state(partial.checkpoint_state())
+    uninterrupted.step_frame()
+
+    resumed = _checkpoint_solver(seed_particles=False)
+    resumed.restore_state(cache.read_checkpoint(cache_dir, 1))
+    resumed.step_frame()
+    pos, vel = resumed.get_render_particles()
+    cache.write_frame(cache_dir, 2, pos, vel)
+    cache.write_checkpoint(cache_dir, 2, resumed.checkpoint_state())
+    metadata["frame_end_baked"] = 2
+    metadata["checkpoint"].update(latest_frame=2, state="COMPLETE")
+    cache.write_meta(cache_dir, metadata)
+
+    assert cache.resumable_frames(cache_dir) == [1, 2]
+    expected = uninterrupted.checkpoint_state()
+    actual = resumed.checkpoint_state()
+    for name in ("pos", "vel", "dt_resid"):
+        np.testing.assert_array_equal(actual[name], expected[name])
+    assert actual["rng_state"] == expected["rng_state"]
+
+
+def test_checkpoint_restore_is_strict_atomic_and_owns_arrays():
+    solver = _checkpoint_solver(seed_particles=True)
+    solver.step_frame()
+    before = solver.checkpoint_state()
+    detached = solver.checkpoint_state()
+    detached["pos"][:] = 0.0
+    np.testing.assert_array_equal(solver.checkpoint_state()["pos"], before["pos"])
+
+    invalid = solver.checkpoint_state()
+    invalid["vel"] = invalid["vel"].astype(np.float64)
+    with pytest.raises(ValueError, match="vel"):
+        solver.restore_state(invalid)
+    after = solver.checkpoint_state()
+    for name in ("pos", "vel", "dt_resid"):
+        np.testing.assert_array_equal(after[name], before[name])
+    assert after["rng_state"] == before["rng_state"]
+
+    invalid = solver.checkpoint_state()
+    invalid["pressure_outflow_removed_total"] += 1
+    with pytest.raises(ValueError, match="inconsistent"):
+        solver.restore_state(invalid)
+
+    invalid = solver.checkpoint_state()
+    invalid["pos"][0, 0] = np.float32(solver.size[0] + 1.0)
+    with pytest.raises(ValueError, match="outside"):
+        solver.restore_state(invalid)
+
+
 @pytest.mark.gpu
 def test_gpu_backend_parity():
     cupy = pytest.importorskip("cupy")
@@ -546,6 +1239,15 @@ def test_gpu_backend_parity():
     mask = np.zeros((16, 16, 16), dtype=bool)
     mask[:5, :, :8] = True
     s_gpu.add_liquid_mask(mask, initial_field)
+    volume_outflow = np.zeros_like(mask)
+    volume_outflow[2, 8, 4] = True
+    pressure_outflow = np.zeros_like(mask)
+    pressure_outflow[0, 8, 12] = True
+    for instance in (s_cpu, s_gpu):
+        instance.add_outflow(volume_outflow, "VOLUME")
+        instance.add_outflow(pressure_outflow, "PRESSURE")
+    assert s_cpu.outflow_stats() == s_gpu.outflow_stats()
+    assert s_gpu.outflow_stats()["pressure_open_face_count"] == 1
 
     # Jitter and velocity-field evaluation both happen in host float32 before
     # upload, so initial state is bitwise identical across solver backends.
@@ -554,6 +1256,26 @@ def test_gpu_backend_parity():
     )
     np.testing.assert_array_equal(
         s_gpu.be.to_numpy(s_gpu.vel), s_cpu.be.to_numpy(s_cpu.vel)
+    )
+    # Checkpoints are host float32 state and must restore directly onto CUDA
+    # without changing source/outflow/solid configuration.
+    s_gpu.restore_state(s_cpu.checkpoint_state())
+    assert isinstance(s_gpu.pos, cupy.ndarray)
+    np.testing.assert_array_equal(
+        s_gpu.be.to_numpy(s_gpu.dt_resid), s_cpu.be.to_numpy(s_cpu.dt_resid)
+    )
+    cpu_culled = s_cpu.cull_outflows()
+    gpu_culled = s_gpu.cull_outflows()
+    assert gpu_culled == cpu_culled
+    assert cpu_culled["volume_outflow_removed"] > 0
+    np.testing.assert_array_equal(
+        s_gpu.be.to_numpy(s_gpu.pos), s_cpu.be.to_numpy(s_cpu.pos)
+    )
+    np.testing.assert_array_equal(
+        s_gpu.be.to_numpy(s_gpu.vel), s_cpu.be.to_numpy(s_cpu.vel)
+    )
+    np.testing.assert_array_equal(
+        s_gpu.be.to_numpy(s_gpu.dt_resid), s_cpu.be.to_numpy(s_cpu.dt_resid)
     )
 
     # The backend must keep solver state and compute results on-device.
@@ -579,9 +1301,20 @@ def test_gpu_backend_parity():
         cpu_stats = s_cpu.step_frame()
         gpu_stats = s_gpu.step_frame()
         assert gpu_stats.steps == cpu_stats.steps
+        assert gpu_stats.particles_removed == cpu_stats.particles_removed
+        assert (
+            gpu_stats.volume_outflow_removed
+            == cpu_stats.volume_outflow_removed
+        )
+        assert (
+            gpu_stats.pressure_outflow_removed
+            == cpu_stats.pressure_outflow_removed
+        )
         # A nonzero PCG iteration count proves the pressure projection ran.
         assert gpu_stats.pcg_iters and all(i > 0 for i in gpu_stats.pcg_iters)
     s_gpu.be.synchronize()
+    assert s_cpu.outflow_stats() == s_gpu.outflow_stats()
+    assert s_cpu.outflow_stats()["volume_outflow_removed_total"] > 0
 
     assert s_gpu._grids
     assert all(isinstance(value, cupy.ndarray)
@@ -613,6 +1346,9 @@ def test_gpu_backend_parity():
         compute_wall_s=None,
     )
     for field in (
+        "particles_removed",
+        "volume_outflow_removed",
+        "pressure_outflow_removed",
         "particle_cfl_estimated_max",
         "particle_cfl_actual_max",
         "speed_max_solver_units_per_s",

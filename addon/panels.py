@@ -31,19 +31,37 @@ class STFLIP_PT_main(bpy.types.Panel):
         layout = self.layout
         st = context.scene.stflip
 
-        layout.operator("stflip.quick_setup", icon="MOD_FLUIDSIM")
-        layout.prop(st, "domain")
+        running = st.bake_state == "RUNNING"
+        row = layout.row(align=True)
+        row.enabled = not running
+        row.operator("stflip.quick_setup", icon="MOD_FLUIDSIM")
+        row.operator(
+            "stflip.whirlpool_preview", icon="FORCE_VORTEX", text="Whirlpool",
+        )
+        domain_row = layout.row()
+        domain_row.enabled = not running
+        domain_row.prop(st, "domain")
 
         col = layout.column(align=True)
+        col.enabled = not running
         col.prop(st, "resolution")
         col.prop(st, "cfl_target")
         col.prop(st, "particles_per_cell")
 
         row = layout.row(align=True)
-        row.operator("stflip.bake", icon="PLAY")
+        if st.bake_state == "RUNNING":
+            row.operator("stflip.cancel_bake", icon="CANCEL", text="Cancel")
+        else:
+            row.operator("stflip.bake", icon="PLAY")
+            row.operator(
+                "stflip.resume_bake", icon="RECOVER_LAST", text="Resume")
         row.operator("stflip.free_bake", icon="TRASH", text="")
+        if st.bake_state == "RUNNING":
+            layout.prop(st, "bake_progress", text="", slider=True)
         if st.bake_status:
             layout.label(text=st.bake_status)
+        if st.bake_state == "FAILED" and st.bake_error:
+            layout.label(text=st.bake_error, icon="ERROR")
 
 
 class STFLIP_PT_object(bpy.types.Panel):
@@ -59,6 +77,7 @@ class STFLIP_PT_object(bpy.types.Panel):
         if obj is None or obj.type != "MESH":
             layout.label(text="Select a mesh object")
             return
+        layout.enabled = context.scene.stflip.bake_state != "RUNNING"
         layout.prop(obj.stflip, "role", text="Role")
         if obj.stflip.role == "LIQUID":
             settings = obj.stflip
@@ -77,6 +96,16 @@ class STFLIP_PT_object(bpy.types.Panel):
                 col.prop(settings, "angular_speed")
         elif obj.stflip.role == "INFLOW":
             layout.prop(obj.stflip, "inflow_velocity")
+        elif obj.stflip.role == "OUTFLOW":
+            layout.prop(obj.stflip, "outflow_mode")
+            if obj.stflip.outflow_mode == "VOLUME":
+                layout.label(text="Deletes particles inside the volume.",
+                             icon="INFO")
+                layout.label(text="Not a pressure boundary.")
+            else:
+                layout.label(text="Atmospheric-pressure exterior opening.",
+                             icon="INFO")
+                layout.label(text="Must intersect a domain boundary.")
 
 
 class STFLIP_PT_solver(bpy.types.Panel):
@@ -90,6 +119,7 @@ class STFLIP_PT_solver(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         st = context.scene.stflip
+        layout.enabled = st.bake_state != "RUNNING"
 
         layout.prop(st, "st_enabled")
         sub = layout.column(align=True)
@@ -122,6 +152,26 @@ class STFLIP_PT_solver(bpy.types.Panel):
         layout.prop(st, "cache_dir")
 
 
+class STFLIP_PT_advanced(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "Advanced Solver"
+    bl_parent_id = "STFLIP_PT_solver"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.stflip
+        layout.enabled = st.bake_state != "RUNNING"
+        col = layout.column(align=True)
+        col.prop(st, "density")
+        col.prop(st, "density_floor_relative")
+        col.prop(st, "local_cfl")
+        col.prop(st, "pcg_tolerance")
+        col.prop(st, "pcg_max_iterations")
+
+
 class STFLIP_PT_experiment(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -133,6 +183,7 @@ class STFLIP_PT_experiment(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         st = context.scene.stflip
+        layout.enabled = st.bake_state != "RUNNING"
 
         layout.prop(st, "experiment_profile")
         row = layout.row()
@@ -160,17 +211,27 @@ class STFLIP_PT_display(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         st = context.scene.stflip
+        layout.enabled = st.bake_state != "RUNNING"
         layout.prop(st, "create_surface")
         col = layout.column(align=True)
         col.enabled = st.create_surface
         col.prop(st, "particle_radius")
         col.prop(st, "surface_voxel")
+        col.prop(st, "surface_smoothing")
+        smooth = col.column(align=True)
+        smooth.enabled = st.surface_smoothing
+        smooth.prop(st, "surface_smoothing_iterations")
+        smooth.prop(st, "surface_smoothing_factor")
+        col.label(text="Blender geometric smoothing; not paper MCF.",
+                  icon="INFO")
+        col.operator("stflip.refresh_surface", icon="FILE_REFRESH")
 
 
 CLASSES = (
     STFLIP_PT_main,
     STFLIP_PT_object,
     STFLIP_PT_solver,
+    STFLIP_PT_advanced,
     STFLIP_PT_experiment,
     STFLIP_PT_display,
 )

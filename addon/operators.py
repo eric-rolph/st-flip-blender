@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import hmac
 import importlib
 import json
 import math
+import ntpath
 import os
 from pathlib import Path
 import shutil
@@ -39,6 +42,7 @@ _PARTICLE_BYTES = 160
 _CUDA_HOST_GRID_BYTES_PER_CELL = 96
 _CUDA_HOST_PARTICLE_BYTES = 48
 _MEMORY_HEADROOM_FRACTION = 0.75
+_SETUP_OBJECT_KEY = "stflip_generated_setup"
 
 
 def _value(source, *names, default=None):
@@ -111,6 +115,14 @@ def _format_bytes(value: int | float) -> str:
             return f"{value:.1f} {suffix}"
         value /= 1024.0
     return f"{value:.1f} TiB"
+
+
+def relative_cache_needs_saved_blend(cache_dir, blend_filepath) -> bool:
+    """Whether a relative cache would move after the .blend is first saved."""
+    configured = str(cache_dir or "//stflip_cache")
+    is_absolute = os.path.isabs(configured) or ntpath.isabs(configured)
+    is_relative = configured.startswith("//") or not is_absolute
+    return is_relative and not bool(str(blend_filepath or "").strip())
 
 
 def memory_guard_reason(estimate: dict, backend_name: str,
@@ -242,6 +254,202 @@ from .handlers import resolve_cache_dir  # noqa: E402
 
 # The live solver cannot be stored on Blender ID properties; module state it is.
 _BAKE: dict = {}
+
+
+def _canonical_json_bytes(value) -> bytes:
+    """Encode simulation descriptors without platform-dependent whitespace."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _fingerprint_array(digest, label: str, value, dtype) -> None:
+    array = np.ascontiguousarray(np.asarray(value, dtype=dtype))
+    digest.update(_canonical_json_bytes({
+        "label": label,
+        "dtype": array.dtype.str,
+        "shape": list(array.shape),
+    }))
+    digest.update(memoryview(array).cast("B"))
+
+
+def simulation_fingerprint(
+    params,
+    dims,
+    dx,
+    origin,
+    backend_name: str,
+    sources,
+    solid_sdf=None,
+    solid_node_sdf=None,
+) -> str:
+    """Hash every re-voxelized input that can change a resumed trajectory.
+
+    Source order is significant because liquid seeding consumes the NumPy RNG
+    in that order. Object names and display settings are deliberately omitted;
+    actual masks, resolved velocity descriptors, and outflow modes are not.
+    """
+    params_payload = {
+        name: getattr(params, name)
+        for name in sorted(vars(params))
+        if not name.startswith("_")
+    }
+    digest = hashlib.sha256()
+    digest.update(_canonical_json_bytes({
+        "schema": "stflip-bake-fingerprint",
+        "version": 1,
+        "params": params_payload,
+        "dims": [int(v) for v in dims],
+        "dx": float(dx),
+        "origin": [float(v) for v in origin],
+        "backend": str(backend_name),
+        "source_count": len(sources),
+    }))
+    for index, source in enumerate(sources):
+        descriptor = {
+            key: value for key, value in source.items() if key != "mask"
+        }
+        digest.update(_canonical_json_bytes({
+            "index": index,
+            "descriptor": descriptor,
+        }))
+        _fingerprint_array(
+            digest, f"source[{index}].mask", source["mask"], np.uint8)
+    if solid_sdf is None:
+        digest.update(b"solid_sdf:none")
+    else:
+        _fingerprint_array(digest, "solid_sdf", solid_sdf, np.float32)
+    if solid_node_sdf is None:
+        digest.update(b"solid_node_sdf:none")
+    else:
+        _fingerprint_array(
+            digest, "solid_node_sdf", solid_node_sdf, np.float32)
+    return digest.hexdigest()
+
+
+def fingerprint_matches(expected, actual) -> bool:
+    """Constant-time comparison for validated SHA-256 bake fingerprints."""
+    if not isinstance(expected, str) or not isinstance(actual, str):
+        return False
+    if len(expected) != 64 or len(actual) != 64:
+        return False
+    return hmac.compare_digest(expected, actual)
+
+
+def validate_resume_metadata(
+    metadata,
+    expected_fingerprint: str,
+    frame_start: int,
+    frame_end: int,
+) -> int:
+    """Validate the atomic commit marker and return its latest frame."""
+    if not isinstance(metadata, dict):
+        raise ValueError("cache metadata is missing or corrupt")
+    stored_start = metadata.get("frame_start")
+    latest = metadata.get("frame_end_baked")
+    if (isinstance(stored_start, bool) or not isinstance(stored_start, int)
+            or isinstance(latest, bool) or not isinstance(latest, int)
+            or stored_start != int(frame_start) or latest < stored_start):
+        raise ValueError("cache frame commit range is incompatible")
+    if int(frame_end) <= latest:
+        raise ValueError(
+            f"extend Scene End beyond committed frame {latest} before resuming")
+    checkpoint = metadata.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        raise ValueError("cache has no resumable checkpoint metadata")
+    if (checkpoint.get("schema") != cache.CHECKPOINT_SCHEMA
+            or checkpoint.get("version") != cache.CHECKPOINT_VERSION):
+        raise ValueError("cache checkpoint schema is unsupported")
+    if checkpoint.get("latest_frame") != latest:
+        raise ValueError("cache checkpoint commit marker is inconsistent")
+    if not fingerprint_matches(
+            checkpoint.get("fingerprint"), expected_fingerprint):
+        raise ValueError(
+            "simulation inputs changed since the checkpoint was created")
+    state = checkpoint.get("state")
+    if state not in {"RUNNING", "COMPLETE", "CANCELLED", "FAILED"}:
+        raise ValueError("cache checkpoint lifecycle state is invalid")
+    return latest
+
+
+def _set_bake_lifecycle(settings, state: str, status: str, *,
+                        error: str = "", progress: float | None = None) -> None:
+    """Update the durable UI-facing bake state as one coherent snapshot."""
+    settings.bake_state = state
+    settings.bake_status = status
+    settings.bake_error = error
+    if progress is not None:
+        settings.bake_progress = min(1.0, max(0.0, float(progress)))
+
+
+def _fail_bake(settings, message: str) -> None:
+    _set_bake_lifecycle(
+        settings, "FAILED", f"Bake failed: {message}", error=message)
+
+
+def _source_mask(obj, depsgraph, origin, dx, dims, not_solid=None):
+    """Voxelize one source and return a validated bool mask and cell count."""
+    mask = np.asarray(
+        voxelize.mask_from_object(obj, depsgraph, origin, dx, dims),
+        dtype=bool,
+    )
+    if mask.shape != tuple(dims):
+        raise ValueError(
+            f"{obj.name}: voxel mask shape {mask.shape!r} does not match "
+            f"domain grid {tuple(dims)!r}")
+    if not_solid is not None:
+        mask &= np.asarray(not_solid, dtype=bool)
+    return mask, int(np.count_nonzero(mask))
+
+
+def _solver_params(settings, dims, dx, gravity, fps):
+    """Translate Blender controls to the bpy-free solver parameter object."""
+    return Params(
+        resolution=dims,
+        dx=dx,
+        gravity=gravity,
+        frame_dt=1.0 / fps,
+        cfl_target=settings.cfl_target,
+        particles_per_cell=settings.particles_per_cell,
+        seed=settings.seed,
+        flip_blend=settings.flip_blend,
+        st_enabled=settings.st_enabled,
+        jitter_strength=settings.jitter_strength,
+        adaptive_gamma=settings.adaptive_gamma,
+        eta_phi=settings.eta_phi,
+        rho=settings.density,
+        cfl_local=settings.local_cfl,
+        pcg_tol=settings.pcg_tolerance,
+        pcg_max_iter=settings.pcg_max_iterations,
+        eps_rho_rel=settings.density_floor_relative,
+    )
+
+
+def _scene_setup_provenance(scene):
+    if scene.get("stflip_setup") != "WHIRLPOOL_PREVIEW_APPROXIMATE":
+        return None
+    return {
+        "kind": "WHIRLPOOL_PREVIEW_APPROXIMATE",
+        "exact_reproduction": False,
+        "published_constraints": {
+            "domain_dimensions_m": [200.0, 200.0, 80.0],
+            "outlet_diameter_m": 20.0,
+            "outlet_length_m": 10.0,
+            "angular_speed_radians_per_second": 0.1,
+        },
+        "preview_resolution_longest_axis": int(scene.stflip.resolution),
+        "limitations": [
+            "preview resolution and particle count",
+            "initial water fill height is an explicit preview choice",
+            "outlet pressure uses the boundary footprint; the authored "
+            "10 m pipe length is reference geometry, not a simulated conduit",
+            "Blender Laplacian surfacing is not paper MCF reconstruction",
+            "unpublished production-scene details are not inferred",
+        ],
+    }
 
 
 def _fluid_objects(scene, role: str):
@@ -569,6 +777,38 @@ def _set_surface_enabled(obj, enabled: bool) -> None:
         modifier.show_render = enabled
 
 
+def _remove_generated_setup_objects(scene) -> int:
+    """Replace only objects authored by this add-on's one-click setups."""
+    removed = 0
+    for obj in list(scene.objects):
+        try:
+            generated = bool(obj.get(_SETUP_OBJECT_KEY, ""))
+        except (AttributeError, ReferenceError, TypeError):
+            generated = False
+        if not generated:
+            continue
+        try:
+            users_scene = list(obj.users_scene)
+        except (AttributeError, ReferenceError, TypeError):
+            users_scene = [scene]
+        if len(users_scene) <= 1:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        else:
+            try:
+                if obj.name in scene.collection.objects:
+                    scene.collection.objects.unlink(obj)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                continue
+        removed += 1
+    for key in ("stflip_setup", "stflip_paper_reference"):
+        try:
+            if key in scene:
+                del scene[key]
+        except (AttributeError, KeyError, ReferenceError, TypeError):
+            pass
+    return removed
+
+
 class STFLIP_OT_quick_setup(bpy.types.Operator):
     """Create a ready-to-bake dam-break scene (domain, liquid, roles)"""
     bl_idname = "stflip.quick_setup"
@@ -576,13 +816,18 @@ class STFLIP_OT_quick_setup(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
+        if _BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake first")
+            return {"CANCELLED"}
         scene = context.scene
+        _remove_generated_setup_objects(scene)
 
         bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0, 0, 1))
         domain = context.active_object
         domain.name = "STFLIP Domain"
         domain.display_type = "WIRE"
         domain.hide_render = True
+        domain[_SETUP_OBJECT_KEY] = "DAM_BREAK"
 
         bpy.ops.mesh.primitive_cube_add(size=2.0, location=(-0.65, 0, 0.55))
         liquid = context.active_object
@@ -591,9 +836,106 @@ class STFLIP_OT_quick_setup(bpy.types.Operator):
         liquid.display_type = "WIRE"
         liquid.hide_render = True
         liquid.stflip.role = "LIQUID"
+        liquid[_SETUP_OBJECT_KEY] = "DAM_BREAK"
 
         scene.stflip.domain = domain
+        scene.frame_start = 1
+        scene.frame_end = 48
         self.report({"INFO"}, "Dam-break scene created; press Bake")
+        return {"FINISHED"}
+
+
+class STFLIP_OT_whirlpool_preview(bpy.types.Operator):
+    """Create a practical approximation of the paper's whirlpool scene."""
+    bl_idname = "stflip.whirlpool_preview"
+    bl_label = "Whirlpool Preview (Approx.)"
+    bl_description = (
+        "Create the paper's published 200 x 200 x 80 m proportions, 20 m "
+        "diameter x 10 m outlet, and 0.1 rad/s rotation at preview resolution; "
+        "this is not the paper's exact production scene or MCF reconstruction"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if _BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake first")
+            return {"CANCELLED"}
+        scene = context.scene
+        _remove_generated_setup_objects(scene)
+
+        scene.unit_settings.system = "METRIC"
+        scene.unit_settings.scale_length = 1.0
+        scene.gravity = (0.0, 0.0, -9.81)
+        scene.use_gravity = True
+
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 40.0))
+        domain = context.active_object
+        domain.name = "STFLIP Whirlpool Preview Domain 200x200x80m"
+        domain.scale = (100.0, 100.0, 40.0)
+        domain.display_type = "WIRE"
+        domain.hide_render = True
+        domain[_SETUP_OBJECT_KEY] = "WHIRLPOOL"
+        domain["stflip_paper_dimensions_m"] = (200.0, 200.0, 80.0)
+
+        # Leave a bottom clearance and an explicit air band above the water.
+        # The paper does not publish its initial fill height; keeping several
+        # preview cells empty makes the free surface visible without claiming
+        # that this inferred height reproduces the production scene.
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 34.5))
+        liquid = context.active_object
+        liquid.name = "STFLIP Whirlpool Preview Liquid"
+        liquid.scale = (99.0, 99.0, 33.5)
+        liquid.display_type = "WIRE"
+        liquid.hide_render = True
+        liquid.stflip.role = "LIQUID"
+        liquid[_SETUP_OBJECT_KEY] = "WHIRLPOOL"
+        liquid.stflip.initial_velocity_mode = "SOLID_BODY"
+        liquid.stflip.initial_velocity = (0.0, 0.0, 0.0)
+        liquid.stflip.rotation_center_world = (0.0, 0.0, 0.0)
+        liquid.stflip.rotation_axis_world = (0.0, 0.0, 1.0)
+        liquid.stflip.angular_speed = 0.1
+
+        # The paper describes a centered bottom pipe. The mesh preserves its
+        # published 10 m reference length, while the pressure solver uses only
+        # its circular footprint on the exterior boundary (not conduit flow).
+        bpy.ops.mesh.primitive_cylinder_add(
+            vertices=64, radius=10.0, depth=10.0,
+            location=(0.0, 0.0, 5.0),
+        )
+        outlet = context.active_object
+        outlet.name = "STFLIP Whirlpool Preview Outlet D20x10m"
+        outlet.display_type = "WIRE"
+        outlet.hide_render = True
+        outlet.stflip.role = "OUTFLOW"
+        outlet.stflip.outflow_mode = "PRESSURE"
+        outlet[_SETUP_OBJECT_KEY] = "WHIRLPOOL"
+        outlet["stflip_paper_pipe_diameter_m"] = 20.0
+        outlet["stflip_paper_pipe_length_m"] = 10.0
+
+        settings = scene.stflip
+        settings.domain = domain
+        settings.resolution = 48
+        settings.particles_per_cell = 4
+        settings.cfl_target = 15.0
+        settings.create_surface = True
+        scene.frame_start = 1
+        scene.frame_end = 48
+        scene["stflip_setup"] = "WHIRLPOOL_PREVIEW_APPROXIMATE"
+        scene["stflip_paper_reference"] = (
+            "Whirlpool: 200x200x80 m, D20x10 m bottom outlet, omega=0.1 rad/s"
+        )
+        _set_bake_lifecycle(
+            settings,
+            "IDLE",
+            "Approx. whirlpool preview created; review settings, then Bake",
+            progress=0.0,
+        )
+        self.report(
+            {"INFO"},
+            "Approximate whirlpool preview created at 48-cell resolution; "
+            "published geometry/rotation retained, production scale and MCF "
+            "surface reconstruction are not reproduced",
+        )
         return {"FINISHED"}
 
 
@@ -604,24 +946,50 @@ class STFLIP_OT_bake(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     _timer = None
+    _is_resume = False
 
     def _setup(self, context) -> bool:
-        """Voxelize the scene, build the solver, write the first frame.
-        Returns False (after self.report) if the bake cannot start."""
+        """Voxelize inputs and start a new bake or restore a committed one."""
         scene = context.scene
         st = scene.stflip
+        is_resume = bool(self._is_resume)
         if _BAKE.get("running"):
             self.report({"WARNING"}, "A bake is already running")
             return False
         if st.domain is None:
-            self.report({"ERROR"}, "Set a domain object first")
+            message = "Set a domain object first"
+            _fail_bake(st, message)
+            self.report({"ERROR"}, message)
             return False
+        if relative_cache_needs_saved_blend(
+                st.cache_dir, getattr(bpy.data, "filepath", "")):
+            message = (
+                "Save the .blend before baking with a relative cache, or "
+                "choose an absolute Cache Directory"
+            )
+            _fail_bake(st, message)
+            self.report({"ERROR"}, message)
+            return False
+
+        # Geometry, modifiers and animated transforms must all be evaluated at
+        # the cache's first frame.  Doing this before obtaining the depsgraph
+        # prevents a bake launched from another timeline frame from capturing
+        # the wrong source shapes.
+        scene.frame_set(scene.frame_start)
+        _set_bake_lifecycle(
+            st, "RUNNING",
+            "Preparing resume..." if is_resume else "Preparing bake...",
+            progress=0.0,
+        )
 
         liquids = _fluid_objects(scene, "LIQUID")
         inflows = _fluid_objects(scene, "INFLOW")
+        outflows = _fluid_objects(scene, "OUTFLOW")
         obstacles = _fluid_objects(scene, "OBSTACLE")
         if not liquids and not inflows:
-            self.report({"ERROR"}, "Mark at least one mesh as Liquid or Inflow")
+            message = "Mark at least one mesh as Liquid or Inflow"
+            _fail_bake(st, message)
+            self.report({"ERROR"}, message)
             return False
 
         deps = context.evaluated_depsgraph_get()
@@ -637,20 +1005,12 @@ class STFLIP_OT_bake(bpy.types.Operator):
             ]
         except ValueError as exc:
             message = str(exc)
-            st.bake_status = f"Bake blocked: {message}"
+            _fail_bake(st, message)
             self.report({"ERROR"}, message)
             return False
         fps = scene.render.fps / scene.render.fps_base
         gravity = tuple(scene.gravity) if scene.use_gravity else (0.0, 0.0, 0.0)
-        params = Params(
-            resolution=dims, dx=dx, gravity=gravity,
-            frame_dt=1.0 / fps, cfl_target=st.cfl_target,
-            particles_per_cell=st.particles_per_cell,
-            seed=st.seed,
-            flip_blend=st.flip_blend, st_enabled=st.st_enabled,
-            jitter_strength=st.jitter_strength,
-            adaptive_gamma=st.adaptive_gamma, eta_phi=st.eta_phi,
-        )
+        params = _solver_params(st, dims, dx, gravity, fps)
 
         cuda_state = ({"available": False, "device": "",
                        "free_bytes": None, "total_bytes": None, "error": ""}
@@ -679,7 +1039,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
             else:
                 memory_reason = f"{memory_reason} {cpu_reason}"
         if memory_reason:
-            st.bake_status = f"Bake blocked: {memory_reason}"
+            _fail_bake(st, memory_reason)
             self.report({"ERROR"}, memory_reason)
             return False
 
@@ -694,7 +1054,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 message = (
                     f"CUDA solver initialization failed ({exc}), and CPU "
                     f"fallback is unsafe: {cpu_reason}")
-                st.bake_status = f"Bake blocked: {message}"
+                _fail_bake(st, message)
                 self.report({"ERROR"}, message)
                 return False
             self.report({"WARNING"},
@@ -720,26 +1080,138 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
         not_solid = (solid_sdf > 0.0) if solid_sdf is not None else None
         seeded = 0
-        for obj, velocity_field, _descriptor in liquid_velocity_sources:
-            mask = voxelize.mask_from_object(obj, deps, origin, dx, dims)
-            if not_solid is not None:
-                mask &= not_solid
-            seeded += solver.add_liquid_mask(
-                mask, velocity_field)
+        liquid_records = []
+        fingerprint_sources = []
+        for obj, velocity_field, descriptor in liquid_velocity_sources:
+            mask, cell_count = _source_mask(
+                obj, deps, origin, dx, dims, not_solid)
+            descriptor = {**descriptor, "cell_count": cell_count}
+            liquid_records.append(descriptor)
+            fingerprint_sources.append({
+                "role": "LIQUID",
+                "velocity": {
+                    key: value for key, value in descriptor.items()
+                    if key not in {"name", "cell_count"}
+                },
+                "mask": mask,
+            })
+            if cell_count == 0:
+                self.report(
+                    {"WARNING"},
+                    f"Liquid {obj.name!r} covers no usable domain cells",
+                )
+                continue
+            if not is_resume:
+                seeded += solver.add_liquid_mask(mask, velocity_field)
+
+        inflow_records = []
+        active_inflow_cells = 0
         for obj in inflows:
-            mask = voxelize.mask_from_object(obj, deps, origin, dx, dims)
-            if not_solid is not None:
-                mask &= not_solid
+            mask, cell_count = _source_mask(
+                obj, deps, origin, dx, dims, not_solid)
+            inflow_records.append({
+                "name": obj.name,
+                "velocity": list(obj.stflip.inflow_velocity),
+                "cell_count": cell_count,
+            })
+            fingerprint_sources.append({
+                "role": "INFLOW",
+                "velocity": list(obj.stflip.inflow_velocity),
+                "mask": mask,
+            })
+            if cell_count == 0:
+                self.report(
+                    {"WARNING"},
+                    f"Inflow {obj.name!r} covers no usable domain cells",
+                )
+                continue
             solver.add_inflow(mask, tuple(obj.stflip.inflow_velocity))
-        if seeded == 0 and not inflows:
-            self.report({"ERROR"}, "No liquid cells inside the domain")
+            active_inflow_cells += cell_count
+
+        outflow_records = []
+        for obj in outflows:
+            mask, cell_count = _source_mask(
+                obj, deps, origin, dx, dims, not_solid)
+            mode = str(obj.stflip.outflow_mode)
+            if mode not in {"VOLUME", "PRESSURE"}:
+                raise ValueError(
+                    f"{obj.name}: unsupported Outflow Mode {mode!r}")
+            outflow_records.append({
+                "name": obj.name,
+                "mode": mode,
+                "cell_count": cell_count,
+            })
+            fingerprint_sources.append({
+                "role": "OUTFLOW",
+                "mode": mode,
+                "mask": mask,
+            })
+            if cell_count == 0:
+                self.report(
+                    {"WARNING"},
+                    f"Outflow {obj.name!r} covers no usable domain cells",
+                )
+                continue
+            solver.add_outflow(mask, mode=mode)
+
+        initial_outflow_cull = (
+            solver.cull_outflows() if not is_resume else {})
+        seeded = int(solver.pos.shape[0])
+        if not is_resume and seeded == 0 and active_inflow_cells == 0:
+            message = "No usable Liquid or Inflow cells exist inside the domain"
+            _fail_bake(st, message)
+            self.report({"ERROR"}, message)
             return False
 
+        # Only clear a previous cache after every source has been validated and
+        # integrated into a live solver.  A bad/empty source therefore cannot
+        # destroy the user's last usable bake.
         cache_dir = resolve_cache_dir(scene)
-        cache.clear(cache_dir)
+        ensure_cache_id = getattr(handlers, "ensure_scene_cache_id", None)
+        cache_owner_id = (
+            ensure_cache_id(scene) if ensure_cache_id is not None
+            else getattr(st, "cache_id", "")
+        )
+        ownership_check = getattr(handlers, "scene_cache_ownership", None)
+        ownership = (
+            ownership_check(scene) if ownership_check is not None else "missing"
+        )
+        refused_ownership = (
+            ownership != "owned" if is_resume
+            else ownership in {"foreign", "invalid"}
+        )
+        if refused_ownership:
+            message = (
+                f"Cache ownership is {ownership}; "
+                + ("resume requires the scene that created this checkpoint"
+                   if is_resume else
+                   "choose a different Cache Directory or use the scene that "
+                   "created this cache"))
+            _fail_bake(st, message)
+            self.report({"ERROR"}, message)
+            return False
+        fingerprint = simulation_fingerprint(
+            params,
+            dims,
+            dx,
+            origin,
+            backend.name,
+            fingerprint_sources,
+            solid_sdf,
+            solid_node_sdf,
+        )
+        existing_meta = cache.read_meta(cache_dir)
+        if not is_resume:
+            cache.clear(cache_dir)
         from ..stflip import __version__ as stflip_version
 
-        meta = {
+        if (is_resume and isinstance(existing_meta, dict)
+                and existing_meta.get("addon_version") != stflip_version):
+            raise ValueError(
+                "checkpoint was created by a different ST-FLIP add-on "
+                "version; rebake with the current version")
+
+        new_meta = {
             "frame_start": scene.frame_start,
             "frame_end": scene.frame_end,
             "frame_end_baked": scene.frame_start,
@@ -748,11 +1220,13 @@ class STFLIP_OT_bake(bpy.types.Operator):
             "backend": backend.name,
             "cuda_device": cuda_device,
             "addon_version": stflip_version,
+            "cache_owner_id": cache_owner_id,
             "scene_units": {
                 "length_unit": "blender_unit",
                 "system": scene.unit_settings.system,
                 "scale_length": scene.unit_settings.scale_length,
             },
+            "scene_setup": _scene_setup_provenance(scene),
             "experiment_profile": None,
             "settings": {
                 "resolution": st.resolution,
@@ -776,47 +1250,138 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "create_surface": st.create_surface,
                 "surface_particle_radius_dx": st.particle_radius,
                 "surface_voxel_size_dx": st.surface_voxel,
+                "surface_geometric_smoothing": st.surface_smoothing,
+                "surface_smoothing_iterations": (
+                    st.surface_smoothing_iterations),
+                "surface_smoothing_factor": st.surface_smoothing_factor,
                 "collect_metrics": st.collect_metrics,
                 "collect_enstrophy": bool(
                     st.collect_metrics and st.collect_enstrophy),
             },
-            "liquid_sources": [
-                descriptor
-                for _obj, _field, descriptor in liquid_velocity_sources
-            ],
-            "inflow_sources": [
-                {"name": obj.name,
-                 "velocity": list(obj.stflip.inflow_velocity)}
-                for obj in inflows
-            ],
+            "liquid_sources": liquid_records,
+            "inflow_sources": inflow_records,
+            "outflow_sources": outflow_records,
+            "outflow": {
+                "source_count": len(outflow_records),
+                "initial_cull": initial_outflow_cull,
+                **solver.outflow_stats(),
+            },
             "solid_boundary": {
                 **solver.solid_aperture_stats(),
                 "obstacle_count": len(obstacles),
             },
-            "version": 4,
+            "checkpoint": {
+                "schema": cache.CHECKPOINT_SCHEMA,
+                "version": cache.CHECKPOINT_VERSION,
+                "fingerprint": fingerprint,
+                "latest_frame": scene.frame_start,
+                "state": "RUNNING",
+            },
+            "bake_lifecycle": {
+                "state": "RUNNING",
+                "last_committed_frame": scene.frame_start,
+                "error": "",
+            },
+            "version": 5,
         }
         from ..stflip.experiments import profile_provenance
 
-        meta["experiment_profile"] = profile_provenance(
+        new_meta["experiment_profile"] = profile_provenance(
             st.experiment_profile, st)
         if st.collect_metrics:
             from ..stflip.metrics import METRICS_SCHEMA, SCHEMA_VERSION
 
-            meta["metrics"] = {
+            new_meta["metrics"] = {
                 "schema": METRICS_SCHEMA,
                 "version": SCHEMA_VERSION,
                 "file": cache.METRICS_NAME,
                 "enstrophy_enabled": st.collect_enstrophy,
             }
 
-        pos, vel = solver.get_render_particles()
-        cache.write_frame(cache_dir, scene.frame_start,
-                          pos + origin[None, :].astype(np.float32), vel)
-        if st.collect_metrics:
-            record = _measure_output_frame(
-                scene.frame_start, solver, None, pos, vel, None, False)
-            cache.append_metric(cache_dir, record)
-        cache.write_meta(cache_dir, meta)
+        if is_resume:
+            latest_frame = validate_resume_metadata(
+                existing_meta,
+                fingerprint,
+                scene.frame_start,
+                scene.frame_end,
+            )
+            if cache.read_frame(cache_dir, latest_frame) is None:
+                raise ValueError(
+                    f"committed output frame {latest_frame} is missing or corrupt")
+            checkpoint_state = cache.read_checkpoint(
+                cache_dir,
+                latest_frame,
+                expected_fingerprint=fingerprint,
+            )
+            if checkpoint_state is None:
+                raise ValueError(
+                    f"solver checkpoint for frame {latest_frame} is missing")
+            expected_time = (
+                latest_frame - int(scene.frame_start)) * params.frame_dt
+            if not math.isclose(
+                    float(checkpoint_state["time"]), expected_time,
+                    rel_tol=1e-10, abs_tol=1e-9):
+                raise ValueError(
+                    f"solver checkpoint for frame {latest_frame} has an "
+                    "incompatible simulation clock")
+            solver.restore_state(checkpoint_state)
+            seeded = int(solver.pos.shape[0])
+            meta = existing_meta
+            meta["frame_end"] = scene.frame_end
+            meta["checkpoint"]["state"] = "RUNNING"
+            meta["bake_lifecycle"] = {
+                "state": "RUNNING",
+                "last_committed_frame": latest_frame,
+                "error": "",
+            }
+            collect_metrics = isinstance(meta.get("metrics"), dict)
+            collect_enstrophy = bool(
+                collect_metrics
+                and meta["metrics"].get("enstrophy_enabled", False))
+            cache.write_meta(cache_dir, meta)
+            current_frame = latest_frame
+        else:
+            meta = new_meta
+            current_frame = scene.frame_start
+            collect_metrics = bool(st.collect_metrics)
+            collect_enstrophy = bool(
+                st.collect_metrics and st.collect_enstrophy)
+            pos, vel = solver.get_render_particles()
+            cache.write_frame(
+                cache_dir,
+                current_frame,
+                pos + origin[None, :].astype(np.float32),
+                vel,
+            )
+            cache.write_checkpoint(
+                cache_dir,
+                current_frame,
+                solver.checkpoint_state(),
+                fingerprint=fingerprint,
+            )
+            if collect_metrics:
+                record = _measure_output_frame(
+                    current_frame, solver, None, pos, vel, None, False)
+                cache.append_metric(cache_dir, record)
+            # The metadata is the commit marker: a crash before this write
+            # leaves the frame/checkpoint pair outside the committed range.
+            cache.write_meta(cache_dir, meta)
+
+        _BAKE.update(
+            solver=solver,
+            origin=origin.astype(np.float32),
+            scene=scene,
+            cache_dir=cache_dir,
+            meta=meta,
+            frame=current_frame,
+            end=scene.frame_end,
+            backend_label=backend_label,
+            collect_metrics=collect_metrics,
+            collect_enstrophy=collect_enstrophy,
+            running=True,
+            cancel_requested=False,
+            resumed=is_resume,
+        )
 
         particle_obj = mesher.ensure_particle_object(
             existing_obj=st.particle_object)
@@ -825,6 +1390,12 @@ class STFLIP_OT_bake(bpy.types.Operator):
             st.surface_object = mesher.ensure_surface_object(
                 particle_obj, dx, st.particle_radius, st.surface_voxel,
                 existing_obj=st.surface_object)
+            mesher.configure_surface_smoothing(
+                st.surface_object,
+                st.surface_smoothing,
+                st.surface_smoothing_iterations,
+                st.surface_smoothing_factor,
+            )
             _set_surface_enabled(st.surface_object, True)
         else:
             stale_surface = st.surface_object
@@ -834,25 +1405,32 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 if candidate is not None and candidate.name in scene.objects:
                     stale_surface = candidate
                     st.surface_object = candidate
+            stale_surface = mesher.scene_exclusive_output(
+                scene, stale_surface)
+            if stale_surface is None:
+                st.surface_object = None
             _set_surface_enabled(stale_surface, False)
         handlers.ensure_registered()
 
-        _BAKE.update(solver=solver, origin=origin.astype(np.float32),
-                     cache_dir=cache_dir, meta=meta,
-                     frame=scene.frame_start, end=scene.frame_end,
-                     backend_label=backend_label,
-                     collect_metrics=st.collect_metrics,
-                     collect_enstrophy=(st.collect_metrics
-                                        and st.collect_enstrophy),
-                     running=True)
-        scene.frame_set(scene.frame_start)
-        st.bake_status = (
-            f"Baking on {backend_label}: {seeded} particles seeded...")
+        scene.frame_set(current_frame)
+        completed_span = max(0, current_frame - scene.frame_start)
+        total_span = max(1, scene.frame_end - scene.frame_start)
+        _set_bake_lifecycle(
+            st,
+            "RUNNING",
+            (f"Resuming after frame {current_frame} on {backend_label}..."
+             if is_resume else
+             f"Baking on {backend_label}: {seeded} particles seeded..."),
+            progress=completed_span / total_span,
+        )
         return True
 
-    def _bake_next_frame(self, scene) -> bool:
+    def _bake_next_frame(self, scene=None) -> bool:
         """Advance one frame; returns True while frames remain."""
         b = _BAKE
+        scene = b.get("scene", scene)
+        if scene is None:
+            raise RuntimeError("owning bake scene is no longer available")
         if b["frame"] >= b["end"]:
             return False
         solver: STFLIPSolver = b["solver"]
@@ -867,6 +1445,12 @@ class STFLIP_OT_bake(bpy.types.Operator):
         pos, vel = solver.get_render_particles()
         cache.write_frame(b["cache_dir"], b["frame"],
                           pos + b["origin"][None, :], vel)
+        cache.write_checkpoint(
+            b["cache_dir"],
+            b["frame"],
+            solver.checkpoint_state(),
+            fingerprint=b["meta"]["checkpoint"]["fingerprint"],
+        )
         if b.get("collect_metrics"):
             record = _measure_output_frame(
                 b["frame"], solver, stats, pos, vel, compute_wall_s,
@@ -874,11 +1458,36 @@ class STFLIP_OT_bake(bpy.types.Operator):
             )
             cache.append_metric(b["cache_dir"], record)
         b["meta"]["frame_end_baked"] = b["frame"]
+        b["meta"]["checkpoint"].update({
+            "latest_frame": b["frame"],
+            "state": "RUNNING",
+        })
+        b["meta"]["bake_lifecycle"] = {
+            "state": "RUNNING",
+            "last_committed_frame": b["frame"],
+            "error": "",
+        }
+        if "outflow" in b["meta"]:
+            source_count = b["meta"]["outflow"].get("source_count", 0)
+            initial_cull = b["meta"]["outflow"].get("initial_cull", {})
+            b["meta"]["outflow"] = {
+                "source_count": source_count,
+                "initial_cull": initial_cull,
+                **solver.outflow_stats(),
+            }
         cache.write_meta(b["cache_dir"], b["meta"])
-        scene.stflip.bake_status = (
+        span = max(1, b["end"] - b["meta"]["frame_start"])
+        progress = (b["frame"] - b["meta"]["frame_start"]) / span
+        removed = int(getattr(stats, "particles_removed", 0))
+        _set_bake_lifecycle(
+            scene.stflip,
+            "RUNNING",
             f"Frame {b['frame']}/{b['end']}  "
             f"({stats.n_particles} pts, {stats.steps} steps, "
-            f"{b.get('backend_label', solver.be.name)})")
+            f"{removed} removed, "
+            f"{b.get('backend_label', solver.be.name)})",
+            progress=progress,
+        )
         scene.frame_set(b["frame"])
         return b["frame"] < b["end"]
 
@@ -887,8 +1496,11 @@ class STFLIP_OT_bake(bpy.types.Operator):
             if not self._setup(context):
                 return {"CANCELLED"}
         except Exception as exc:
-            _BAKE["running"] = False
             self.report({"ERROR"}, f"Bake setup failed: {exc}")
+            if _BAKE.get("meta") is not None:
+                return self._finish(context, "FAILED", error=str(exc))
+            _BAKE.clear()
+            _fail_bake(context.scene.stflip, str(exc))
             return {"CANCELLED"}
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.01, window=context.window)
@@ -900,51 +1512,201 @@ class STFLIP_OT_bake(bpy.types.Operator):
         try:
             if not self._setup(context):
                 return {"CANCELLED"}
-            while self._bake_next_frame(context.scene):
+            while self._bake_next_frame():
                 pass
         except Exception as exc:
+            scene = _BAKE.get("scene", context.scene)
+            _fail_bake(scene.stflip, str(exc))
             self.report({"ERROR"}, f"Bake failed: {exc}")
-            return {"CANCELLED"}
-        finally:
-            _BAKE["running"] = False
-            _BAKE.pop("solver", None)
-        backend_label = _BAKE.get("backend_label", "unknown backend")
-        context.scene.stflip.bake_status = (
-            f"Bake complete ({_BAKE.get('frame', '?')} frames) on "
-            f"{backend_label}")
-        return {"FINISHED"}
+            return self._finish(context, "FAILED", error=str(exc))
+        return self._finish(context, "COMPLETE")
 
     def modal(self, context, event):
         if event.type == "ESC":
-            return self._finish(context, cancelled=True)
+            return self._finish(context, "CANCELLED")
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
+        if _BAKE.get("cancel_requested"):
+            return self._finish(context, "CANCELLED")
         if not _BAKE.get("running"):
-            return self._finish(context, cancelled=True)
+            return self._finish(context, "CANCELLED")
         # Any exception must still tear down the timer and _BAKE state, or
         # baking is bricked for the rest of the session.
         try:
-            more = self._bake_next_frame(context.scene)
+            more = self._bake_next_frame()
         except Exception as exc:
             self.report({"ERROR"}, f"Bake failed: {exc}")
-            return self._finish(context, cancelled=True)
+            return self._finish(context, "FAILED", error=str(exc))
         if not more:
-            return self._finish(context, cancelled=False)
+            return self._finish(context, "COMPLETE")
         return {"RUNNING_MODAL"}
 
-    def _finish(self, context, cancelled: bool):
+    def _finish(self, context, outcome: str, error: str = ""):
         wm = context.window_manager
         if self._timer is not None:
             wm.event_timer_remove(self._timer)
             self._timer = None
-        st = context.scene.stflip
+        scene = _BAKE.get("scene", context.scene)
+        st = scene.stflip
         backend_label = _BAKE.get("backend_label", "unknown backend")
-        st.bake_status = ("Bake cancelled" if cancelled
-                          else f"Bake complete ({_BAKE.get('frame', '?')} "
-                               f"frames) on {backend_label}")
-        _BAKE["running"] = False
-        _BAKE.pop("solver", None)
-        return {"CANCELLED"} if cancelled else {"FINISHED"}
+        meta = _BAKE.get("meta")
+        start = int((meta or {}).get("frame_start", scene.frame_start))
+        committed = int((meta or {}).get("frame_end_baked", start - 1))
+        count = max(0, committed - start + 1)
+        if outcome == "COMPLETE" and committed < int(_BAKE.get("end", committed)):
+            outcome = "FAILED"
+            error = error or "bake ended before the requested frame range"
+        if isinstance(meta, dict):
+            meta["checkpoint"]["state"] = outcome
+            meta["bake_lifecycle"] = {
+                "state": outcome,
+                "last_committed_frame": committed,
+                "error": error if outcome == "FAILED" else "",
+            }
+            try:
+                cache.write_meta(_BAKE["cache_dir"], meta)
+            except Exception as exc:
+                outcome = "FAILED"
+                error = f"could not persist bake lifecycle: {exc}"
+        if outcome == "COMPLETE":
+            _set_bake_lifecycle(
+                st, "COMPLETE",
+                f"Bake complete ({count} frames) on {backend_label}",
+                progress=1.0,
+            )
+        elif outcome == "FAILED":
+            _fail_bake(st, error or "unknown simulation error")
+        else:
+            _set_bake_lifecycle(
+                st, "CANCELLED",
+                f"Bake cancelled after {count} cached frames",
+                progress=st.bake_progress,
+            )
+        result = {"FINISHED"} if outcome == "COMPLETE" else {"CANCELLED"}
+        _BAKE.clear()
+        return result
+
+
+class STFLIP_OT_resume_bake(bpy.types.Operator):
+    """Resume the latest committed checkpoint after re-validating the scene."""
+    bl_idname = "stflip.resume_bake"
+    bl_label = "Resume Bake"
+    bl_options = {"REGISTER"}
+    bl_description = (
+        "Re-voxelize simulation inputs, restore the latest committed solver "
+        "checkpoint, and continue to an extended Scene End frame"
+    )
+    _timer = None
+    _is_resume = True
+
+    # Do not inherit from the registered Bake operator. Blender's RNA
+    # registration treats registered Operator subclasses as runtime types;
+    # registering a second RNA type through that inheritance chain can detach
+    # the base type's execute callback. Thin wrappers share the implementation
+    # while keeping the two Blender operator classes independent.
+    def _setup(self, context) -> bool:
+        return STFLIP_OT_bake._setup(self, context)
+
+    def _bake_next_frame(self, scene=None) -> bool:
+        return STFLIP_OT_bake._bake_next_frame(self, scene)
+
+    def invoke(self, context, event):
+        return STFLIP_OT_bake.invoke(self, context, event)
+
+    def execute(self, context):
+        return STFLIP_OT_bake.execute(self, context)
+
+    def modal(self, context, event):
+        return STFLIP_OT_bake.modal(self, context, event)
+
+    def _finish(self, context, outcome: str, error: str = ""):
+        return STFLIP_OT_bake._finish(self, context, outcome, error)
+
+
+class STFLIP_OT_cancel_bake(bpy.types.Operator):
+    """Request cancellation of the active modal bake."""
+    bl_idname = "stflip.cancel_bake"
+    bl_label = "Cancel Bake"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if not _BAKE.get("running"):
+            self.report({"INFO"}, "No bake is running")
+            return {"CANCELLED"}
+        _BAKE["cancel_requested"] = True
+        scene = _BAKE.get("scene", context.scene)
+        scene.stflip.bake_status = "Cancelling after the current operation..."
+        return {"FINISHED"}
+
+
+class STFLIP_OT_refresh_surface(bpy.types.Operator):
+    """Refresh surfacing controls for an existing valid bake."""
+    bl_idname = "stflip.refresh_surface"
+    bl_label = "Refresh Surface"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if _BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake first")
+            return {"CANCELLED"}
+        scene = context.scene
+        st = scene.stflip
+        ownership_check = getattr(handlers, "scene_cache_ownership", None)
+        ownership = (
+            ownership_check(scene) if ownership_check is not None else "legacy"
+        )
+        if ownership in {"foreign", "invalid", "missing"}:
+            self.report(
+                {"ERROR"},
+                f"Cannot refresh surface: cache ownership is {ownership}",
+            )
+            return {"CANCELLED"}
+        meta = cache.read_meta(resolve_cache_dir(scene))
+        try:
+            dx = float(meta["dx"])
+        except (KeyError, TypeError, ValueError):
+            self.report({"ERROR"}, "Cache metadata has no valid cell size")
+            return {"CANCELLED"}
+        if not math.isfinite(dx) or dx <= 0.0:
+            self.report({"ERROR"}, "Cache metadata has no valid cell size")
+            return {"CANCELLED"}
+
+        reconcile = getattr(handlers, "reconcile_scene_cache", None)
+        if reconcile is not None and not reconcile(scene):
+            self.report(
+                {"ERROR"},
+                "Cannot refresh surface: cached particle frame is unavailable",
+            )
+            return {"CANCELLED"}
+        particle_obj = st.particle_object
+        if particle_obj is None or getattr(particle_obj, "type", None) != "MESH":
+            self.report({"ERROR"}, "Baked particle output is unavailable")
+            return {"CANCELLED"}
+        if not st.create_surface:
+            surface = mesher.scene_exclusive_output(
+                scene, st.surface_object)
+            if surface is None:
+                st.surface_object = None
+            _set_surface_enabled(surface, False)
+            self.report({"INFO"}, "Surface display disabled")
+            return {"FINISHED"}
+
+        st.surface_object = mesher.ensure_surface_object(
+            particle_obj,
+            dx,
+            st.particle_radius,
+            st.surface_voxel,
+            existing_obj=st.surface_object,
+        )
+        mesher.configure_surface_smoothing(
+            st.surface_object,
+            st.surface_smoothing,
+            st.surface_smoothing_iterations,
+            st.surface_smoothing_factor,
+        )
+        _set_surface_enabled(st.surface_object, True)
+        self.report({"INFO"}, "Surface controls refreshed from baked particles")
+        return {"FINISHED"}
 
 
 class STFLIP_OT_free_bake(bpy.types.Operator):
@@ -954,11 +1716,26 @@ class STFLIP_OT_free_bake(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        if _BAKE.get("running"):
-            self.report({"WARNING"}, "Stop the running bake first (Esc)")
+        scene = context.scene
+        ensure_cache_id = getattr(handlers, "ensure_scene_cache_id", None)
+        if ensure_cache_id is not None:
+            ensure_cache_id(scene)
+        ownership_check = getattr(handlers, "scene_cache_ownership", None)
+        ownership = (
+            ownership_check(scene) if ownership_check is not None else "legacy"
+        )
+        if ownership in {"foreign", "invalid"}:
+            self.report(
+                {"ERROR"},
+                f"Refusing to delete a {ownership} cache",
+            )
             return {"CANCELLED"}
-        n = cache.clear(resolve_cache_dir(context.scene))
-        context.scene.stflip.bake_status = ""
+        n = cache.clear(resolve_cache_dir(scene))
+        clear_output = getattr(handlers, "clear_scene_output", None)
+        if clear_output is not None:
+            clear_output(scene)
+        _set_bake_lifecycle(
+            scene.stflip, "IDLE", "", progress=0.0)
         self.report({"INFO"}, f"Removed {n} cache files")
         return {"FINISHED"}
 
@@ -1066,7 +1843,11 @@ class STFLIP_OT_install_gpu(bpy.types.Operator):
 
 CLASSES = (
     STFLIP_OT_quick_setup,
+    STFLIP_OT_whirlpool_preview,
     STFLIP_OT_bake,
+    STFLIP_OT_resume_bake,
+    STFLIP_OT_cancel_bake,
+    STFLIP_OT_refresh_surface,
     STFLIP_OT_free_bake,
     STFLIP_OT_install_gpu,
 )

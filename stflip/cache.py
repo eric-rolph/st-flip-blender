@@ -6,6 +6,7 @@ import csv
 import json
 from numbers import Integral
 import os
+import re
 import tempfile
 
 import numpy as np
@@ -19,6 +20,61 @@ from .metrics import (
 
 META_NAME = "stflip_meta.json"
 METRICS_NAME = "stflip_metrics.jsonl"
+CHECKPOINT_SCHEMA = "stflip-solver-checkpoint"
+CHECKPOINT_VERSION = 1
+
+_FRAME_RE = re.compile(r"^stflip_(-?\d+)\.npz$")
+_CHECKPOINT_RE = re.compile(r"^stflip_checkpoint_(-?\d+)\.npz$")
+_CHECKPOINT_KEYS = frozenset({
+    "schema",
+    "version",
+    "frame",
+    "fingerprint",
+    "pos",
+    "vel",
+    "dt_resid",
+    "time",
+    "dt_prev",
+    "rng_state_json",
+    "outflow_removed_total",
+    "volume_outflow_removed_total",
+    "pressure_outflow_removed_total",
+})
+_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+
+OWNER_KEY = "cache_owner_id"
+OWNERSHIP_OWNED = "owned"
+OWNERSHIP_LEGACY = "legacy"
+OWNERSHIP_FOREIGN = "foreign"
+OWNERSHIP_INVALID = "invalid"
+OWNERSHIP_MISSING = "missing"
+
+
+def ownership_status(metadata: dict | None, expected_owner_id: str) -> str:
+    """Classify cache metadata relative to one scene's persistent owner ID.
+
+    ``owned`` means a non-empty owner is an exact match. ``legacy`` means the
+    metadata predates ownership IDs and is safe to read for compatibility.
+    ``foreign`` is a valid, non-empty owner belonging to another scene.
+    ``invalid`` covers malformed owner fields or a missing expected ID, while
+    ``missing`` means there is no metadata mapping to authorize at all.
+
+    Callers may read ``owned`` and ``legacy`` caches. Destructive operations
+    should refuse ``foreign`` and ``invalid`` so a custom path shared by two
+    scenes cannot delete the other scene's bake.
+    """
+    if not isinstance(metadata, dict):
+        return OWNERSHIP_MISSING
+    if not isinstance(expected_owner_id, str) or not expected_owner_id.strip():
+        return OWNERSHIP_INVALID
+    if OWNER_KEY not in metadata:
+        return OWNERSHIP_LEGACY
+    recorded = metadata[OWNER_KEY]
+    if not isinstance(recorded, str) or not recorded.strip():
+        return OWNERSHIP_INVALID
+    if recorded.strip() == expected_owner_id.strip():
+        return OWNERSHIP_OWNED
+    return OWNERSHIP_FOREIGN
 
 
 def _atomic_path(cache_dir: str, suffix: str):
@@ -31,6 +87,13 @@ def _atomic_path(cache_dir: str, suffix: str):
 
 def frame_path(cache_dir: str, frame: int) -> str:
     return os.path.join(cache_dir, f"stflip_{frame:06d}.npz")
+
+
+def checkpoint_path(cache_dir: str, frame: int) -> str:
+    """Return the raw, restart-capable solver checkpoint path for ``frame``."""
+    if isinstance(frame, bool) or not isinstance(frame, Integral):
+        raise ValueError("checkpoint frame must be an integer")
+    return os.path.join(cache_dir, f"stflip_checkpoint_{int(frame):06d}.npz")
 
 
 def metrics_path(cache_dir: str) -> str:
@@ -74,6 +137,239 @@ def read_frame(cache_dir: str, frame: int):
             return positions, velocities
     except (OSError, TypeError, ValueError, KeyError):
         return None
+
+
+class CheckpointError(ValueError):
+    """A checkpoint exists but cannot safely restore solver state."""
+
+
+def _checkpoint_array(value, shape, name: str) -> np.ndarray:
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise CheckpointError(f"checkpoint {name} is not a numeric array") from exc
+    if array.shape != shape or array.dtype != np.dtype(np.float32):
+        raise CheckpointError(
+            f"checkpoint {name} must be float32 with shape {shape}")
+    if not bool(np.all(np.isfinite(array))):
+        raise CheckpointError(f"checkpoint {name} contains non-finite values")
+    return np.array(array, dtype=np.float32, order="C", copy=True)
+
+
+def _checkpoint_scalar(value, name: str) -> float:
+    array = np.asarray(value)
+    if array.shape != () or array.dtype != np.dtype(np.float64):
+        raise CheckpointError(f"checkpoint {name} must be a float64 scalar")
+    result = float(array)
+    if not np.isfinite(result) or result < 0.0:
+        raise CheckpointError(f"checkpoint {name} must be finite and non-negative")
+    return result
+
+
+def _checkpoint_counter(value, name: str) -> int:
+    array = np.asarray(value)
+    if array.shape != () or array.dtype != np.dtype(np.int64):
+        raise CheckpointError(f"checkpoint {name} must be an int64 scalar")
+    result = int(array)
+    if result < 0:
+        raise CheckpointError(f"checkpoint {name} must be non-negative")
+    return result
+
+
+def _checkpoint_rng_json(value) -> tuple[dict, np.ndarray]:
+    """Validate and canonically encode one NumPy bit-generator state."""
+    if not isinstance(value, dict):
+        raise CheckpointError("checkpoint rng_state must be a mapping")
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        decoded = json.loads(encoded.decode("utf-8"))
+        probe = np.random.default_rng()
+        probe.bit_generator.state = decoded
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CheckpointError("checkpoint rng_state is invalid") from exc
+    return decoded, np.frombuffer(encoded, dtype=np.uint8).copy()
+
+
+def validate_checkpoint_state(state: dict) -> dict:
+    """Return an owned, normalized copy of a complete solver checkpoint.
+
+    The restart format intentionally excludes grids and derived geometry. They
+    are rebuilt by the next solver step; only trajectory-defining mutable state
+    is persisted.  Array dtypes are fixed so CPU and CUDA restore identically.
+    """
+    if not isinstance(state, dict):
+        raise CheckpointError("checkpoint state must be a mapping")
+    required = {
+        "pos", "vel", "dt_resid", "time", "dt_prev",
+        "rng_state", "outflow_removed_total", "volume_outflow_removed_total",
+        "pressure_outflow_removed_total",
+    }
+    if set(state) != required:
+        missing = sorted(required - set(state))
+        extra = sorted(set(state) - required)
+        raise CheckpointError(
+            f"checkpoint state keys mismatch (missing={missing}, extra={extra})")
+
+    positions_value = np.asarray(state["pos"])
+    if positions_value.ndim != 2 or positions_value.shape[1:] != (3,):
+        raise CheckpointError("checkpoint pos must have shape (N, 3)")
+    positions = _checkpoint_array(
+        positions_value, positions_value.shape, "pos")
+    velocities = _checkpoint_array(
+        state["vel"], positions.shape, "vel")
+    dt_resid = _checkpoint_array(
+        state["dt_resid"], (positions.shape[0],), "dt_resid")
+    rng_state, _ = _checkpoint_rng_json(state["rng_state"])
+    return {
+        "pos": positions,
+        "vel": velocities,
+        "dt_resid": dt_resid,
+        "time": _checkpoint_scalar(state["time"], "time"),
+        "dt_prev": _checkpoint_scalar(state["dt_prev"], "dt_prev"),
+        "rng_state": rng_state,
+        "outflow_removed_total": _checkpoint_counter(
+            state["outflow_removed_total"], "outflow_removed_total"),
+        "volume_outflow_removed_total": _checkpoint_counter(
+            state["volume_outflow_removed_total"],
+            "volume_outflow_removed_total"),
+        "pressure_outflow_removed_total": _checkpoint_counter(
+            state["pressure_outflow_removed_total"],
+            "pressure_outflow_removed_total"),
+    }
+
+
+def _checkpoint_fingerprint(value, *, allow_empty: bool) -> str:
+    if isinstance(value, np.ndarray):
+        if value.shape != () or value.dtype.kind not in {"U", "S"}:
+            raise CheckpointError("checkpoint fingerprint is invalid")
+        value = value.item()
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise CheckpointError("checkpoint fingerprint is invalid") from exc
+    if not isinstance(value, str):
+        raise CheckpointError("checkpoint fingerprint is invalid")
+    if value == "" and allow_empty:
+        return value
+    if _FINGERPRINT_RE.fullmatch(value) is None:
+        raise CheckpointError("checkpoint fingerprint is invalid")
+    return value
+
+
+def write_checkpoint(
+    cache_dir: str,
+    frame: int,
+    state: dict,
+    *,
+    fingerprint: str = "",
+) -> str:
+    """Atomically write a raw restart checkpoint bound to frame and inputs."""
+    normalized = validate_checkpoint_state(state)
+    _, rng_bytes = _checkpoint_rng_json(normalized["rng_state"])
+    path = checkpoint_path(cache_dir, frame)
+    fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=True)
+    fd, temporary = _atomic_path(cache_dir, ".npz")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            np.savez(
+                stream,
+                schema=np.asarray(CHECKPOINT_SCHEMA),
+                version=np.asarray(CHECKPOINT_VERSION, dtype=np.int64),
+                frame=np.asarray(int(frame), dtype=np.int64),
+                fingerprint=np.asarray(fingerprint),
+                pos=normalized["pos"],
+                vel=normalized["vel"],
+                dt_resid=normalized["dt_resid"],
+                time=np.asarray(normalized["time"], dtype=np.float64),
+                dt_prev=np.asarray(normalized["dt_prev"], dtype=np.float64),
+                rng_state_json=rng_bytes,
+                outflow_removed_total=np.asarray(
+                    normalized["outflow_removed_total"], dtype=np.int64),
+                volume_outflow_removed_total=np.asarray(
+                    normalized["volume_outflow_removed_total"], dtype=np.int64),
+                pressure_outflow_removed_total=np.asarray(
+                    normalized["pressure_outflow_removed_total"], dtype=np.int64),
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return path
+
+
+def read_checkpoint(
+    cache_dir: str,
+    frame: int,
+    *,
+    expected_fingerprint: str | None = None,
+) -> dict | None:
+    """Read a strict restart checkpoint, returning ``None`` only if absent.
+
+    Existing but malformed files raise :class:`CheckpointError`, allowing the
+    Blender resume operator to distinguish corruption from a cache that was
+    created by an older add-on without checkpoints.
+    """
+    path = checkpoint_path(cache_dir, frame)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if set(data.files) != _CHECKPOINT_KEYS:
+                raise CheckpointError("checkpoint archive keys do not match schema")
+            schema = data["schema"]
+            version = data["version"]
+            if (schema.shape != () or schema.dtype.kind not in {"U", "S"}
+                    or str(schema.item()) != CHECKPOINT_SCHEMA):
+                raise CheckpointError("checkpoint schema identifier is invalid")
+            if (version.shape != () or version.dtype != np.dtype(np.int64)
+                    or int(version) != CHECKPOINT_VERSION):
+                raise CheckpointError("checkpoint schema version is unsupported")
+            archived_frame = data["frame"]
+            if (archived_frame.shape != ()
+                    or archived_frame.dtype != np.dtype(np.int64)
+                    or int(archived_frame) != int(frame)):
+                raise CheckpointError("checkpoint frame binding does not match filename")
+            archived_fingerprint = _checkpoint_fingerprint(
+                data["fingerprint"], allow_empty=True)
+            if expected_fingerprint is not None:
+                expected = _checkpoint_fingerprint(
+                    expected_fingerprint, allow_empty=False)
+                if archived_fingerprint != expected:
+                    raise CheckpointError(
+                        "checkpoint simulation fingerprint does not match")
+            rng_bytes = data["rng_state_json"]
+            if rng_bytes.ndim != 1 or rng_bytes.dtype != np.dtype(np.uint8):
+                raise CheckpointError("checkpoint rng_state_json is invalid")
+            try:
+                rng_state = json.loads(rng_bytes.tobytes().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CheckpointError("checkpoint rng_state_json is invalid") from exc
+            state = {
+                "pos": data["pos"],
+                "vel": data["vel"],
+                "dt_resid": data["dt_resid"],
+                "time": data["time"],
+                "dt_prev": data["dt_prev"],
+                "rng_state": rng_state,
+                "outflow_removed_total": data["outflow_removed_total"],
+                "volume_outflow_removed_total": data[
+                    "volume_outflow_removed_total"],
+                "pressure_outflow_removed_total": data[
+                    "pressure_outflow_removed_total"],
+            }
+            return validate_checkpoint_state(state)
+    except CheckpointError:
+        raise
+    except (OSError, TypeError, ValueError, KeyError, EOFError) as exc:
+        raise CheckpointError(f"checkpoint {frame} is corrupt") from exc
 
 
 def write_meta(cache_dir: str, meta: dict) -> None:
@@ -267,12 +563,34 @@ def baked_frames(cache_dir: str) -> list[int]:
         return []
     out = []
     for name in os.listdir(cache_dir):
-        if name.startswith("stflip_") and name.endswith(".npz"):
-            try:
-                out.append(int(name[7:13]))
-            except ValueError:
-                pass
+        match = _FRAME_RE.fullmatch(name)
+        if match is not None:
+            out.append(int(match.group(1)))
     return sorted(out)
+
+
+def checkpoint_frames(cache_dir: str) -> list[int]:
+    """Return frames whose checkpoint files pass the complete strict schema."""
+    if not os.path.isdir(cache_dir):
+        return []
+    out = []
+    for name in os.listdir(cache_dir):
+        match = _CHECKPOINT_RE.fullmatch(name)
+        if match is None:
+            continue
+        frame = int(match.group(1))
+        try:
+            if read_checkpoint(cache_dir, frame) is not None:
+                out.append(frame)
+        except CheckpointError:
+            continue
+    return sorted(set(out))
+
+
+def resumable_frames(cache_dir: str, metadata: dict | None = None) -> list[int]:
+    """Return atomically committed frames with both output and solver state."""
+    readable_output = set(committed_frames(cache_dir, metadata))
+    return sorted(readable_output.intersection(checkpoint_frames(cache_dir)))
 
 
 def clear(cache_dir: str) -> int:
