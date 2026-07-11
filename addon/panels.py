@@ -36,8 +36,23 @@ class STFLIP_PT_main(bpy.types.Panel):
         row.enabled = not running
         row.operator("stflip.quick_setup", icon="MOD_FLUIDSIM")
         row.operator(
-            "stflip.whirlpool_preview", icon="FORCE_VORTEX", text="Whirlpool",
+            "stflip.whirlpool_preview", icon="FORCE_VORTEX",
+            text="Whirlpool Preview (Approx.)",
         )
+        row = layout.row()
+        row.enabled = not running
+        row.operator(
+            "stflip.high_cfl_jet_leak",
+            icon="MOD_FLUIDSIM",
+            text="High-CFL Jet Preview (Approx.)",
+        )
+        if context.scene.get("stflip_setup") in {
+                "WHIRLPOOL_PREVIEW_APPROXIMATE",
+                "HIGH_CFL_JET_LEAK_APPROXIMATE"}:
+            layout.label(
+                text="Domain/resolution/FPS edits break preset ratios.",
+                icon="INFO",
+            )
         domain_row = layout.row()
         domain_row.enabled = not running
         domain_row.prop(st, "domain")
@@ -95,7 +110,28 @@ class STFLIP_PT_object(bpy.types.Panel):
                 col.prop(settings, "rotation_axis_world")
                 col.prop(settings, "angular_speed")
         elif obj.stflip.role == "INFLOW":
-            layout.prop(obj.stflip, "inflow_velocity")
+            settings = obj.stflip
+            layout.prop(settings, "inflow_velocity_mode", text="Velocity")
+            layout.prop(
+                settings,
+                "inflow_velocity",
+                text=("Uniform Velocity"
+                      if settings.inflow_velocity_mode == "UNIFORM"
+                      else "Linear Velocity"),
+            )
+            if settings.inflow_velocity_mode == "SOLID_BODY":
+                col = layout.column(align=True)
+                col.prop(settings, "rotation_center_world")
+                col.prop(settings, "rotation_axis_world")
+                col.prop(settings, "angular_speed")
+            layout.separator()
+            layout.prop(settings, "inflow_use_frame_range")
+            frames = layout.row(align=True)
+            frames.enabled = settings.inflow_use_frame_range
+            frames.prop(settings, "inflow_start_frame")
+            frames.prop(settings, "inflow_end_frame")
+            layout.label(text="Inclusive evolved output frames.",
+                         icon="INFO")
         elif obj.stflip.role == "OUTFLOW":
             layout.prop(obj.stflip, "outflow_mode")
             if obj.stflip.outflow_mode == "VOLUME":
@@ -200,6 +236,27 @@ class STFLIP_PT_experiment(bpy.types.Panel):
         layout.operator("stflip.export_metrics", icon="EXPORT")
 
 
+class STFLIP_PT_export(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "Downstream Export"
+    bl_parent_id = "STFLIP_PT_main"
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.stflip
+        layout.label(text="ZIP of committed playback frames.", icon="EXPORT")
+        layout.operator(
+            "stflip.export_handoff",
+            icon="EXPORT",
+            text="Export Playback Handoff",
+        )
+        layout.label(text="Positions + velocity; no AI model.", icon="INFO")
+        if st.bake_state == "IDLE":
+            layout.label(text="Bake first to enable export.", icon="INFO")
+
+
 class STFLIP_PT_display(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -233,6 +290,7 @@ CLASSES = (
     STFLIP_PT_solver,
     STFLIP_PT_advanced,
     STFLIP_PT_experiment,
+    STFLIP_PT_export,
     STFLIP_PT_display,
 )
 

@@ -429,27 +429,243 @@ def _solver_params(settings, dims, dx, gravity, fps):
 
 
 def _scene_setup_provenance(scene):
-    if scene.get("stflip_setup") != "WHIRLPOOL_PREVIEW_APPROXIMATE":
-        return None
-    return {
-        "kind": "WHIRLPOOL_PREVIEW_APPROXIMATE",
-        "exact_reproduction": False,
-        "published_constraints": {
-            "domain_dimensions_m": [200.0, 200.0, 80.0],
-            "outlet_diameter_m": 20.0,
-            "outlet_length_m": 10.0,
-            "angular_speed_radians_per_second": 0.1,
-        },
-        "preview_resolution_longest_axis": int(scene.stflip.resolution),
-        "limitations": [
-            "preview resolution and particle count",
-            "initial water fill height is an explicit preview choice",
-            "outlet pressure uses the boundary footprint; the authored "
-            "10 m pipe length is reference geometry, not a simulated conduit",
-            "Blender Laplacian surfacing is not paper MCF reconstruction",
-            "unpublished production-scene details are not inferred",
-        ],
-    }
+    setup = scene.get("stflip_setup")
+    if setup == "WHIRLPOOL_PREVIEW_APPROXIMATE":
+        return {
+            "kind": setup,
+            "exact_reproduction": False,
+            "published_constraints": {
+                "domain_dimensions_m": [200.0, 200.0, 80.0],
+                "outlet_diameter_m": 20.0,
+                "outlet_length_m": 10.0,
+                "angular_speed_radians_per_second": 0.1,
+            },
+            "preview_resolution_longest_axis": int(scene.stflip.resolution),
+            "limitations": [
+                "preview resolution and particle count",
+                "initial water fill height is an explicit preview choice",
+                "outlet pressure uses the boundary footprint; the authored "
+                "10 m pipe length is reference geometry, not a simulated "
+                "conduit",
+                "Blender Laplacian surfacing is not paper MCF reconstruction",
+                "unpublished production-scene details are not inferred",
+            ],
+        }
+    if setup == "HIGH_CFL_JET_LEAK_APPROXIMATE":
+        settings = scene.stflip
+
+        def vector_value(obj, attribute):
+            try:
+                values = getattr(obj, attribute)
+                return [float(value) for value in values]
+            except (AttributeError, ReferenceError, TypeError, ValueError):
+                return None
+
+        def vector_matches(value, expected):
+            try:
+                return value is not None and bool(np.allclose(value, expected))
+            except (TypeError, ValueError):
+                return False
+
+        def generated_role(role):
+            for obj in getattr(scene, "objects", ()):
+                try:
+                    if (obj.get(_SETUP_OBJECT_KEY) == "HIGH_CFL_JET_LEAK"
+                            and obj.stflip.role == role):
+                        return obj
+                except (AttributeError, ReferenceError, TypeError):
+                    continue
+            return None
+
+        domain = settings.domain
+        inflow = generated_role("INFLOW")
+        plate = generated_role("OBSTACLE")
+        outlet = generated_role("OUTFLOW")
+        try:
+            dimensions = [float(value) for value in domain.dimensions]
+            dx = max(dimensions) / int(settings.resolution)
+        except (AttributeError, ReferenceError, TypeError, ValueError, ZeroDivisionError):
+            dimensions = None
+            dx = None
+        try:
+            fps = float(scene.render.fps) / float(scene.render.fps_base)
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            fps = None
+        try:
+            velocity = np.asarray(
+                inflow.stflip.inflow_velocity, dtype=np.float64)
+            jet_speed = float(np.linalg.norm(velocity))
+            jet_velocity = [float(value) for value in velocity]
+        except (AttributeError, ReferenceError, TypeError, ValueError):
+            jet_speed = None
+            jet_velocity = None
+        try:
+            inflow_velocity_mode = str(inflow.stflip.inflow_velocity_mode)
+            inflow_rotation_center = [
+                float(value)
+                for value in inflow.stflip.rotation_center_world
+            ]
+            inflow_rotation_axis = [
+                float(value)
+                for value in inflow.stflip.rotation_axis_world
+            ]
+            inflow_angular_speed = float(inflow.stflip.angular_speed)
+        except (AttributeError, ReferenceError, TypeError, ValueError):
+            inflow_velocity_mode = None
+            inflow_rotation_center = None
+            inflow_rotation_axis = None
+            inflow_angular_speed = None
+        try:
+            plate_thickness = min(
+                abs(float(value)) for value in plate.dimensions)
+        except (AttributeError, ReferenceError, TypeError, ValueError):
+            plate_thickness = None
+        nominal_cells = (
+            jet_speed / (fps * dx)
+            if (jet_speed is not None and fps and dx) else None
+        )
+        thickness_dx = (
+            plate_thickness / dx
+            if plate_thickness is not None and dx else None
+        )
+        active_frames = None
+        try:
+            if inflow.stflip.inflow_use_frame_range:
+                active_frames = [
+                    int(inflow.stflip.inflow_start_frame),
+                    int(inflow.stflip.inflow_end_frame),
+                ]
+        except (AttributeError, ReferenceError, TypeError, ValueError):
+            pass
+        current_values = {
+            "domain_dimensions_m": dimensions,
+            "domain_location_m": vector_value(domain, "location"),
+            "resolution_longest_axis": int(settings.resolution),
+            "frames_per_second": fps,
+            "gravity_enabled": bool(getattr(scene, "use_gravity", False)),
+            "gravity_meters_per_second2": vector_value(scene, "gravity"),
+            "target_cfl": float(settings.cfl_target),
+            "local_collision_cfl": float(settings.local_cfl),
+            "particles_per_cell": int(settings.particles_per_cell),
+            "spatiotemporal_sampling": bool(settings.st_enabled),
+            "jitter_strength": float(settings.jitter_strength),
+            "adaptive_gamma": bool(settings.adaptive_gamma),
+            "interface_steepness": float(settings.eta_phi),
+            "flip_fraction": float(settings.flip_blend),
+            "inflow_velocity_mode": inflow_velocity_mode,
+            "jet_velocity_meters_per_second": jet_velocity,
+            "jet_speed_meters_per_second": jet_speed,
+            "inflow_rotation_center_world": inflow_rotation_center,
+            "inflow_rotation_axis_world": inflow_rotation_axis,
+            "inflow_angular_speed_radians_per_second": (
+                inflow_angular_speed),
+            "inflow_location_m": vector_value(inflow, "location"),
+            "inflow_dimensions_m": vector_value(inflow, "dimensions"),
+            "inflow_rotation_radians": vector_value(
+                inflow, "rotation_euler"),
+            "nominal_jet_cells_per_frame": nominal_cells,
+            "plate_location_m": vector_value(plate, "location"),
+            "plate_dimensions_m": vector_value(plate, "dimensions"),
+            "plate_rotation_radians": vector_value(
+                plate, "rotation_euler"),
+            "plate_thickness_grid_cells": thickness_dx,
+            "outflow_mode": (
+                None if outlet is None else str(outlet.stflip.outflow_mode)),
+            "outflow_location_m": vector_value(outlet, "location"),
+            "outflow_dimensions_m": vector_value(outlet, "dimensions"),
+            "active_frames_inclusive": active_frames,
+        }
+        preset_intact = (
+            dimensions is not None
+            and np.allclose(dimensions, (6.0, 6.0, 6.0))
+            and vector_matches(
+                current_values["domain_location_m"], (0.0, 0.0, 3.0))
+            and int(settings.resolution) == 48
+            and fps is not None and math.isclose(fps, 24.0)
+            and current_values["gravity_enabled"] is True
+            and vector_matches(
+                current_values["gravity_meters_per_second2"],
+                (0.0, 0.0, -9.81),
+            )
+            and math.isclose(float(settings.cfl_target), 16.0)
+            and math.isclose(float(settings.local_cfl), 1.0)
+            and int(settings.particles_per_cell) == 8
+            and bool(settings.st_enabled) is True
+            and math.isclose(float(settings.jitter_strength), 1.0)
+            and bool(settings.adaptive_gamma) is True
+            and math.isclose(float(settings.eta_phi), 0.5)
+            and math.isclose(
+                float(settings.flip_blend), 0.98,
+                rel_tol=1e-6, abs_tol=1e-7,
+            )
+            and inflow_velocity_mode == "UNIFORM"
+            and jet_speed is not None and math.isclose(jet_speed, 48.0)
+            and vector_matches(jet_velocity, (0.0, 0.0, -48.0))
+            and vector_matches(
+                current_values["inflow_location_m"], (0.0, 0.0, 5.5))
+            and vector_matches(
+                current_values["inflow_dimensions_m"], (1.0, 1.0, 0.5))
+            and vector_matches(
+                current_values["inflow_rotation_radians"], (0.0, 0.0, 0.0))
+            and nominal_cells is not None
+            and math.isclose(nominal_cells, 16.0, rel_tol=1e-6)
+            and vector_matches(
+                current_values["plate_location_m"], (0.0, 0.0, 2.0))
+            and vector_matches(
+                current_values["plate_dimensions_m"], (4.0, 4.0, 0.125))
+            and vector_matches(
+                current_values["plate_rotation_radians"], (0.0, 0.0, 0.0))
+            and thickness_dx is not None
+            and math.isclose(thickness_dx, 1.0, rel_tol=1e-6)
+            and current_values["outflow_mode"] == "PRESSURE"
+            and vector_matches(
+                current_values["outflow_location_m"], (0.0, 0.0, 0.0625))
+            and vector_matches(
+                current_values["outflow_dimensions_m"],
+                (5.75, 5.75, 0.125),
+            )
+            and active_frames == [2, 48]
+        )
+        return {
+            "kind": setup,
+            "exact_reproduction": False,
+            "preset_intact": bool(preset_intact),
+            "paper_figure": 21,
+            "published_constraints": {
+                "target_cfl": 16.0,
+                "obstacle_thickness_grid_cells": 1.0,
+                "local_collision_cfl": 1.0,
+            },
+            "preview_choices": {
+                "domain_dimensions_m": [6.0, 6.0, 6.0],
+                "resolution_longest_axis": 48,
+                "frames_per_second": 24.0,
+                "gravity_meters_per_second2": [0.0, 0.0, -9.81],
+                "particles_per_cell": 8,
+                "spatiotemporal_sampling": True,
+                "jitter_strength": 1.0,
+                "adaptive_gamma": True,
+                "interface_steepness": 0.5,
+                "flip_fraction": 0.98,
+                "inflow_velocity_mode": "UNIFORM",
+                "jet_diameter_m": 1.0,
+                "jet_speed_meters_per_second": 48.0,
+                "plate_dimensions_m": [4.0, 4.0, 0.125],
+                "outflow_mode": "PRESSURE",
+                "active_frames_inclusive": [2, 48],
+            },
+            "current_values": current_values,
+            "limitations": [
+                "the paper does not publish the exact domain, nozzle, speed, "
+                "plate span, duration, or camera parameters",
+                "the plate is static; moving and deforming obstacles are not "
+                "supported",
+                "the refill source is an impinging jet, not a physical "
+                "pressure/head-controlled leak model",
+                "Blender Laplacian surfacing is not paper MCF reconstruction",
+            ],
+        }
+    return None
 
 
 def _fluid_objects(scene, role: str):
@@ -472,38 +688,52 @@ def _finite_vector3(value, label: str, source_name: str) -> np.ndarray:
     return vector
 
 
-def resolve_liquid_initial_velocity(settings, domain_origin, source_name):
-    """Resolve Blender world-space controls to a solver-local field.
+def _resolve_source_velocity(
+    mode,
+    linear_velocity,
+    rotation_center_world,
+    rotation_axis_world,
+    angular_speed,
+    domain_origin,
+    source_name,
+    *,
+    velocity_label: str,
+    mode_label: str,
+    velocity_key: str,
+    mode_key: str,
+):
+    """Validate shared liquid/inflow controls and return the actual field.
 
-    The returned descriptor is constructed from the same normalized field
-    passed to the solver, so cache metadata records the values actually used.
+    Descriptors are built from the normalized field passed to the solver, not
+    directly from Blender RNA values.  Cache metadata and bake fingerprints
+    therefore describe the float32 values that actually seed particles.
     """
     source_name = str(source_name)
     linear = _finite_vector3(
-        settings.initial_velocity, "Initial Velocity", source_name)
+        linear_velocity, velocity_label, source_name)
     origin = _finite_vector3(domain_origin, "Domain Origin", source_name)
-    mode = str(settings.initial_velocity_mode)
+    mode = str(mode)
 
     if mode == "UNIFORM":
         field = UniformVelocity(tuple(linear))
         return field, {
             "name": source_name,
-            "initial_velocity": list(field.value),
-            "initial_velocity_mode": mode,
+            velocity_key: list(field.value),
+            mode_key: mode,
         }
     if mode != "SOLID_BODY":
         raise ValueError(
-            f"{source_name}: unknown Initial Velocity Mode {mode!r}")
+            f"{source_name}: unknown {mode_label} {mode!r}")
 
     center_world = _finite_vector3(
-        settings.rotation_center_world, "Rotation Center", source_name)
+        rotation_center_world, "Rotation Center", source_name)
     axis_authored = _finite_vector3(
-        settings.rotation_axis_world, "Rotation Axis", source_name)
+        rotation_axis_world, "Rotation Axis", source_name)
     axis_length = float(np.linalg.norm(axis_authored))
     if not np.isfinite(axis_length) or axis_length <= 1e-12:
         raise ValueError(f"{source_name}: Rotation Axis must be non-zero")
     try:
-        angular_speed = float(settings.angular_speed)
+        angular_speed = float(angular_speed)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"{source_name}: Angular Speed must be finite") from exc
@@ -520,8 +750,8 @@ def resolve_liquid_initial_velocity(settings, domain_origin, source_name):
     )
     descriptor = {
         "name": source_name,
-        "initial_velocity": list(field.linear_velocity),
-        "initial_velocity_mode": mode,
+        velocity_key: list(field.linear_velocity),
+        mode_key: mode,
         "solid_body_rotation": {
             "center_world": [float(value) for value in center_world],
             "center_solver_local": list(field.center),
@@ -532,6 +762,165 @@ def resolve_liquid_initial_velocity(settings, domain_origin, source_name):
         },
     }
     return field, descriptor
+
+
+def resolve_liquid_initial_velocity(settings, domain_origin, source_name):
+    """Resolve a liquid source's world-space initial-velocity controls."""
+    return _resolve_source_velocity(
+        settings.initial_velocity_mode,
+        settings.initial_velocity,
+        settings.rotation_center_world,
+        settings.rotation_axis_world,
+        settings.angular_speed,
+        domain_origin,
+        source_name,
+        velocity_label="Initial Velocity",
+        mode_label="Initial Velocity Mode",
+        velocity_key="initial_velocity",
+        mode_key="initial_velocity_mode",
+    )
+
+
+def resolve_inflow_velocity(settings, domain_origin, source_name):
+    """Resolve an inflow's world-space controls through the shared validator."""
+    return _resolve_source_velocity(
+        settings.inflow_velocity_mode,
+        settings.inflow_velocity,
+        settings.rotation_center_world,
+        settings.rotation_axis_world,
+        settings.angular_speed,
+        domain_origin,
+        source_name,
+        velocity_label="Inflow Velocity",
+        mode_label="Inflow Velocity Mode",
+        velocity_key="velocity",
+        mode_key="velocity_mode",
+    )
+
+
+def _resolved_velocity_fingerprint(descriptor, velocity_key, mode_key):
+    """Return only normalized values that can affect seeded particle state."""
+    payload = {
+        mode_key: descriptor[mode_key],
+        velocity_key: descriptor[velocity_key],
+    }
+    if descriptor[mode_key] == "SOLID_BODY":
+        rotation = descriptor["solid_body_rotation"]
+        payload["solid_body_rotation"] = {
+            "center_solver_local": rotation["center_solver_local"],
+            "angular_velocity_world": rotation["angular_velocity_world"],
+        }
+    return payload
+
+
+def _integer_frame(value, label: str, source_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{source_name}: {label} must be an integer")
+    try:
+        frame = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{source_name}: {label} must be an integer") from exc
+    if frame != value:
+        raise ValueError(f"{source_name}: {label} must be an integer")
+    return frame
+
+
+def resolve_inflow_schedule(
+    settings,
+    scene_frame_start,
+    scene_frame_end,
+    frame_dt,
+    source_name,
+):
+    """Translate inclusive *evolved output frames* to solver intervals.
+
+    The cache's first frame is a pre-step snapshot. To make authored frame N
+    visible at output N, its refill occurs during the preceding N-1 -> N
+    interval. The solver schedule is start-inclusive/end-exclusive; ranges
+    with no evolved output (including a range containing only the initial
+    snapshot) become the valid inactive interval ``[0, 0)``. The descriptor
+    excludes the mutable requested bake end so extending and resuming does not
+    alter the fingerprint.
+    """
+    source_name = str(source_name)
+    try:
+        dt = float(frame_dt)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source_name}: Frame Duration must be finite") from exc
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"{source_name}: Frame Duration must be positive")
+    bake_start = _integer_frame(
+        scene_frame_start, "Scene Start Frame", source_name)
+    bake_end = _integer_frame(scene_frame_end, "Scene End Frame", source_name)
+
+    if not bool(settings.inflow_use_frame_range):
+        return 0.0, None, {
+            "active_frame_range": {
+                "mode": "UNBOUNDED",
+                "authored_inclusive": None,
+                "effective_inclusive": None,
+                "solver_time_seconds": {
+                    "start_inclusive": 0.0,
+                    "end_exclusive": None,
+                },
+            },
+        }, None
+
+    start_frame = _integer_frame(
+        settings.inflow_start_frame, "Inflow Start Frame", source_name)
+    end_frame = _integer_frame(
+        settings.inflow_end_frame, "Inflow End Frame", source_name)
+    if start_frame > end_frame:
+        raise ValueError(
+            f"{source_name}: Inflow Start Frame must not exceed End Frame")
+
+    start_time = max(0.0, (start_frame - bake_start - 1) * dt)
+    end_time = max(0.0, (end_frame - bake_start) * dt)
+    first_evolved_frame = bake_start + 1
+    effective_frames = (
+        None if end_frame < first_evolved_frame
+        else [max(start_frame, first_evolved_frame), end_frame]
+    )
+    descriptor = {
+        "active_frame_range": {
+            "mode": "LIMITED",
+            "authored_inclusive": [start_frame, end_frame],
+            "effective_inclusive": effective_frames,
+            "solver_time_seconds": {
+                "start_inclusive": start_time,
+                "end_exclusive": end_time,
+            },
+        },
+    }
+
+    overlap_start = max(start_frame, first_evolved_frame)
+    overlap_end = min(end_frame, bake_end)
+    warning = None
+    if overlap_start > overlap_end:
+        warning = (
+            f"Inflow {source_name!r} active frames {start_frame}-{end_frame} "
+            f"do not overlap evolved outputs {first_evolved_frame}-"
+            f"{bake_end}; the source is deliberately inactive for this bake"
+        )
+    elif start_frame < bake_start or end_frame > bake_end:
+        warning = (
+            f"Inflow {source_name!r} active frames {start_frame}-{end_frame} "
+            f"extend outside evolved outputs {first_evolved_frame}-"
+            f"{bake_end}; this "
+            f"bake uses the inclusive overlap {overlap_start}-{overlap_end}"
+        )
+    return start_time, end_time, descriptor, warning
+
+
+def _inflow_schedule_overlaps(start_time, end_time, duration) -> bool:
+    """Return whether a half-open source interval overlaps this bake."""
+    start = float(start_time)
+    stop = None if end_time is None else float(end_time)
+    span = max(0.0, float(duration))
+    return start < span and (stop is None or stop > 0.0) and (
+        stop is None or start < stop
+    )
 
 
 def _system_available_memory_bytes() -> int | None:
@@ -809,17 +1198,115 @@ def _remove_generated_setup_objects(scene) -> int:
     return removed
 
 
+def _clear_bake_for_new_setup(scene) -> int:
+    """Clear this scene's owned bake before replacing authored inputs.
+
+    A one-click setup changes trajectory-defining geometry. Leaving its old
+    cache accessible would let the frame handler display stale particles and
+    downstream export package the previous setup. Foreign or invalid custom
+    cache ownership is never deleted implicitly.
+    """
+    ensure_cache_id = getattr(handlers, "ensure_scene_cache_id", None)
+    if ensure_cache_id is not None:
+        ensure_cache_id(scene)
+    ownership_check = getattr(handlers, "scene_cache_ownership", None)
+    ownership = (
+        ownership_check(scene) if ownership_check is not None else "legacy"
+    )
+    if ownership in {"foreign", "invalid"}:
+        raise ValueError(
+            "cannot replace the setup while Cache Directory ownership is "
+            f"{ownership}; choose a new cache path or use its owning scene"
+        )
+    removed = cache.clear(resolve_cache_dir(scene))
+    clear_output = getattr(handlers, "clear_scene_output", None)
+    if clear_output is not None:
+        clear_output(scene)
+    _set_bake_lifecycle(scene.stflip, "IDLE", "", progress=0.0)
+    return removed
+
+
+def _owned_setup_cache_file_count(scene) -> int:
+    """Count files a one-click setup would irreversibly remove.
+
+    This mirrors :func:`stflip.cache.clear` without opening or deleting
+    anything. Foreign and invalid cache directories are never offered for
+    deletion and remain subject to the stricter execute-time refusal.
+    """
+    ownership_check = getattr(handlers, "scene_cache_ownership", None)
+    ownership = (
+        ownership_check(scene) if ownership_check is not None else "legacy"
+    )
+    if ownership not in {"owned", "legacy", "missing"}:
+        return 0
+    cache_dir = resolve_cache_dir(scene)
+    if not os.path.isdir(cache_dir):
+        return 0
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return 0
+    return sum(
+        1
+        for name in names
+        if (
+            (name.startswith("stflip_") and name.endswith(".npz"))
+            or name == cache.META_NAME
+            or name == cache.METRICS_NAME
+            or name.startswith(".stflip-writing-")
+            or name.startswith(".stflip-exporting-")
+        )
+    )
+
+
+def _invoke_setup_replace_confirmation(operator, context, event):
+    """Confirm the disk mutation that Blender's object Undo cannot restore."""
+    file_count = _owned_setup_cache_file_count(context.scene)
+    if not file_count:
+        return operator.execute(context)
+    message = (
+        f"This will permanently delete {file_count} cached ST-FLIP file"
+        f"{'s' if file_count != 1 else ''}. Blender Undo cannot restore "
+        "the bake."
+    )
+    try:
+        return context.window_manager.invoke_confirm(
+            operator,
+            event,
+            title="Replace ST-FLIP Setup?",
+            message=message,
+            confirm_text="Delete Bake and Replace",
+            icon="ERROR",
+        )
+    except TypeError:
+        # Older Blender confirmation signatures still show bl_description,
+        # which also states that the cache deletion cannot be undone.
+        return context.window_manager.invoke_confirm(operator, event)
+
+
 class STFLIP_OT_quick_setup(bpy.types.Operator):
     """Create a ready-to-bake dam-break scene (domain, liquid, roles)"""
     bl_idname = "stflip.quick_setup"
     bl_label = "Quick Dam-Break Setup"
+    bl_description = (
+        "Replace generated setup objects and this scene's owned bake with a "
+        "ready-to-bake dam break; deleting cached bake files cannot be undone"
+    )
     bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        return _invoke_setup_replace_confirmation(self, context, event)
 
     def execute(self, context):
         if _BAKE.get("running"):
             self.report({"WARNING"}, "Cancel the running bake first")
             return {"CANCELLED"}
         scene = context.scene
+        try:
+            removed_cache_files = _clear_bake_for_new_setup(scene)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         _remove_generated_setup_objects(scene)
 
         bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0, 0, 1))
@@ -841,7 +1328,11 @@ class STFLIP_OT_quick_setup(bpy.types.Operator):
         scene.stflip.domain = domain
         scene.frame_start = 1
         scene.frame_end = 48
-        self.report({"INFO"}, "Dam-break scene created; press Bake")
+        detail = (
+            f"; cleared {removed_cache_files} previous bake files"
+            if removed_cache_files else ""
+        )
+        self.report({"INFO"}, f"Dam-break scene created; press Bake{detail}")
         return {"FINISHED"}
 
 
@@ -852,15 +1343,25 @@ class STFLIP_OT_whirlpool_preview(bpy.types.Operator):
     bl_description = (
         "Create the paper's published 200 x 200 x 80 m proportions, 20 m "
         "diameter x 10 m outlet, and 0.1 rad/s rotation at preview resolution; "
-        "this is not the paper's exact production scene or MCF reconstruction"
+        "changes scene units/gravity/range and clears its owned bake; this is "
+        "not the paper's exact production scene or MCF reconstruction; "
+        "deleted cache files cannot be restored by Undo"
     )
     bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        return _invoke_setup_replace_confirmation(self, context, event)
 
     def execute(self, context):
         if _BAKE.get("running"):
             self.report({"WARNING"}, "Cancel the running bake first")
             return {"CANCELLED"}
         scene = context.scene
+        try:
+            removed_cache_files = _clear_bake_for_new_setup(scene)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         _remove_generated_setup_objects(scene)
 
         scene.unit_settings.system = "METRIC"
@@ -934,7 +1435,154 @@ class STFLIP_OT_whirlpool_preview(bpy.types.Operator):
             {"INFO"},
             "Approximate whirlpool preview created at 48-cell resolution; "
             "published geometry/rotation retained, production scale and MCF "
-            "surface reconstruction are not reproduced",
+            "surface reconstruction are not reproduced"
+            + (f"; cleared {removed_cache_files} previous bake files"
+               if removed_cache_files else ""),
+        )
+        return {"FINISHED"}
+
+
+class STFLIP_OT_high_cfl_jet_leak(bpy.types.Operator):
+    """Create a practical approximation of the paper's thin-plate jet."""
+
+    bl_idname = "stflip.high_cfl_jet_leak"
+    bl_label = "High-CFL Jet Preview (Approx.)"
+    bl_description = (
+        "Create a static Figure 21-style water jet at target CFL 16 with a "
+        "one-cell plate and pressure outflow; changes units/FPS/gravity/range "
+        "and clears the owned bake. Exact parameters are unpublished; deleted "
+        "cache files cannot be restored by Undo"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        return _invoke_setup_replace_confirmation(self, context, event)
+
+    def execute(self, context):
+        if _BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake first")
+            return {"CANCELLED"}
+        scene = context.scene
+        try:
+            removed_cache_files = _clear_bake_for_new_setup(scene)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        _remove_generated_setup_objects(scene)
+
+        # Figure 21 publishes CFL=16 and a plate thickness of one grid cell,
+        # but not its world dimensions or jet speed.  These preview choices
+        # make one 24 fps frame correspond to a nominal 16-cell jet travel.
+        domain_size = 6.0
+        resolution = 48
+        fps = 24
+        dx = domain_size / resolution
+        jet_speed = 16.0 * dx * fps
+
+        scene.unit_settings.system = "METRIC"
+        scene.unit_settings.scale_length = 1.0
+        scene.render.fps = fps
+        scene.render.fps_base = 1.0
+        scene.gravity = (0.0, 0.0, -9.81)
+        scene.use_gravity = True
+
+        bpy.ops.mesh.primitive_cube_add(
+            size=2.0, location=(0.0, 0.0, domain_size / 2.0))
+        domain = context.active_object
+        domain.name = "STFLIP High-CFL Jet Domain (Approx.)"
+        domain.scale = (domain_size / 2.0,) * 3
+        domain.display_type = "WIRE"
+        domain.hide_render = True
+        domain[_SETUP_OBJECT_KEY] = "HIGH_CFL_JET_LEAK"
+        domain["stflip_preview_dimensions_m"] = (
+            domain_size, domain_size, domain_size)
+        domain["stflip_preview_dx_m"] = dx
+
+        bpy.ops.mesh.primitive_cylinder_add(
+            vertices=64,
+            radius=0.5,
+            depth=0.5,
+            location=(0.0, 0.0, 5.5),
+        )
+        inflow = context.active_object
+        inflow.name = "STFLIP High-CFL Jet Inflow (Approx.)"
+        inflow.display_type = "WIRE"
+        inflow.hide_render = True
+        inflow.stflip.role = "INFLOW"
+        inflow.stflip.inflow_velocity_mode = "UNIFORM"
+        inflow.stflip.inflow_velocity = (0.0, 0.0, -jet_speed)
+        inflow.stflip.inflow_use_frame_range = True
+        # Frame 1 is the pre-step cache snapshot. Frame 2 is the first evolved
+        # output and still seeds at solver time zero.
+        inflow.stflip.inflow_start_frame = 2
+        inflow.stflip.inflow_end_frame = 48
+        inflow[_SETUP_OBJECT_KEY] = "HIGH_CFL_JET_LEAK"
+        inflow["stflip_preview_jet_diameter_m"] = 1.0
+        inflow["stflip_preview_jet_speed_meters_per_second"] = jet_speed
+        inflow["stflip_preview_nominal_cells_per_frame"] = 16.0
+
+        bpy.ops.mesh.primitive_cube_add(
+            size=2.0, location=(0.0, 0.0, 2.0))
+        plate = context.active_object
+        plate.name = "STFLIP One-Cell Jet Plate (Static, Approx.)"
+        plate.scale = (2.0, 2.0, dx / 2.0)
+        plate.display_type = "WIRE"
+        plate.hide_render = True
+        plate.stflip.role = "OBSTACLE"
+        plate[_SETUP_OBJECT_KEY] = "HIGH_CFL_JET_LEAK"
+        plate["stflip_published_thickness_dx"] = 1.0
+        plate["stflip_preview_thickness_m"] = dx
+        plate["stflip_static_obstacle"] = True
+
+        # A bottom pressure footprint lets runoff leave without deleting the
+        # impact region or pretending that a modeled drain conduit exists.
+        bpy.ops.mesh.primitive_cube_add(
+            size=2.0, location=(0.0, 0.0, dx / 2.0))
+        outlet = context.active_object
+        outlet.name = "STFLIP Jet Bottom Pressure Outflow (Approx.)"
+        outlet.scale = (
+            domain_size / 2.0 - dx,
+            domain_size / 2.0 - dx,
+            dx / 2.0,
+        )
+        outlet.display_type = "WIRE"
+        outlet.hide_render = True
+        outlet.stflip.role = "OUTFLOW"
+        outlet.stflip.outflow_mode = "PRESSURE"
+        outlet[_SETUP_OBJECT_KEY] = "HIGH_CFL_JET_LEAK"
+        outlet["stflip_safe_runoff_outflow"] = True
+
+        settings = scene.stflip
+        settings.domain = domain
+        settings.resolution = resolution
+        settings.cfl_target = 16.0
+        settings.local_cfl = 1.0
+        settings.particles_per_cell = 8
+        settings.st_enabled = True
+        settings.jitter_strength = 1.0
+        settings.adaptive_gamma = True
+        settings.eta_phi = 0.5
+        settings.flip_blend = 0.98
+        settings.create_surface = True
+        scene.frame_start = 1
+        scene.frame_end = 48
+        scene["stflip_setup"] = "HIGH_CFL_JET_LEAK_APPROXIMATE"
+        scene["stflip_paper_reference"] = (
+            "Figure 21: target CFL=16, static plate thickness=one grid cell; "
+            "other scene parameters are unpublished preview choices"
+        )
+        _set_bake_lifecycle(
+            settings,
+            "IDLE",
+            "Approx. high-CFL jet preview created; review settings, then Bake",
+            progress=0.0,
+        )
+        self.report(
+            {"INFO"},
+            "Approximate Figure 21-style jet created at target CFL 16; exact "
+            "jet geometry and speed are unpublished and not reproduced"
+            + (f"; cleared {removed_cache_files} previous bake files"
+               if removed_cache_files else ""),
         )
         return {"FINISHED"}
 
@@ -994,6 +1642,9 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
         deps = context.evaluated_depsgraph_get()
         dims, dx, origin = voxelize.domain_grid(st.domain, st.resolution)
+        fps = scene.render.fps / scene.render.fps_base
+        gravity = tuple(scene.gravity) if scene.use_gravity else (0.0, 0.0, 0.0)
+        params = _solver_params(st, dims, dx, gravity, fps)
         try:
             liquid_velocity_sources = [
                 (
@@ -1003,14 +1654,32 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 )
                 for obj in liquids
             ]
+            inflow_velocity_sources = []
+            for obj in inflows:
+                velocity_field, descriptor = resolve_inflow_velocity(
+                    obj.stflip, origin, obj.name)
+                start_time, end_time, schedule, warning = (
+                    resolve_inflow_schedule(
+                        obj.stflip,
+                        scene.frame_start,
+                        scene.frame_end,
+                        params.frame_dt,
+                        obj.name,
+                    )
+                )
+                inflow_velocity_sources.append((
+                    obj,
+                    velocity_field,
+                    {**descriptor, **schedule},
+                    start_time,
+                    end_time,
+                    warning,
+                ))
         except ValueError as exc:
             message = str(exc)
             _fail_bake(st, message)
             self.report({"ERROR"}, message)
             return False
-        fps = scene.render.fps / scene.render.fps_base
-        gravity = tuple(scene.gravity) if scene.use_gravity else (0.0, 0.0, 0.0)
-        params = _solver_params(st, dims, dx, gravity, fps)
 
         cuda_state = ({"available": False, "device": "",
                        "free_bytes": None, "total_bytes": None, "error": ""}
@@ -1089,10 +1758,11 @@ class STFLIP_OT_bake(bpy.types.Operator):
             liquid_records.append(descriptor)
             fingerprint_sources.append({
                 "role": "LIQUID",
-                "velocity": {
-                    key: value for key, value in descriptor.items()
-                    if key not in {"name", "cell_count"}
-                },
+                "velocity": _resolved_velocity_fingerprint(
+                    descriptor,
+                    "initial_velocity",
+                    "initial_velocity_mode",
+                ),
                 "mask": mask,
             })
             if cell_count == 0:
@@ -1105,28 +1775,49 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 seeded += solver.add_liquid_mask(mask, velocity_field)
 
         inflow_records = []
+        usable_inflow_cells = 0
         active_inflow_cells = 0
-        for obj in inflows:
+        requested_duration = max(
+            0.0,
+            (int(scene.frame_end) - int(scene.frame_start)) * params.frame_dt,
+        )
+        for (
+            obj,
+            velocity_field,
+            descriptor,
+            start_time,
+            end_time,
+            schedule_warning,
+        ) in inflow_velocity_sources:
             mask, cell_count = _source_mask(
                 obj, deps, origin, dx, dims, not_solid)
-            inflow_records.append({
-                "name": obj.name,
-                "velocity": list(obj.stflip.inflow_velocity),
-                "cell_count": cell_count,
-            })
+            descriptor = {**descriptor, "cell_count": cell_count}
+            inflow_records.append(descriptor)
             fingerprint_sources.append({
                 "role": "INFLOW",
-                "velocity": list(obj.stflip.inflow_velocity),
+                "velocity": _resolved_velocity_fingerprint(
+                    descriptor, "velocity", "velocity_mode"),
+                "active_frame_range": descriptor["active_frame_range"],
                 "mask": mask,
             })
+            if schedule_warning:
+                self.report({"WARNING"}, schedule_warning)
             if cell_count == 0:
                 self.report(
                     {"WARNING"},
                     f"Inflow {obj.name!r} covers no usable domain cells",
                 )
                 continue
-            solver.add_inflow(mask, tuple(obj.stflip.inflow_velocity))
-            active_inflow_cells += cell_count
+            usable_inflow_cells += cell_count
+            solver.add_inflow(
+                mask,
+                velocity_field,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if _inflow_schedule_overlaps(
+                    start_time, end_time, requested_duration):
+                active_inflow_cells += cell_count
 
         outflow_records = []
         for obj in outflows:
@@ -1157,11 +1848,19 @@ class STFLIP_OT_bake(bpy.types.Operator):
         initial_outflow_cull = (
             solver.cull_outflows() if not is_resume else {})
         seeded = int(solver.pos.shape[0])
-        if not is_resume and seeded == 0 and active_inflow_cells == 0:
+        if not is_resume and seeded == 0 and usable_inflow_cells == 0:
             message = "No usable Liquid or Inflow cells exist inside the domain"
             _fail_bake(st, message)
             self.report({"ERROR"}, message)
             return False
+        if (not is_resume and seeded == 0 and usable_inflow_cells > 0
+                and active_inflow_cells == 0):
+            self.report(
+                {"WARNING"},
+                "All usable inflows are inactive for the requested frame "
+                "range; playback remains empty until a later scheduled "
+                "output is included",
+            )
 
         # Only clear a previous cache after every source has been validated and
         # integrated into a live solver.  A bad/empty source therefore cannot
@@ -1211,6 +1910,17 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "checkpoint was created by a different ST-FLIP add-on "
                 "version; rebake with the current version")
 
+        setup_provenance = _scene_setup_provenance(scene)
+        if (isinstance(setup_provenance, dict)
+                and setup_provenance.get("kind")
+                == "HIGH_CFL_JET_LEAK_APPROXIMATE"
+                and not setup_provenance.get("preset_intact", False)):
+            self.report(
+                {"WARNING"},
+                "High-CFL Jet Preview ratios changed; cache metadata records "
+                "current values, but this is no longer the authored preset",
+            )
+
         new_meta = {
             "frame_start": scene.frame_start,
             "frame_end": scene.frame_end,
@@ -1226,7 +1936,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "system": scene.unit_settings.system,
                 "scale_length": scene.unit_settings.scale_length,
             },
-            "scene_setup": _scene_setup_provenance(scene),
+            "scene_setup": setup_provenance,
             "experiment_profile": None,
             "settings": {
                 "resolution": st.resolution,
@@ -1844,6 +2554,7 @@ class STFLIP_OT_install_gpu(bpy.types.Operator):
 CLASSES = (
     STFLIP_OT_quick_setup,
     STFLIP_OT_whirlpool_preview,
+    STFLIP_OT_high_cfl_jet_leak,
     STFLIP_OT_bake,
     STFLIP_OT_resume_bake,
     STFLIP_OT_cancel_bake,

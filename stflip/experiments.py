@@ -141,16 +141,21 @@ DAM_BREAK_PROFILES = tuple(
     for cfl in (1, 2, 4, 8, 16)
 )
 
-DAM_BREAK_INSTANTANEOUS_CFL_16 = _profile(
-    "DAM_BREAK_INSTANTANEOUS_CFL_16",
-    "Dam break - instantaneous P2G CFL 16",
-    "Instantaneous-P2G temporal ablation at target CFL 16. This is not the "
-    "paper's standard-FLIP/GFM reference solver.",
-    "dam_break_ablation",
-    "Section 4.3 inspired ablation",
-    16.0,
-    st_enabled=False,
+DAM_BREAK_INSTANTANEOUS_PROFILES = tuple(
+    _profile(
+        f"DAM_BREAK_INSTANTANEOUS_CFL_{cfl}",
+        f"Dam break - instantaneous P2G CFL {cfl}",
+        f"Instantaneous-P2G temporal ablation at target CFL {cfl}. This is "
+        "not the paper's standard-FLIP/GFM reference solver.",
+        "dam_break_ablation",
+        "Section 4.3 inspired ablation",
+        float(cfl),
+        st_enabled=False,
+    )
+    for cfl in (1, 16)
 )
+DAM_BREAK_INSTANTANEOUS_CFL_1 = DAM_BREAK_INSTANTANEOUS_PROFILES[0]
+DAM_BREAK_INSTANTANEOUS_CFL_16 = DAM_BREAK_INSTANTANEOUS_PROFILES[1]
 
 LAMINAR_DAM_BREAK_PROFILES = tuple(
     _profile(
@@ -207,7 +212,7 @@ PROFILES = (
     PAPER_DEFAULTS,
     *LAMINAR_DAM_BREAK_PROFILES,
     *DAM_BREAK_PROFILES,
-    DAM_BREAK_INSTANTANEOUS_CFL_16,
+    *DAM_BREAK_INSTANTANEOUS_PROFILES,
     *ENSTROPHY_PROFILES,
     *PARTICLE_COUNT_PROFILES,
 )
@@ -277,7 +282,9 @@ def profile_provenance(identifier: str, values) -> dict[str, object]:
 
 __all__ = [
     "CUSTOM_PROFILE_ID",
+    "DAM_BREAK_INSTANTANEOUS_CFL_1",
     "DAM_BREAK_INSTANTANEOUS_CFL_16",
+    "DAM_BREAK_INSTANTANEOUS_PROFILES",
     "DAM_BREAK_PROFILES",
     "ENSTROPHY_PROFILES",
     "EXPERIMENT_PROFILES",

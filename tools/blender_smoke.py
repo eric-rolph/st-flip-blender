@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import time
 import tomllib
+import zipfile
 from pathlib import Path
 
 import bpy
@@ -74,6 +75,100 @@ def _validate_whirlpool_preview(window) -> dict:
             "outlet_m": {"diameter": 20.0, "length": 10.0},
             "angular_speed_rad_s": 0.1,
             "preview_resolution": settings.resolution,
+        }
+    finally:
+        window.scene = previous
+        for obj in list(scene.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        bpy.data.scenes.remove(scene)
+
+
+def _validate_high_cfl_jet_leak(window) -> dict:
+    """Inspect the explicitly approximate Figure 21-style authored scene."""
+    previous = window.scene
+    scene = bpy.data.scenes.new("STFLIP High-CFL Jet Setup Smoke")
+    try:
+        window.scene = scene
+        _finished(
+            bpy.ops.stflip.high_cfl_jet_leak(),
+            "high-CFL jet / leak setup",
+        )
+        settings = scene.stflip
+        by_role = {
+            role: [
+                obj for obj in scene.objects
+                if getattr(getattr(obj, "stflip", None), "role", None) == role
+            ]
+            for role in ("INFLOW", "OBSTACLE", "OUTFLOW")
+        }
+        if any(len(objects) != 1 for objects in by_role.values()):
+            raise AssertionError(
+                f"jet setup roles are incomplete: "
+                f"{ {key: len(value) for key, value in by_role.items()} }"
+            )
+        inflow = by_role["INFLOW"][0]
+        plate = by_role["OBSTACLE"][0]
+        outlet = by_role["OUTFLOW"][0]
+        domain = settings.domain
+        if (domain is None
+                or not np.allclose(domain.dimensions, (6.0, 6.0, 6.0))
+                or not np.isclose(domain.get("stflip_preview_dx_m"), 0.125)):
+            raise AssertionError("jet preview domain/dx metadata is wrong")
+        if (settings.resolution != 48
+                or not np.isclose(settings.cfl_target, 16.0)
+                or not np.isclose(settings.local_cfl, 1.0)):
+            raise AssertionError("jet preview CFL controls are wrong")
+        if (inflow.stflip.inflow_velocity_mode != "UNIFORM"
+                or not np.allclose(
+                    inflow.stflip.inflow_velocity, (0.0, 0.0, -48.0))
+                or not inflow.stflip.inflow_use_frame_range
+                or (inflow.stflip.inflow_start_frame,
+                    inflow.stflip.inflow_end_frame) != (2, 48)
+                or not np.isclose(inflow.get(
+                    "stflip_preview_nominal_cells_per_frame"), 16.0)):
+            raise AssertionError("jet preview inflow metadata is wrong")
+        if (not np.isclose(plate.dimensions.z, 0.125)
+                or not np.isclose(
+                    plate.get("stflip_published_thickness_dx"), 1.0)
+                or plate.get("stflip_static_obstacle") is not True):
+            raise AssertionError("jet preview one-cell static plate is wrong")
+        if (outlet.stflip.outflow_mode != "PRESSURE"
+                or outlet.get("stflip_safe_runoff_outflow") is not True):
+            raise AssertionError("jet preview safe pressure outflow is wrong")
+        from bl_ext.user_default.st_flip.addon import operators
+
+        provenance = operators._scene_setup_provenance(scene)
+        if (scene.get("stflip_setup")
+                != "HIGH_CFL_JET_LEAK_APPROXIMATE"
+                or provenance.get("exact_reproduction") is not False
+                or provenance.get("preset_intact") is not True
+                or provenance.get("published_constraints") != {
+                    "target_cfl": 16.0,
+                    "obstacle_thickness_grid_cells": 1.0,
+                    "local_collision_cfl": 1.0,
+                }
+                or "unpublished" not in scene.get(
+                    "stflip_paper_reference", "")):
+            raise AssertionError("jet preview is not marked non-exact")
+        current = provenance.get("current_values", {})
+        if (not np.isclose(current.get(
+                "nominal_jet_cells_per_frame"), 16.0)
+                or not np.isclose(current.get(
+                    "plate_thickness_grid_cells"), 1.0)):
+            raise AssertionError("jet preview dynamic provenance is wrong")
+        return {
+            "approximate": True,
+            "paper_figure": 21,
+            "target_cfl": settings.cfl_target,
+            "local_collision_cfl": settings.local_cfl,
+            "plate_thickness_dx": plate.get(
+                "stflip_published_thickness_dx"),
+            "jet_speed_m_s": abs(inflow.stflip.inflow_velocity.z),
+            "active_frames_inclusive": [
+                inflow.stflip.inflow_start_frame,
+                inflow.stflip.inflow_end_frame,
+            ],
+            "outflow_mode": outlet.stflip.outflow_mode,
         }
     finally:
         window.scene = previous
@@ -196,6 +291,7 @@ def run(backend: str = "cuda") -> dict:
     started = time.perf_counter()
     try:
         whirlpool_preview = _validate_whirlpool_preview(window)
+        high_cfl_jet_leak = _validate_high_cfl_jet_leak(window)
         window.scene = scene
         _finished(bpy.ops.stflip.quick_setup(), "quick setup")
         scene.frame_start = 1
@@ -215,6 +311,27 @@ def run(backend: str = "cuda") -> dict:
         obstacle.display_type = "WIRE"
         obstacle.hide_render = True
         obstacle.stflip.role = "OBSTACLE"
+
+        # Register a rotating inflow whose authored schedule is deliberately
+        # beyond this short bake.  This exercises field normalization,
+        # inclusive-frame translation, metadata, fingerprinting, and resume
+        # without perturbing the dam-break assertions below.
+        bpy.ops.mesh.primitive_cube_add(
+            size=2.0, location=(0.65, 0.0, 1.5))
+        scheduled_inflow = bpy.context.active_object
+        scheduled_inflow.name = "STFLIP Smoke Scheduled Rotating Inflow"
+        scheduled_inflow.scale = (0.18, 0.18, 0.18)
+        scheduled_inflow.display_type = "WIRE"
+        scheduled_inflow.hide_render = True
+        scheduled_inflow.stflip.role = "INFLOW"
+        scheduled_inflow.stflip.inflow_velocity_mode = "SOLID_BODY"
+        scheduled_inflow.stflip.inflow_velocity = (0.25, -0.5, 0.75)
+        scheduled_inflow.stflip.rotation_center_world = (0.65, 0.0, 1.5)
+        scheduled_inflow.stflip.rotation_axis_world = (0.0, 0.0, 2.0)
+        scheduled_inflow.stflip.angular_speed = 1.25
+        scheduled_inflow.stflip.inflow_use_frame_range = True
+        scheduled_inflow.stflip.inflow_start_frame = 10
+        scheduled_inflow.stflip.inflow_end_frame = 12
 
         # Exercise both honest outlet semantics.  These compact source volumes
         # overlap the initial liquid so a two-frame smoke bake observes actual
@@ -305,6 +422,36 @@ def run(backend: str = "cuda") -> dict:
             if not np.isclose(advanced.get(key), expected):
                 raise AssertionError(
                     f"advanced setting {key} was not baked: {advanced.get(key)!r}")
+        inflow_source = next(
+            (
+                source for source in meta.get("inflow_sources", [])
+                if source.get("name") == scheduled_inflow.name
+            ),
+            None,
+        )
+        if (inflow_source is None
+                or inflow_source.get("cell_count", 0) <= 0
+                or inflow_source.get("velocity_mode") != "SOLID_BODY"
+                or not np.allclose(
+                    inflow_source.get("velocity"), (0.25, -0.5, 0.75))):
+            raise AssertionError("rotating inflow values were not baked")
+        inflow_rotation = inflow_source.get("solid_body_rotation", {})
+        if (not np.allclose(
+                inflow_rotation.get("axis_world_unit"), (0.0, 0.0, 1.0))
+                or not np.allclose(
+                    inflow_rotation.get("angular_velocity_world"),
+                    (0.0, 0.0, 1.25))):
+            raise AssertionError("rotating inflow was not normalized")
+        inflow_range = inflow_source.get("active_frame_range", {})
+        inflow_times = inflow_range.get("solver_time_seconds", {})
+        if (inflow_range.get("mode") != "LIMITED"
+                or inflow_range.get("authored_inclusive") != [10, 12]
+                or inflow_range.get("effective_inclusive") != [10, 12]
+                or not np.isclose(
+                    inflow_times.get("start_inclusive"), 8.0 / 24.0)
+                or not np.isclose(
+                    inflow_times.get("end_exclusive"), 11.0 / 24.0)):
+            raise AssertionError("inclusive inflow schedule metadata is wrong")
         outflow_sources = meta.get("outflow_sources", [])
         modes = {source.get("mode") for source in outflow_sources}
         if modes != {"VOLUME", "PRESSURE"}:
@@ -428,6 +575,30 @@ def run(backend: str = "cuda") -> dict:
                 filepath=str(json_path), export_format="JSON"),
             "JSON metrics export",
         )
+        handoff_path = cache_dir / "smoke_playback_handoff.zip"
+        _finished(
+            bpy.ops.stflip.export_handoff(filepath=str(handoff_path)),
+            "playback handoff export",
+        )
+        with zipfile.ZipFile(handoff_path, "r") as archive:
+            if archive.testzip() is not None:
+                raise AssertionError("playback handoff ZIP is corrupt")
+            names = set(archive.namelist())
+            manifest = json.loads(archive.read("manifest.json"))
+        expected_frames = {
+            f"frames/stflip_{frame:06d}.npz" for frame in (1, 2, 3)
+        }
+        if not expected_frames.issubset(names):
+            raise AssertionError("playback handoff is missing committed frames")
+        if any("checkpoint" in name.lower() for name in names):
+            raise AssertionError("playback handoff contains a solver checkpoint")
+        limitations = manifest.get("limitations", {})
+        if (manifest.get("playback_only") is not True
+                or manifest.get("contains_solver_checkpoints") is not False
+                or limitations.get("stable_particle_ids_included") is not False
+                or limitations.get("foam_or_spray_labels_included") is not False
+                or limitations.get("ai_model_included") is not False):
+            raise AssertionError("playback handoff absence declarations are wrong")
 
         particles = settings.particle_object
         surface = settings.surface_object
@@ -492,8 +663,21 @@ def run(backend: str = "cuda") -> dict:
             "resume_continuity": True,
             "copied_scene_output_isolation": copied_scene_isolation,
             "metrics_exports": [csv_path.name, json_path.name],
+            "playback_handoff": {
+                "frame_count": manifest["timing"]["frame_count"],
+                "playback_only": manifest["playback_only"],
+                "contains_solver_checkpoints": manifest[
+                    "contains_solver_checkpoints"],
+            },
             "elapsed_s": time.perf_counter() - started,
             "whirlpool_preview": whirlpool_preview,
+            "high_cfl_jet_leak": high_cfl_jet_leak,
+            "scheduled_rotating_inflow": {
+                "velocity_mode": inflow_source["velocity_mode"],
+                "active_frames_inclusive": inflow_range[
+                    "authored_inclusive"],
+                "inactive_during_smoke_bake": True,
+            },
         }
         _finished(bpy.ops.stflip.free_bake(), "free bake")
         if (cache_dir / "stflip_meta.json").exists():
