@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import kernels, pressure
+from . import apertures, kernels, pressure
 from .backend import Backend, get_backend
 
 # Face-grid offsets (in cell units) of node (i,j,k) for each MAC grid.
@@ -102,10 +102,14 @@ class STFLIPSolver:
         self._clamp_hi = xp.asarray([s - eps for s in self.size],
                                     dtype=xp.float32)
 
-        # Solid signed distance, cell-centred; positive outside solids.
+        # Solid signed distance, cell-centred; positive outside solids.  A
+        # node-centred SDF is optional: when present it defines fractional
+        # face apertures for the pressure projection, while the cell-centred
+        # field remains the collision/push-out representation.
         self.sdf = xp.full(self.shape, 1e9, dtype=xp.float32)
+        self._solid_node_sdf = None
         self._sdf_grad = None
-        self._solid_faces = None  # computed lazily from sdf
+        self._solid_faces = None  # apertures + fully-solid cells, built lazily
 
         self._inflows: list[tuple] = []  # (cell_mask device bool, velocity xp(3,))
         self._rng = np.random.default_rng(params.seed)
@@ -117,11 +121,30 @@ class STFLIPSolver:
 
     # ------------------------------------------------------------------ setup
 
-    def set_solid_sdf(self, sdf_cells: np.ndarray) -> None:
-        """Cell-centred signed distance to solids (positive = outside)."""
+    def set_solid_sdf(
+        self,
+        sdf_cells: np.ndarray,
+        node_sdf: np.ndarray | None = None,
+    ) -> None:
+        """Set the collision SDF and, optionally, fractional solid geometry.
+
+        ``sdf_cells`` preserves the original binary cell-centred API and is
+        always used for particle collision push-out.  Supplying
+        ``node_sdf`` with shape ``(nx + 1, ny + 1, nz + 1)`` enables
+        cut-cell face apertures for pressure projection.  Omitting it keeps
+        the previous binary rule: a face is blocked when either adjacent
+        cell is solid.
+        """
         assert sdf_cells.shape == self.shape
         xp = self.be.xp
         self.sdf = self.be.from_numpy(sdf_cells.astype(np.float32))
+        if node_sdf is None:
+            self._solid_node_sdf = None
+        else:
+            expected = tuple(n + 1 for n in self.shape)
+            assert node_sdf.shape == expected
+            self._solid_node_sdf = self.be.from_numpy(
+                node_sdf.astype(np.float32))
         gx, gy, gz = xp.gradient(self.sdf, self.p.dx)
         self._sdf_grad = (gx, gy, gz)
         self._solid_faces = None  # rebuild on next step
@@ -248,28 +271,104 @@ class STFLIPSolver:
 
     # ------------------------------------------------------------- grid utils
 
-    def _solid_face_masks(self):
+    def _solid_face_apertures(self):
+        """Return open-area fractions on MAC faces and fully-solid cells.
+
+        The binary fallback deliberately matches the original solver: domain
+        faces are closed and an internal face is closed when either adjacent
+        cell-centred SDF sample is negative.  With a node SDF, cut-cell area
+        fractions are computed geometrically; domain faces remain closed.
+        """
         if self._solid_faces is not None:
             return self._solid_faces
         xp = self.be.xp
         nx, ny, nz = self.shape
-        solid_c = self.sdf < 0.0
 
-        su = xp.ones((nx + 1, ny, nz), dtype=bool)
-        su[1:-1] = solid_c[1:] | solid_c[:-1]
-        sv = xp.ones((nx, ny + 1, nz), dtype=bool)
-        sv[:, 1:-1] = solid_c[:, 1:] | solid_c[:, :-1]
-        sw = xp.ones((nx, ny, nz + 1), dtype=bool)
-        sw[:, :, 1:-1] = solid_c[:, :, 1:] | solid_c[:, :, :-1]
-        self._solid_faces = (su, sv, sw, solid_c)
+        if self._solid_node_sdf is None:
+            solid_c = self.sdf < 0.0
+            alpha_u = xp.zeros((nx + 1, ny, nz), dtype=xp.float32)
+            alpha_u[1:-1] = (~(solid_c[1:] | solid_c[:-1])).astype(
+                xp.float32)
+            alpha_v = xp.zeros((nx, ny + 1, nz), dtype=xp.float32)
+            alpha_v[:, 1:-1] = (~(solid_c[:, 1:] | solid_c[:, :-1])).astype(
+                xp.float32)
+            alpha_w = xp.zeros((nx, ny, nz + 1), dtype=xp.float32)
+            alpha_w[:, :, 1:-1] = (
+                ~(solid_c[:, :, 1:] | solid_c[:, :, :-1])
+            ).astype(xp.float32)
+        else:
+            alpha_u, alpha_v, alpha_w = (
+                apertures.face_apertures_from_node_sdf(
+                    self._solid_node_sdf, array_module=xp)
+            )
+            solid_c = apertures.solid_cells_from_node_sdf(
+                self._solid_node_sdf, array_module=xp)
+            alpha_u = xp.clip(alpha_u, 0.0, 1.0).astype(xp.float32)
+            alpha_v = xp.clip(alpha_v, 0.0, 1.0).astype(xp.float32)
+            alpha_w = xp.clip(alpha_w, 0.0, 1.0).astype(xp.float32)
+
+            # The simulation domain is a closed box even when every node on
+            # an exterior face is outside the embedded solid.
+            alpha_u[0] = 0.0
+            alpha_u[-1] = 0.0
+            alpha_v[:, 0] = 0.0
+            alpha_v[:, -1] = 0.0
+            alpha_w[:, :, 0] = 0.0
+            alpha_w[:, :, -1] = 0.0
+
+        self._solid_faces = (alpha_u, alpha_v, alpha_w, solid_c)
         return self._solid_faces
 
-    def _extrapolate(self, u, valid, layers: int):
+    def _solid_face_masks(self):
+        """Compatibility view of the fully blocked solid faces."""
+        alpha_u, alpha_v, alpha_w, solid_c = self._solid_face_apertures()
+        return alpha_u <= 0.0, alpha_v <= 0.0, alpha_w <= 0.0, solid_c
+
+    def solid_aperture_stats(self) -> dict[str, int | str]:
+        """Summarize the active solid-boundary representation.
+
+        Counts cover all three MAC face grids, including closed simulation
+        domain faces, and therefore partition ``total_face_count`` exactly.
+        This call may synchronize a GPU backend and is intended for run
+        metadata, not the stepping hot path.
+        """
+        xp = self.be.xp
+        alpha_u, alpha_v, alpha_w, _ = self._solid_face_apertures()
+
+        def count(predicate) -> int:
+            value = self.be.to_numpy(xp.asarray(predicate.sum()))
+            return int(value.item())
+
+        faces = (alpha_u, alpha_v, alpha_w)
+        total = sum(int(alpha.size) for alpha in faces)
+        blocked = sum(count(alpha <= 0.0) for alpha in faces)
+        fractional = sum(
+            count((alpha > 0.0) & (alpha < 1.0)) for alpha in faces
+        )
+        opened = total - blocked - fractional
+        return {
+            "model": (
+                "fractional_node_sdf"
+                if self._solid_node_sdf is not None
+                else "binary_cell_center"
+            ),
+            "total_face_count": total,
+            "blocked_face_count": blocked,
+            "fractional_face_count": fractional,
+            "open_face_count": opened,
+        }
+
+    def _extrapolate(self, u, valid, layers: int, allowed=None):
         """Propagate velocities into invalid faces by neighbour averaging.
 
         Shifted-slice accumulation: no wrap-around to correct and roughly a
-        third of the kernel launches of an xp.roll formulation."""
+        third of the kernel launches of an xp.roll formulation.  ``allowed``
+        prevents propagation onto or through zero-aperture faces.
+        """
         xp = self.be.xp
+        if allowed is None:
+            allowed = xp.ones_like(valid, dtype=bool)
+        valid = valid & allowed
         for _ in range(layers):
             vf = valid.astype(u.dtype)
             uf = u * vf
@@ -287,7 +386,7 @@ class STFLIPSolver:
             c[:, :, :-1] += vf[:, :, 1:]
             s[:, :, 1:] += uf[:, :, :-1]
             c[:, :, 1:] += vf[:, :, :-1]
-            newly = (~valid) & (c > 0)
+            newly = (~valid) & allowed & (c > 0)
             u = xp.where(newly, s / xp.maximum(c, 1.0), u)
             valid = valid | newly
         return u, valid
@@ -386,11 +485,13 @@ class STFLIPSolver:
     def _step(self, dt: float, stats: FrameStats) -> None:
         xp = self.be.xp
         p = self.p
-        nx, ny, nz = self.shape
         dt_prev = self._dt_prev
 
         grids = self._p2g(dt_prev)
-        su, sv, sw, solid_c = self._solid_face_masks()
+        alpha_u, alpha_v, alpha_w, solid_c = self._solid_face_apertures()
+        open_u = alpha_u > 0.0
+        open_v = alpha_v > 0.0
+        open_w = alpha_w > 0.0
 
         # Save post-P2G velocities for the FLIP delta.
         old = {g: grids[g].copy() for g in ("u", "v", "w")}
@@ -401,25 +502,32 @@ class STFLIPSolver:
         grids["v"] = grids["v"] + g[1] * dt
         grids["w"] = grids["w"] + g[2] * dt
 
-        # No-through on solid faces before computing the divergence.
-        grids["u"] = xp.where(su, 0.0, grids["u"])
-        grids["v"] = xp.where(sv, 0.0, grids["v"])
-        grids["w"] = xp.where(sw, 0.0, grids["w"])
+        # No-through on fully blocked faces before computing the aperture-
+        # weighted flux divergence.  A partially open face stores the fluid
+        # velocity over its open area and remains active.
+        grids["u"] = xp.where(open_u, grids["u"], 0.0)
+        grids["v"] = xp.where(open_v, grids["v"], 0.0)
+        grids["w"] = xp.where(open_w, grids["w"], 0.0)
 
         liquid = (grids["c_phi"] >= 0.5) & (~solid_c)
 
-        # Face coefficients k_f = dt * alpha_f / max(rho * phi_f, eps) (Eq. 15).
+        # PPE coefficients are aperture-weighted, while the velocity update
+        # itself is not: k_f = dt * alpha_f / rho_f, followed by
+        # u_f <- u_f - dt/rho_f * grad(p) on every alpha_f > 0 face.
+        # This distinction is essential for fractional faces: alpha belongs
+        # in the flux constraint, not in the physical pressure acceleration.
         eps_rho = p.eps_rho_rel * p.rho
-        kx = dt / xp.maximum(p.rho * grids["u_phi"], eps_rho)
-        ky = dt / xp.maximum(p.rho * grids["v_phi"], eps_rho)
-        kz = dt / xp.maximum(p.rho * grids["w_phi"], eps_rho)
-        kx = xp.where(su, 0.0, kx)
-        ky = xp.where(sv, 0.0, ky)
-        kz = xp.where(sw, 0.0, kz)
+        inv_rho_u = 1.0 / xp.maximum(p.rho * grids["u_phi"], eps_rho)
+        inv_rho_v = 1.0 / xp.maximum(p.rho * grids["v_phi"], eps_rho)
+        inv_rho_w = 1.0 / xp.maximum(p.rho * grids["w_phi"], eps_rho)
+        kx = dt * alpha_u * inv_rho_u
+        ky = dt * alpha_v * inv_rho_v
+        kz = dt * alpha_w * inv_rho_w
 
-        div = ((grids["u"][1:, :, :] - grids["u"][:-1, :, :])
-               + (grids["v"][:, 1:, :] - grids["v"][:, :-1, :])
-               + (grids["w"][:, :, 1:] - grids["w"][:, :, :-1])) / p.dx
+        div = apertures.weighted_divergence(
+            grids["u"], grids["v"], grids["w"],
+            alpha_u, alpha_v, alpha_w, p.dx, array_module=xp,
+        )
 
         # Solve sum_f k_f (p_c - p_nb)/dx^2 = -(div u*)_c on liquid cells.
         rhs = -(div) * liquid
@@ -432,15 +540,21 @@ class STFLIPSolver:
 
         pm = pr * liquid
         gradx = (pm[1:, :, :] - pm[:-1, :, :]) / p.dx
-        grids["u"][1:-1, :, :] -= kx[1:-1, :, :] * gradx
+        correction = dt * inv_rho_u[1:-1, :, :] * gradx
+        grids["u"][1:-1, :, :] -= xp.where(
+            open_u[1:-1, :, :], correction, 0.0)
         grady = (pm[:, 1:, :] - pm[:, :-1, :]) / p.dx
-        grids["v"][:, 1:-1, :] -= ky[:, 1:-1, :] * grady
+        correction = dt * inv_rho_v[:, 1:-1, :] * grady
+        grids["v"][:, 1:-1, :] -= xp.where(
+            open_v[:, 1:-1, :], correction, 0.0)
         gradz = (pm[:, :, 1:] - pm[:, :, :-1]) / p.dx
-        grids["w"][:, :, 1:-1] -= kz[:, :, 1:-1] * gradz
+        correction = dt * inv_rho_w[:, :, 1:-1] * gradz
+        grids["w"][:, :, 1:-1] -= xp.where(
+            open_w[:, :, 1:-1], correction, 0.0)
 
-        grids["u"] = xp.where(su, 0.0, grids["u"])
-        grids["v"] = xp.where(sv, 0.0, grids["v"])
-        grids["w"] = xp.where(sw, 0.0, grids["w"])
+        grids["u"] = xp.where(open_u, grids["u"], 0.0)
+        grids["v"] = xp.where(open_v, grids["v"], 0.0)
+        grids["w"] = xp.where(open_w, grids["w"], 0.0)
 
         # Extrapolate into under-sampled faces so advection sees a full
         # field.  Jittered advection can move a particle up to 2*dt, i.e.
@@ -451,13 +565,17 @@ class STFLIPSolver:
         # a spurious energy kick (temporal weights can invalidate all of a
         # particle's own faces when theta lands in the kernel's zero tail).
         layers = int(math.ceil(2.0 * p.cfl_target)) + 2
-        for gname, sf in (("u", su), ("v", sv), ("w", sw)):
-            valid = grids[gname + "_valid"] & (~sf)
-            grids[gname], _ = self._extrapolate(grids[gname], valid, layers)
-            old[gname], _ = self._extrapolate(old[gname], valid, layers)
-            # Re-enforce no-through after extrapolation refills solid faces.
-            grids[gname] = xp.where(sf, 0.0, grids[gname])
-            old[gname] = xp.where(sf, 0.0, old[gname])
+        for gname, face_open in (
+            ("u", open_u), ("v", open_v), ("w", open_w),
+        ):
+            valid = grids[gname + "_valid"] & face_open
+            grids[gname], _ = self._extrapolate(
+                grids[gname], valid, layers, allowed=face_open)
+            old[gname], _ = self._extrapolate(
+                old[gname], valid, layers, allowed=face_open)
+            # Re-enforce no-through defensively after extrapolation.
+            grids[gname] = xp.where(face_open, grids[gname], 0.0)
+            old[gname] = xp.where(face_open, old[gname], 0.0)
 
         # G2P: FLIP/PIC blend (Sec 3.9, standard operator).
         u_new = self._sample_faces(grids, self.pos)

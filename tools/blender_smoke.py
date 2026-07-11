@@ -65,6 +65,30 @@ def run(backend: str = "cuda") -> dict:
         scene.frame_end = 2
         _finished(bpy.ops.stflip.quick_setup(), "quick setup")
 
+        # A rotated, sub-cell-aligned obstacle ensures the installed add-on
+        # exercises non-binary solid face apertures rather than domain walls
+        # alone.
+        bpy.ops.mesh.primitive_cube_add(
+            size=2.0,
+            location=(-0.05, 0.0, 0.42),
+            rotation=(0.21, 0.17, 0.29),
+        )
+        obstacle = bpy.context.active_object
+        obstacle.name = "STFLIP Smoke Obstacle"
+        obstacle.scale = (0.18, 0.32, 0.28)
+        obstacle.display_type = "WIRE"
+        obstacle.hide_render = True
+        obstacle.stflip.role = "OBSTACLE"
+        liquid = next(
+            (obj for obj in scene.objects
+             if getattr(getattr(obj, "stflip", None), "role", None)
+             == "LIQUID"),
+            None,
+        )
+        if liquid is None:
+            raise AssertionError("quick setup liquid was not created")
+        liquid.stflip.initial_velocity = (4.0, 0.0, 0.0)
+
         settings = scene.stflip
         settings.experiment_profile = "ENSTROPHY_CFL_10_FLIP_99"
         _finished(
@@ -80,8 +104,15 @@ def run(backend: str = "cuda") -> dict:
             raise AssertionError(
                 f"requested {backend!r}, bake used {meta['backend']!r}"
             )
-        if meta.get("version") != 2 or meta.get("settings", {}).get("seed") != 0:
-            raise AssertionError("cache metadata lacks the v2 settings snapshot")
+        if meta.get("version") != 3 or meta.get("settings", {}).get("seed") != 0:
+            raise AssertionError("cache metadata lacks the v3 settings snapshot")
+        if meta.get("addon_version") != installed_version:
+            raise AssertionError("cache metadata add-on version is stale")
+        boundary = meta.get("solid_boundary", {})
+        if boundary.get("model") != "fractional_node_sdf":
+            raise AssertionError("node-SDF solid boundary model was not used")
+        if boundary.get("fractional_face_count", 0) <= 0:
+            raise AssertionError("smoke obstacle produced no fractional faces")
         provenance = meta.get("experiment_profile", {})
         if provenance.get("matched") != settings.experiment_profile:
             raise AssertionError("applied profile provenance was not preserved")
@@ -95,6 +126,20 @@ def run(backend: str = "cuda") -> dict:
             raise AssertionError("evolved frame lacks synchronized solver timing")
         if metrics[-1]["mac_grid_enstrophy_estimate"] is None:
             raise AssertionError("enstrophy diagnostic was not recorded")
+        final_positions, _ = stflip_cache.read_frame(str(cache_dir), 2)
+        if float(final_positions[:, 0].max()) <= -0.2:
+            raise AssertionError("liquid front did not reach the smoke obstacle")
+        from mathutils import Vector
+
+        obstacle_inverse = obstacle.matrix_world.inverted()
+        deeply_inside = sum(
+            max(abs(value) for value in obstacle_inverse @ Vector(position))
+            < 0.6
+            for position in final_positions
+        )
+        if deeply_inside:
+            raise AssertionError(
+                f"{deeply_inside} particles remained deep inside the obstacle")
         csv_path = cache_dir / "smoke_metrics.csv"
         json_path = cache_dir / "smoke_metrics.json"
         _finished(
@@ -127,6 +172,8 @@ def run(backend: str = "cuda") -> dict:
             "particles": len(particles.data.vertices),
             "velocity_attribute": True,
             "surface": surface.name,
+            "fractional_solid_faces": boundary["fractional_face_count"],
+            "particles_deep_inside_obstacle": deeply_inside,
             "metric_frames": len(metrics),
             "metrics_exports": [csv_path.name, json_path.name],
             "elapsed_s": time.perf_counter() - started,

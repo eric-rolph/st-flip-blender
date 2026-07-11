@@ -2,8 +2,9 @@
 
 Solves  sum_f k_f (p_c - p_nb) / dx^2 = -(div u*)_c  on liquid cells with a
 matrix-free Jacobi-preconditioned conjugate gradient.  Face coefficients
-k_f = dt * alpha_f / max(rho(phi_f), eps_rho) come directly from the P2G
-weight-accumulator phase field, so no surface reconstruction is needed.
+k_f = dt * alpha_f / max(rho(phi_f), eps_rho) combine solid-geometry face
+apertures with density values from the P2G weight-accumulator phase field, so
+no liquid-surface reconstruction is needed.
 
 Air cells (phi_c < 0.5) are Dirichlet p = 0 and are simply excluded from the
 system; because their pressure value is zero, masking p by the liquid mask
