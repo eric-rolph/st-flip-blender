@@ -21,6 +21,11 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
             ("NONE", "None", "Not part of the simulation"),
             ("LIQUID", "Liquid", "Initial liquid volume (closed mesh)"),
             ("INFLOW", "Inflow", "Continuously emits liquid (closed mesh)"),
+            (
+                "OUTFLOW",
+                "Outflow",
+                "Removes liquid through a closed-mesh outlet volume",
+            ),
             ("OBSTACLE", "Obstacle", "Solid obstacle (closed mesh)"),
         ],
         default="NONE",
@@ -72,6 +77,25 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
         precision=4,
         description="Signed angular speed in radians per scene second; "
                     "positive values follow the right-hand rule",
+    )
+    outflow_mode: EnumProperty(
+        name="Outflow Mode",
+        items=[
+            (
+                "VOLUME",
+                "Volume Sink",
+                "Delete particles inside this volume; this is a geometric "
+                "sink, not a pressure boundary",
+            ),
+            (
+                "PRESSURE",
+                "Pressure Outlet",
+                "Open covered exterior domain faces at atmospheric pressure "
+                "and remove particles after they cross those faces; the mesh "
+                "must intersect a domain boundary",
+            ),
+        ],
+        default="VOLUME",
     )
 
 
@@ -142,6 +166,32 @@ class STFLIPSettings(bpy.types.PropertyGroup):
                     "transition and levels sampling wells more aggressively; "
                     "larger preserves more detail but also more noise",
     )
+    density: FloatProperty(
+        name="Liquid Density", default=1000.0, min=1e-6,
+        soft_max=5000.0,
+        description="Liquid density used by the variable-density pressure "
+                    "projection (mass per cubic Blender unit)",
+    )
+    local_cfl: FloatProperty(
+        name="Local Advection CFL", default=1.0, min=0.05, max=4.0,
+        description="Maximum particle travel in grid cells per local "
+                    "advection substep; independent of Target CFL",
+    )
+    pcg_tolerance: FloatProperty(
+        name="PCG Tolerance", default=1e-4, min=1e-8, max=1e-1,
+        precision=6,
+        description="Relative residual tolerance for the pressure solve",
+    )
+    pcg_max_iterations: IntProperty(
+        name="PCG Max Iterations", default=400, min=1, max=10000,
+        description="Maximum pressure-solver iterations per simulation step",
+    )
+    density_floor_relative: FloatProperty(
+        name="Relative Density Floor", default=1e-3, min=1e-8, max=1.0,
+        precision=6,
+        description="Minimum face density as a fraction of Liquid Density; "
+                    "prevents singular projection coefficients",
+    )
     backend: EnumProperty(
         name="Compute Backend",
         items=[
@@ -167,7 +217,42 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         name="Surface Voxel", default=0.5, min=0.1, max=2.0,
         description="Surfacing voxel size in cell widths",
     )
+    surface_smoothing: BoolProperty(
+        name="Geometric Smoothing", default=False,
+        description="Apply Blender's Laplacian Smooth modifier to the "
+                    "display mesh; this is post-process geometry smoothing, "
+                    "not the paper's MCF reconstruction",
+    )
+    surface_smoothing_iterations: IntProperty(
+        name="Smoothing Iterations", default=2, min=1, max=50,
+        description="Iterations for Blender's Laplacian Smooth modifier",
+    )
+    surface_smoothing_factor: FloatProperty(
+        name="Smoothing Factor", default=0.35, min=-2.0, max=2.0,
+        description="Lambda factor for Blender's Laplacian Smooth modifier",
+    )
     bake_status: StringProperty(name="Bake Status", default="")
+    bake_state: EnumProperty(
+        name="Bake State",
+        items=[
+            ("IDLE", "Idle", "No bake is active"),
+            ("RUNNING", "Running", "A bake is currently running"),
+            ("COMPLETE", "Complete", "The requested frame range was baked"),
+            ("CANCELLED", "Cancelled", "The bake was stopped by the user"),
+            ("FAILED", "Failed", "The bake stopped because of an error"),
+        ],
+        default="IDLE",
+    )
+    bake_error: StringProperty(name="Bake Error", default="")
+    bake_progress: FloatProperty(
+        name="Bake Progress", default=0.0, min=0.0, max=1.0,
+        subtype="FACTOR",
+    )
+    cache_id: StringProperty(
+        name="Cache Owner ID", default="", options={"HIDDEN"},
+        description="Persistent scene identifier used to prevent cache "
+                    "ownership collisions",
+    )
     # Robust bindings to the bake outputs (survive renames; null on delete).
     particle_object: PointerProperty(type=bpy.types.Object)
     surface_object: PointerProperty(type=bpy.types.Object)

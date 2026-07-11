@@ -16,7 +16,7 @@ import numpy as np
 
 
 METRICS_SCHEMA = "stflip.frame_metrics"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # This order is both the strict JSONL schema and the stable CSV column order.
 FRAME_FIELD_ORDER = (
@@ -25,7 +25,11 @@ FRAME_FIELD_ORDER = (
     "simulation_time_s",
     "target_cfl",
     "particle_count",
+    "particles_removed",
+    "volume_outflow_removed",
+    "pressure_outflow_removed",
     "solver_steps",
+    "inactive_time_s",
     "dt_min_s",
     "dt_mean_s",
     "dt_max_s",
@@ -211,7 +215,7 @@ def measure_frame(
     phase_threshold: float = 0.5,
     array_module=None,
 ) -> dict[str, Any]:
-    """Build one strict schema-v1 record from a cached particle snapshot."""
+    """Build one strict schema-v2 record from a cached particle snapshot."""
     if isinstance(frame, bool) or not isinstance(frame, (int, np.integer)):
         raise TypeError("frame must be an integer")
     simulation_time = _finite_float(simulation_time_s, "simulation_time_s")
@@ -245,6 +249,12 @@ def measure_frame(
         "dt_values",
     )
     dt_min, dt_mean, dt_max = _dt_summary(dt_values)
+    inactive_time = _finite_float(
+        getattr(stats, "inactive_time_s", 0.0) if stats is not None else 0.0,
+        "inactive_time_s",
+    )
+    if inactive_time < 0.0:
+        raise ValueError("inactive_time_s must not be negative")
     estimated_cfl = _finite_values(
         getattr(stats, "particle_cfl_estimated_values", None)
         if stats is not None
@@ -299,13 +309,30 @@ def measure_frame(
     particle_volume = dx**3 / ppc
     particle_mass = rho * particle_volume
     momentum = particle_mass * velocity_sum
+    removed_counts = {
+        name: int(getattr(stats, name, 0) if stats is not None else 0)
+        for name in (
+            "particles_removed",
+            "volume_outflow_removed",
+            "pressure_outflow_removed",
+        )
+    }
+    if any(value < 0 for value in removed_counts.values()):
+        raise ValueError("outflow removal counts must not be negative")
+    if removed_counts["particles_removed"] != (
+        removed_counts["volume_outflow_removed"]
+        + removed_counts["pressure_outflow_removed"]
+    ):
+        raise ValueError("outflow removal counts must sum to particles_removed")
     record = {
         "schema_version": SCHEMA_VERSION,
         "frame": int(frame),
         "simulation_time_s": simulation_time,
         "target_cfl": target_cfl,
         "particle_count": count,
+        **removed_counts,
         "solver_steps": int(getattr(stats, "steps", 0) if stats is not None else 0),
+        "inactive_time_s": inactive_time,
         "dt_min_s": dt_min,
         "dt_mean_s": dt_mean,
         "dt_max_s": dt_max,
@@ -367,6 +394,30 @@ def validate_frame_record(record: Mapping[str, Any]) -> None:
     frame = record["frame"]
     if isinstance(frame, bool) or not isinstance(frame, int):
         raise TypeError("metric frame must be an integer")
+    for name in (
+        "particle_count",
+        "particles_removed",
+        "volume_outflow_removed",
+        "pressure_outflow_removed",
+        "solver_steps",
+    ):
+        value = record[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"metric field {name!r} must be an integer")
+        if value < 0:
+            raise ValueError(f"metric field {name!r} must not be negative")
+    if record["particles_removed"] != (
+        record["volume_outflow_removed"]
+        + record["pressure_outflow_removed"]
+    ):
+        raise ValueError("outflow removal counts must sum to particles_removed")
+    inactive_time = record["inactive_time_s"]
+    if isinstance(inactive_time, bool) or not isinstance(
+        inactive_time, (int, float)
+    ):
+        raise TypeError("metric field 'inactive_time_s' must be numeric")
+    if inactive_time < 0.0:
+        raise ValueError("metric field 'inactive_time_s' must not be negative")
     for name, value in record.items():
         if not isinstance(value, _SCALAR_TYPES):
             raise TypeError(f"metric field {name!r} must be a JSON scalar")

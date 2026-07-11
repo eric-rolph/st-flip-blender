@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - name: Verify version tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(
+              Path("blender_manifest.toml").read_text("utf-8")
+          )
+          expected = f"v{manifest['version']}"
+          actual = os.environ["RELEASE_TAG"]
+          if actual != expected:
+              raise SystemExit(
+                  f"tag {actual!r} does not match manifest {expected!r}"
+              )
+          PY
+      - name: Run release tests
+        run: uv run --python 3.12 --with pytest --with numpy pytest tests -q
+      - name: Build deterministic extension archive
+        run: python tools/build_extension.py
+      - name: Write SHA-256 checksum
+        run: cd dist && sha256sum st_flip-*.zip > SHA256SUMS.txt
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/st_flip-*.zip dist/SHA256SUMS.txt
+          --verify-tag --generate-notes
+          --title "ST-FLIP Fluid $GITHUB_REF_NAME"

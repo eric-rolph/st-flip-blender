@@ -51,3 +51,39 @@ def test_zero_rhs_gives_zero_pressure():
     p, iters, rel = pressure.solve(np, rhs * 0.0, kx, ky, kz, liquid)
     assert np.allclose(p, 0.0)
     assert iters == 0
+
+
+def test_exterior_coefficients_use_half_cell_dirichlet_terms():
+    liquid = np.ones((1, 1, 1), dtype=bool)
+    p = np.asarray([[[3.0]]])
+    kx = np.asarray([[[2.0]], [[5.0]]])
+    ky = np.asarray([[[7.0], [11.0]]])
+    kz = np.asarray([[[13.0, 17.0]]])
+
+    applied = pressure.apply_laplacian(np, p, kx, ky, kz, liquid)
+    diag = pressure.diagonal(np, kx, ky, kz, liquid)
+    expected_diagonal = 2.0 * (2.0 + 5.0 + 7.0 + 11.0 + 13.0 + 17.0)
+
+    assert diag[0, 0, 0] == expected_diagonal
+    assert applied[0, 0, 0] == expected_diagonal * 3.0
+
+
+def test_operator_stays_symmetric_with_open_exterior_coefficients():
+    rng = np.random.default_rng(17)
+    _, kx, ky, kz, liquid = _setup(n=5)
+    liquid[:] = True
+    kx[0] = rng.uniform(0.1, 1.0, size=kx[0].shape)
+    kx[-1] = rng.uniform(0.1, 1.0, size=kx[-1].shape)
+    ky[:, 0] = rng.uniform(0.1, 1.0, size=ky[:, 0].shape)
+    ky[:, -1] = rng.uniform(0.1, 1.0, size=ky[:, -1].shape)
+    kz[:, :, 0] = rng.uniform(0.1, 1.0, size=kz[:, :, 0].shape)
+    kz[:, :, -1] = rng.uniform(0.1, 1.0, size=kz[:, :, -1].shape)
+    x = rng.standard_normal(liquid.shape)
+    y = rng.standard_normal(liquid.shape)
+
+    ax = pressure.apply_laplacian(np, x, kx, ky, kz, liquid)
+    ay = pressure.apply_laplacian(np, y, kx, ky, kz, liquid)
+
+    np.testing.assert_allclose(
+        np.vdot(ax, y), np.vdot(x, ay), rtol=1e-12, atol=1e-12
+    )

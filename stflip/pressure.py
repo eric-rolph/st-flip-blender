@@ -8,8 +8,12 @@ no liquid-surface reconstruction is needed.
 
 Air cells (phi_c < 0.5) are Dirichlet p = 0 and are simply excluded from the
 system; because their pressure value is zero, masking p by the liquid mask
-implements the boundary condition while keeping the operator symmetric
-positive definite.  Solid faces carry k = 0 and drop out naturally.
+implements the boundary condition while keeping the operator symmetric.
+Dirichlet air/outlet contact anchors a component and makes it positive
+definite; a sealed all-liquid component retains the usual constant-pressure
+nullspace and is positive semidefinite. Solid faces carry k = 0 and drop out
+naturally. Nonzero exterior-face coefficients represent open p=0 boundaries
+at half-cell distance, and therefore contribute twice their face coefficient.
 """
 
 from __future__ import annotations
@@ -19,7 +23,8 @@ def apply_laplacian(xp, p, kx, ky, kz, liquid):
     """A p = sum_f k_f (p_c - p_nb), restricted to liquid rows.
 
     p, liquid: (nx, ny, nz); kx: (nx+1, ny, nz); ky: (nx, ny+1, nz);
-    kz: (nx, ny, nz+1).  Boundary faces of the domain must have k = 0.
+    kz: (nx, ny, nz+1). Nonzero exterior coefficients impose p=0 at the
+    boundary face, half a cell from the adjacent pressure sample.
     """
     pm = p * liquid
     out = xp.zeros_like(p)
@@ -40,6 +45,15 @@ def apply_laplacian(xp, p, kx, ky, kz, liquid):
     out[:, :, 1:] += fz * d
     out[:, :, :-1] -= fz * d
 
+    # Exterior Dirichlet p=0 is half a cell from the boundary cell centre,
+    # hence 2*k rather than the full-cell internal-face coefficient k.
+    out[0, :, :] += 2.0 * kx[0, :, :] * pm[0, :, :]
+    out[-1, :, :] += 2.0 * kx[-1, :, :] * pm[-1, :, :]
+    out[:, 0, :] += 2.0 * ky[:, 0, :] * pm[:, 0, :]
+    out[:, -1, :] += 2.0 * ky[:, -1, :] * pm[:, -1, :]
+    out[:, :, 0] += 2.0 * kz[:, :, 0] * pm[:, :, 0]
+    out[:, :, -1] += 2.0 * kz[:, :, -1] * pm[:, :, -1]
+
     return out * liquid
 
 
@@ -50,6 +64,14 @@ def diagonal(xp, kx, ky, kz, liquid):
         + ky[:, 1:, :] + ky[:, :-1, :]
         + kz[:, :, 1:] + kz[:, :, :-1]
     )
+    # The sum above includes each exterior coefficient once. Add it once more
+    # to match the half-cell (2*k) terms in apply_laplacian.
+    diag[0, :, :] += kx[0, :, :]
+    diag[-1, :, :] += kx[-1, :, :]
+    diag[:, 0, :] += ky[:, 0, :]
+    diag[:, -1, :] += ky[:, -1, :]
+    diag[:, :, 0] += kz[:, :, 0]
+    diag[:, :, -1] += kz[:, :, -1]
     return diag * liquid
 
 

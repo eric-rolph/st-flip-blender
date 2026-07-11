@@ -9,7 +9,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - name: Run tests (CPU backend)
         run: uv run --python 3.12 --with pytest --with numpy pytest tests -v
+      - name: Lint packaged Python
+        run: uvx ruff check --isolated stflip addon tests tools
+      - name: Build Blender extension
+        run: python tools/build_extension.py
+      - name: Upload installable extension
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/st_flip-*.zip
+          archive: false
+          if-no-files-found: error
