@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from stflip import Params, STFLIPSolver
+from stflip import Params, STFLIPSolver, cuda_diagnostics
 
 
 def _dam_break(n=24, cfl=8.0, st=True, seed=0, ppc=8):
@@ -21,6 +21,30 @@ def test_m0_calibration_close_to_ppc():
     s = _dam_break()
     # Normalised kernels: expected accumulator ~ particles-per-cell.
     assert 0.7 * 8 <= s.m0 <= 1.3 * 8
+
+
+def test_phase_field_uses_eq13_transition_scale():
+    """Eq. 13 is C(m / (eta_phi * m0)), C(x) = min(sqrt(x), 1)."""
+    p = Params(
+        resolution=(4, 4, 4), dx=0.25, gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1, st_enabled=False, eta_phi=0.25, seed=11,
+    )
+    s = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[1, 1, 1] = True
+    s.add_liquid_mask(mask)
+    # Keep every nonzero sample in C's unsaturated branch so the transition
+    # scale (rather than only the clamp) is exercised.
+    s.m0 = 100.0
+
+    grids = s._p2g(p.frame_dt)
+
+    for grid_name in ("u", "v", "w", "c"):
+        mass = s.be.to_numpy(grids[f"{grid_name}_m"])
+        phase = s.be.to_numpy(grids[f"{grid_name}_phi"])
+        expected = np.minimum(np.sqrt(mass / (p.eta_phi * s.m0)), 1.0)
+        assert np.any((expected > 0.0) & (expected < 1.0))
+        np.testing.assert_allclose(phase, expected, rtol=1e-6, atol=1e-7)
 
 
 def test_dam_break_runs_and_stays_finite():
@@ -70,7 +94,7 @@ def test_still_pool_stays_calm():
     assert speed.max() < 3.0
 
 
-def test_plain_flip_mode_runs():
+def test_instantaneous_p2g_ablation_runs():
     s = _dam_break(st=False)
     for _ in range(2):
         s.step_frame()
@@ -84,6 +108,30 @@ def test_render_particles_resynchronised_shape():
     pos, vel = s.get_render_particles()
     assert pos.shape == s.pos.shape and vel.shape == s.vel.shape
     assert np.all(np.isfinite(pos))
+
+
+def test_advection_local_cfl_is_not_clipped_at_40_substeps():
+    class SampleCountingSolver(STFLIPSolver):
+        sample_calls = 0
+
+        def _sample_faces(self, grids, pos):
+            self.sample_calls += 1
+            return self.be.xp.zeros_like(pos)
+
+    p = Params(
+        resolution=(4, 4, 4), dx=1.0, gravity=(0.0, 0.0, 0.0),
+        cfl_local=1.0,
+    )
+    s = SampleCountingSolver(p, "cpu")
+    s.pos = s.be.xp.asarray([[1.5, 1.5, 1.5]], dtype=s.be.xp.float32)
+    # ceil(41 cells / cfl_local) requires 41 RK substeps. Each Ralston RK3
+    # substep samples the velocity field three times.
+    s.vel = s.be.xp.asarray([[41.0, 0.0, 0.0]], dtype=s.be.xp.float32)
+    dt_act = s.be.xp.asarray([1.0], dtype=s.be.xp.float32)
+
+    s._advect({}, s.pos.copy(), dt_act)
+
+    assert s.sample_calls == 3 * 41
 
 
 def test_solid_obstacle_blocks_particles():
@@ -140,19 +188,57 @@ def test_no_energy_kick_for_zero_temporal_weight_particles():
 @pytest.mark.gpu
 def test_gpu_backend_parity():
     cupy = pytest.importorskip("cupy")
-    assert cupy.cuda.runtime.getDeviceCount() > 0
+    available, reason = cuda_diagnostics(force=True)
+    assert available, reason
+
     s_cpu = _dam_break(n=16, seed=7)
     s_gpu = STFLIPSolver(s_cpu.p, "cuda")
     mask = np.zeros((16, 16, 16), dtype=bool)
     mask[:5, :, :8] = True
     s_gpu.add_liquid_mask(mask)
+
+    # The backend must keep solver state and compute results on-device.
+    assert s_gpu.be.xp is cupy
+    assert isinstance(s_gpu.pos, cupy.ndarray)
+    assert isinstance(s_gpu.vel, cupy.ndarray)
+    kernel_values = s_gpu.be.from_numpy(
+        np.asarray([1.0, 2.0, 3.0], dtype=np.float32))
+    kernel_result = kernel_values * kernel_values + 1.0
+    assert isinstance(kernel_result, cupy.ndarray)
+    assert float(kernel_result.sum()) == pytest.approx(17.0)
+    scatter_result = cupy.zeros((2,), dtype=cupy.float32)
+    s_gpu.be.scatter_add(
+        scatter_result,
+        cupy.asarray([0, 0, 1], dtype=cupy.int32),
+        cupy.asarray([1.0, 2.0, 4.0], dtype=cupy.float32),
+    )
+    s_gpu.be.synchronize()
+    np.testing.assert_array_equal(
+        s_gpu.be.to_numpy(scatter_result), np.asarray([3.0, 4.0]))
+
     for _ in range(2):
-        s_cpu.step_frame()
-        s_gpu.step_frame()
+        cpu_stats = s_cpu.step_frame()
+        gpu_stats = s_gpu.step_frame()
+        assert gpu_stats.steps == cpu_stats.steps
+        # A nonzero PCG iteration count proves the pressure projection ran.
+        assert gpu_stats.pcg_iters and all(i > 0 for i in gpu_stats.pcg_iters)
+    s_gpu.be.synchronize()
+
+    assert s_gpu._grids
+    assert all(isinstance(value, cupy.ndarray)
+               for value in s_gpu._grids.values())
+
+    pos_c = s_cpu.be.to_numpy(s_cpu.pos)
     pos_g = s_gpu.be.to_numpy(s_gpu.pos)
+    vel_c = s_cpu.be.to_numpy(s_cpu.vel)
+    vel_g = s_gpu.be.to_numpy(s_gpu.vel)
     assert np.all(np.isfinite(pos_g))
-    assert pos_g.shape == s_cpu.be.to_numpy(s_cpu.pos).shape
-    # Chaotic dynamics preclude bitwise parity; compare bulk statistics.
-    com_c = s_cpu.be.to_numpy(s_cpu.pos).mean(axis=0)
-    com_g = pos_g.mean(axis=0)
-    assert np.linalg.norm(com_c - com_g) < 0.1
+    np.testing.assert_allclose(pos_g, pos_c, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(vel_g, vel_c, rtol=2e-5, atol=2e-6)
+    for grid_name in ("u", "v", "w", "u_phi", "v_phi", "w_phi", "c_phi"):
+        np.testing.assert_allclose(
+            s_gpu.be.to_numpy(s_gpu._grids[grid_name]),
+            s_cpu.be.to_numpy(s_cpu._grids[grid_name]),
+            rtol=2e-5,
+            atol=2e-6,
+        )
