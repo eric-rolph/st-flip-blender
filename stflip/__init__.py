@@ -12,14 +12,17 @@ from .backend import (
     get_backend,
 )
 from .solver import FrameStats, Params, STFLIPSolver
+from .velocity import SolidBodyRotation, UniformVelocity
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "Backend",
     "FrameStats",
     "Params",
+    "SolidBodyRotation",
     "STFLIPSolver",
+    "UniformVelocity",
     "cuda_available",
     "cuda_device_name",
     "cuda_diagnostics",

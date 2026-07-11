@@ -1,12 +1,26 @@
 import numpy as np
 import pytest
 
-from stflip import FrameStats, Params, STFLIPSolver, cuda_diagnostics
+from stflip import (
+    FrameStats,
+    Params,
+    SolidBodyRotation,
+    STFLIPSolver,
+    UniformVelocity,
+    cuda_diagnostics,
+)
 from stflip.apertures import weighted_divergence
 from stflip.metrics import estimate_mac_grid_metrics, measure_frame
 
 
-def _dam_break(n=24, cfl=8.0, st=True, seed=0, ppc=8):
+def _dam_break(
+    n=24,
+    cfl=8.0,
+    st=True,
+    seed=0,
+    ppc=8,
+    velocity=(0.0, 0.0, 0.0),
+):
     p = Params(
         resolution=(n, n, n), dx=1.0 / n, gravity=(0.0, 0.0, -9.81),
         frame_dt=1.0 / 24.0, cfl_target=cfl, particles_per_cell=ppc,
@@ -15,7 +29,7 @@ def _dam_break(n=24, cfl=8.0, st=True, seed=0, ppc=8):
     s = STFLIPSolver(p, "cpu")
     mask = np.zeros((n, n, n), dtype=bool)
     mask[: n // 3, :, : n // 2] = True
-    s.add_liquid_mask(mask)
+    s.add_liquid_mask(mask, velocity)
     return s
 
 
@@ -47,6 +61,139 @@ def test_phase_field_uses_eq13_transition_scale():
         expected = np.minimum(np.sqrt(mass / (p.eta_phi * s.m0)), 1.0)
         assert np.any((expected > 0.0) & (expected < 1.0))
         np.testing.assert_allclose(phase, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_legacy_and_uniform_velocity_seed_identical_particle_state():
+    p = Params(
+        resolution=(4, 4, 4),
+        dx=0.25,
+        gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=8,
+        seed=91,
+    )
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[1:3, 1:3, 1:3] = True
+    legacy = STFLIPSolver(p, "cpu")
+    explicit = STFLIPSolver(p, "cpu")
+
+    legacy.add_liquid_mask(mask, (1.25, -0.5, 0.125))
+    explicit.add_liquid_mask(mask, UniformVelocity((1.25, -0.5, 0.125)))
+
+    np.testing.assert_array_equal(legacy.pos, explicit.pos)
+    np.testing.assert_array_equal(legacy.vel, explicit.vel)
+    np.testing.assert_array_equal(legacy.dt_resid, explicit.dt_resid)
+
+
+def test_solid_body_rotation_samples_actual_jittered_particle_positions():
+    p = Params(
+        resolution=(4, 4, 4),
+        dx=0.25,
+        gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=8,
+        seed=27,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[1, 1, 1] = True
+    field = SolidBodyRotation(
+        center=(0.5, 0.5, 0.5),
+        angular_velocity=(0.0, 0.0, 2.0),
+        linear_velocity=(0.25, -0.125, 0.5),
+    )
+
+    assert solver.add_liquid_mask(mask, field) == 8
+
+    positions = solver.be.to_numpy(solver.pos)
+    velocities = solver.be.to_numpy(solver.vel)
+    np.testing.assert_array_equal(velocities, field.sample(positions))
+    # Sampling cell centres would give one shared value; actual particle
+    # sampling must preserve the velocity variation from spatial jitter.
+    assert np.unique(velocities[:, :2], axis=0).shape[0] > 1
+
+
+def test_inflow_rotation_is_resampled_at_each_new_particle_position():
+    p = Params(
+        resolution=(3, 3, 3),
+        dx=0.25,
+        gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+        seed=42,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[1, 1, 1] = True
+    field = SolidBodyRotation(
+        center=(0.25, 0.25, 0.25),
+        angular_velocity=(0.0, 0.0, 1.0),
+        linear_velocity=(0.1, 0.2, 0.3),
+    )
+    solver.add_inflow(mask, field)
+
+    solver._seed_inflows()
+    first_positions = solver.be.to_numpy(solver.pos).copy()
+    np.testing.assert_array_equal(
+        solver.be.to_numpy(solver.vel), field.sample(first_positions)
+    )
+
+    xp = solver.be.xp
+    solver.pos = xp.zeros((0, 3), dtype=xp.float32)
+    solver.vel = xp.zeros((0, 3), dtype=xp.float32)
+    solver.dt_resid = xp.zeros((0,), dtype=xp.float32)
+    solver._seed_inflows()
+    second_positions = solver.be.to_numpy(solver.pos)
+
+    assert not np.array_equal(second_positions, first_positions)
+    np.testing.assert_array_equal(
+        solver.be.to_numpy(solver.vel), field.sample(second_positions)
+    )
+
+
+def test_velocity_inputs_are_validated_even_when_masks_are_empty():
+    p = Params(resolution=(2, 2, 2), dx=0.5, particles_per_cell=1)
+    solver = STFLIPSolver(p, "cpu")
+    empty = np.zeros(p.resolution, dtype=bool)
+
+    with pytest.raises(ValueError, match="three finite values"):
+        solver.add_liquid_mask(empty, (np.nan, 0.0, 0.0))
+    with pytest.raises(ValueError, match="three finite values"):
+        solver.add_inflow(empty, (0.0, np.inf, 0.0))
+
+
+def test_liquid_and_inflow_masks_must_match_the_solver_grid():
+    p = Params(resolution=(2, 3, 4), dx=0.5, particles_per_cell=1)
+    solver = STFLIPSolver(p, "cpu")
+    outside = np.ones((3, 3, 4), dtype=bool)
+    broadcastable = np.ones((1, 3, 4), dtype=bool)
+
+    with pytest.raises(ValueError, match="cell_mask must have solver shape"):
+        solver.add_liquid_mask(outside)
+    with pytest.raises(ValueError, match="cell_mask must have solver shape"):
+        solver.add_inflow(broadcastable)
+
+    assert solver.pos.shape == (0, 3)
+    assert not solver._inflows
+
+
+def test_inflow_owns_its_cell_mask_after_registration():
+    p = Params(
+        resolution=(2, 2, 2),
+        dx=0.5,
+        gravity=(0.0, 0.0, 0.0),
+        particles_per_cell=1,
+        seed=12,
+    )
+    solver = STFLIPSolver(p, "cpu")
+    mask = np.zeros(p.resolution, dtype=bool)
+    mask[0, 0, 0] = True
+    solver.add_inflow(mask)
+
+    # Mutating caller-owned storage must not retarget a registered inflow.
+    mask[:] = False
+    mask[1, 1, 1] = True
+    solver._seed_inflows()
+
+    seeded_cell = np.floor(solver.pos[0] / p.dx).astype(int)
+    np.testing.assert_array_equal(seeded_cell, (0, 0, 0))
 
 
 def test_dam_break_runs_and_stays_finite():
@@ -376,7 +523,12 @@ def test_gpu_backend_parity():
     available, reason = cuda_diagnostics(force=True)
     assert available, reason
 
-    s_cpu = _dam_break(n=16, seed=7)
+    initial_field = SolidBodyRotation(
+        center=(0.5, 0.5, 0.5),
+        angular_velocity=(0.0, 0.0, 0.25),
+        linear_velocity=(0.1, 0.0, 0.0),
+    )
+    s_cpu = _dam_break(n=16, seed=7, velocity=initial_field)
     s_gpu = STFLIPSolver(s_cpu.p, "cuda")
     # A fractional cut near the far x wall exercises node-SDF aperture math,
     # alpha-weighted projection, and setup statistics on both backends without
@@ -393,7 +545,16 @@ def test_gpu_backend_parity():
     assert s_gpu.solid_aperture_stats()["fractional_face_count"] > 0
     mask = np.zeros((16, 16, 16), dtype=bool)
     mask[:5, :, :8] = True
-    s_gpu.add_liquid_mask(mask)
+    s_gpu.add_liquid_mask(mask, initial_field)
+
+    # Jitter and velocity-field evaluation both happen in host float32 before
+    # upload, so initial state is bitwise identical across solver backends.
+    np.testing.assert_array_equal(
+        s_gpu.be.to_numpy(s_gpu.pos), s_cpu.be.to_numpy(s_cpu.pos)
+    )
+    np.testing.assert_array_equal(
+        s_gpu.be.to_numpy(s_gpu.vel), s_cpu.be.to_numpy(s_cpu.vel)
+    )
 
     # The backend must keep solver state and compute results on-device.
     assert s_gpu.be.xp is cupy

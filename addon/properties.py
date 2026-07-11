@@ -32,8 +32,46 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
     initial_velocity: FloatVectorProperty(
         name="Initial Velocity", subtype="VELOCITY", size=3,
         default=(0.0, 0.0, 0.0),
-        description="Uniform starting velocity for particles seeded from "
-                    "this liquid volume",
+        description="World-space linear starting velocity for particles "
+                    "seeded from this liquid volume; in Solid Body mode it "
+                    "is superposed on the rotational velocity",
+    )
+    initial_velocity_mode: EnumProperty(
+        name="Initial Velocity Mode",
+        items=[
+            ("UNIFORM", "Uniform", "Use one world-space velocity vector"),
+            (
+                "SOLID_BODY",
+                "Solid Body Rotation",
+                "Use linear velocity plus a world-space rigid rotation",
+            ),
+        ],
+        default="UNIFORM",
+    )
+    rotation_center_world: FloatVectorProperty(
+        name="Rotation Center (World)",
+        subtype="TRANSLATION",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        description="Rotation center in Blender world coordinates; it is "
+                    "not transformed with the liquid object",
+    )
+    rotation_axis_world: FloatVectorProperty(
+        name="Rotation Axis (World)",
+        subtype="DIRECTION",
+        size=3,
+        default=(0.0, 0.0, 1.0),
+        description="World-space rotation axis; normalized when baking and "
+                    "not transformed with the liquid object",
+    )
+    angular_speed: FloatProperty(
+        name="Angular Speed (rad/s)",
+        default=0.1,
+        soft_min=-10.0,
+        soft_max=10.0,
+        precision=4,
+        description="Signed angular speed in radians per scene second; "
+                    "positive values follow the right-hand rule",
     )
 
 

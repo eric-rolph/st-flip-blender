@@ -61,7 +61,20 @@ class STFLIP_PT_object(bpy.types.Panel):
             return
         layout.prop(obj.stflip, "role", text="Role")
         if obj.stflip.role == "LIQUID":
-            layout.prop(obj.stflip, "initial_velocity")
+            settings = obj.stflip
+            layout.prop(settings, "initial_velocity_mode", text="Velocity")
+            layout.prop(
+                settings,
+                "initial_velocity",
+                text=("Uniform Velocity"
+                      if settings.initial_velocity_mode == "UNIFORM"
+                      else "Linear Velocity"),
+            )
+            if settings.initial_velocity_mode == "SOLID_BODY":
+                col = layout.column(align=True)
+                col.prop(settings, "rotation_center_world")
+                col.prop(settings, "rotation_axis_world")
+                col.prop(settings, "angular_speed")
         elif obj.stflip.role == "INFLOW":
             layout.prop(obj.stflip, "inflow_velocity")
 

@@ -16,6 +16,7 @@ import tomllib
 from pathlib import Path
 
 import bpy
+import numpy as np
 
 
 def _finished(result: set[str], operation: str) -> None:
@@ -87,7 +88,11 @@ def run(backend: str = "cuda") -> dict:
         )
         if liquid is None:
             raise AssertionError("quick setup liquid was not created")
+        liquid.stflip.initial_velocity_mode = "SOLID_BODY"
         liquid.stflip.initial_velocity = (4.0, 0.0, 0.0)
+        liquid.stflip.rotation_center_world = (0.15, -0.2, 0.3)
+        liquid.stflip.rotation_axis_world = (0.0, 0.0, 2.0)
+        liquid.stflip.angular_speed = 1.5
 
         settings = scene.stflip
         settings.experiment_profile = "ENSTROPHY_CFL_10_FLIP_99"
@@ -104,8 +109,8 @@ def run(backend: str = "cuda") -> dict:
             raise AssertionError(
                 f"requested {backend!r}, bake used {meta['backend']!r}"
             )
-        if meta.get("version") != 3 or meta.get("settings", {}).get("seed") != 0:
-            raise AssertionError("cache metadata lacks the v3 settings snapshot")
+        if meta.get("version") != 4 or meta.get("settings", {}).get("seed") != 0:
+            raise AssertionError("cache metadata lacks the v4 settings snapshot")
         if meta.get("addon_version") != installed_version:
             raise AssertionError("cache metadata add-on version is stale")
         boundary = meta.get("solid_boundary", {})
@@ -126,6 +131,34 @@ def run(backend: str = "cuda") -> dict:
             raise AssertionError("evolved frame lacks synchronized solver timing")
         if metrics[-1]["mac_grid_enstrophy_estimate"] is None:
             raise AssertionError("enstrophy diagnostic was not recorded")
+        initial_positions, initial_velocities = stflip_cache.read_frame(
+            str(cache_dir), 1)
+        source = next(
+            (item for item in meta.get("liquid_sources", [])
+             if item.get("name") == liquid.name),
+            None,
+        )
+        if source is None or source.get("initial_velocity_mode") != "SOLID_BODY":
+            raise AssertionError("solid-body liquid metadata was not preserved")
+        rotation = source.get("solid_body_rotation", {})
+        omega = np.asarray(
+            rotation.get("angular_velocity_world"), dtype=np.float32)
+        center = np.asarray(
+            rotation.get("center_world"), dtype=np.float32)
+        linear = np.asarray(source.get("initial_velocity"), dtype=np.float32)
+        if omega.shape != (3,) or center.shape != (3,) or linear.shape != (3,):
+            raise AssertionError("solid-body metadata vectors are malformed")
+        expected_velocities = linear + np.cross(
+            np.broadcast_to(omega, initial_positions.shape),
+            initial_positions.astype(np.float32) - center,
+        )
+        initial_velocity_max_error = float(np.max(np.abs(
+            initial_velocities - expected_velocities)))
+        if initial_velocity_max_error > 1e-5:
+            raise AssertionError(
+                "solid-body initial velocity mismatch: "
+                f"max error {initial_velocity_max_error:.3g}"
+            )
         final_positions, _ = stflip_cache.read_frame(str(cache_dir), 2)
         if float(final_positions[:, 0].max()) <= -0.2:
             raise AssertionError("liquid front did not reach the smoke obstacle")
@@ -173,6 +206,8 @@ def run(backend: str = "cuda") -> dict:
             "velocity_attribute": True,
             "surface": surface.name,
             "fractional_solid_faces": boundary["fractional_face_count"],
+            "initial_velocity_mode": source["initial_velocity_mode"],
+            "initial_velocity_max_error": initial_velocity_max_error,
             "particles_deep_inside_obstacle": deeply_inside,
             "metric_frames": len(metrics),
             "metrics_exports": [csv_path.name, json_path.name],

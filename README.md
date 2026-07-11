@@ -100,7 +100,24 @@ settings.
 | Interface Steepness (η) | Eq. 13 | Lower = steeper/stronger leveling; higher = finer detail/noise |
 | FLIP Fraction | §4 | FLIP/PIC blend (default 0.98) |
 | Random Seed | §3.10 | Reproducible particle placement and temporal jitter; seed 0 is an add-on default, not a published paper value |
-| Initial / Inflow Velocity | §4.8 | Uniform velocity per liquid or inflow mesh; general spatial fields are not supported |
+| Initial / Inflow Velocity | §4.8 | Per-liquid uniform or solid-body rotational initial velocity; inflow meshes remain uniform |
+
+### Solid-body initial velocity
+
+For each **Liquid** object, choose **Solid Body Rotation** to initialize the
+actual jittered particles with
+`u(x) = v_linear + omega × (x - center)`. The center and axis are entered in
+Blender world coordinates. The axis is normalized, the signed angular speed
+is in radians per scene second, and positive speed follows the right-hand
+rule. The linear velocity is superposed on the rotation. Field sampling uses
+a deterministic host-float32 path, so a fixed seed produces the same initial
+particle positions and velocities on CPU and CUDA.
+
+With the paper's vertical axis mapped through Blender's world origin, its
+whirlpool initialization is represented by center `(0, 0, 0)`, axis `+Z`,
+zero linear velocity, and angular speed `0.1 rad/s`. This reproduces the
+published initial velocity field, not the complete experiment: the
+cylindrical bottom outflow and an exact scene preset are still unavailable.
 
 ### Experiment profiles and diagnostics
 
@@ -139,7 +156,7 @@ outside the reported solver-only wall time.
 
 ### Paper coverage
 
-Version 0.4 implements the paper's **single-phase, free-surface ST-FLIP
+Version 0.5 implements the paper's **single-phase, free-surface ST-FLIP
 core**; it is not a full reproduction of every solver variant and production
 example in the paper.
 
@@ -167,13 +184,15 @@ Experiment-level coverage is narrower than method-level coverage:
 | Particle-count and FLIP-blend studies | ST-FLIP-side parameter profiles, deterministic seed, and enstrophy diagnostic are available; true FLIP/GFM branches, SDF RMSE, and batch-sweep tooling are not |
 | Kleefsman obstacle validation | Missing water-height gauges and experimental-data comparison |
 | MCF reconstruction study | Missing MCF and normal-RMSE evaluation |
-| Whirlpool, rotational fields, and outflow scenes | Missing general spatial velocity fields and outflow boundaries |
+| Whirlpool, rotational fields, and outflow scenes | Partial: the published solid-body rotational initialization is controllable; the cylindrical outflow and exact scene preset are missing |
 | Two-phase glugging/discharge and production-scale scenes | Missing two-phase solver and sparse production grid |
 
 The Blender UI exposes these inputs for the implemented single-phase solver:
 resolution, target CFL, particles/cell, `γ`, adaptive attenuation, `η`,
-FLIP/PIC blend, seed, backend, gravity, frame rate/range, inflow velocity, and
-per-liquid initial velocity, plus surface display radius/voxel size. Every
+FLIP/PIC blend, seed, backend, gravity, frame rate/range, uniform inflow
+velocity, and per-liquid uniform or solid-body initial velocity (linear
+velocity, world center/axis, and signed angular speed), plus surface display
+radius/voxel size. Every
 bake records these settings in its cache metadata. The solver's Python
 `Params` API additionally exposes liquid density, pressure tolerance/iteration
 limit, local advection CFL, the under-sampling threshold, and the relative
@@ -199,6 +218,8 @@ because the corresponding algorithms are not implemented.
 - Particle re-synchronisation (un-jittering) at output frames
 - Stationary solid obstacles via cell/node-sampled voxelised SDF, fractional
   face apertures, and particle push-back; inflow emitters
+- Uniform and right-handed solid-body initial velocity fields, sampled at the
+  actual jittered particle positions with deterministic CPU/CUDA setup
 - NumPy CPU + CuPy CUDA backends sharing one code path
 - Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy
@@ -207,6 +228,8 @@ Not (yet) implemented from the paper: two-phase air–liquid coupling, surface
 tension (CSF), APIC transfers, sparse/adaptive grids, mean-curvature-flow
 surface smoothing (Appendix B — the Geometry Nodes volume meshing stands in),
 and the paper's standard-FLIP/GFM and implicit-density-projection baselines.
+Outflow boundaries, including the whirlpool experiment's cylindrical bottom
+pipe, are also not yet implemented.
 
 Known limitations: scene voxelization (mesh → grid masks/SDF) is a pure
 Python BVH loop and gets slow above resolution ~128 — vectorizing it is on

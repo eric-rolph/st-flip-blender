@@ -43,9 +43,13 @@ def _load_operators(monkeypatch, tmp_path):
     solver = types.ModuleType(f"{root}.stflip.solver")
     solver.Params = object
     solver.STFLIPSolver = object
+    velocity = types.ModuleType(f"{root}.stflip.velocity")
+    velocity.SolidBodyRotation = object
+    velocity.UniformVelocity = object
     monkeypatch.setitem(sys.modules, cache.__name__, cache)
     monkeypatch.setitem(sys.modules, backend.__name__, backend)
     monkeypatch.setitem(sys.modules, solver.__name__, solver)
+    monkeypatch.setitem(sys.modules, velocity.__name__, velocity)
 
     for leaf in ("handlers", "mesher", "voxelize"):
         module = types.ModuleType(f"{root}.addon.{leaf}")

@@ -236,6 +236,7 @@ from ..stflip.backend import (  # noqa: E402
     get_backend,
 )
 from ..stflip.solver import Params, STFLIPSolver  # noqa: E402
+from ..stflip.velocity import SolidBodyRotation, UniformVelocity  # noqa: E402
 from . import handlers, mesher, voxelize  # noqa: E402
 from .handlers import resolve_cache_dir  # noqa: E402
 
@@ -246,6 +247,83 @@ _BAKE: dict = {}
 def _fluid_objects(scene, role: str):
     return [o for o in scene.objects
             if o.type == "MESH" and o.stflip.role == role]
+
+
+def _finite_vector3(value, label: str, source_name: str) -> np.ndarray:
+    """Return a finite float64 vector with a source-specific error."""
+    try:
+        vector = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{source_name}: {label} must contain three finite values"
+        ) from exc
+    if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+        raise ValueError(
+            f"{source_name}: {label} must contain three finite values"
+        )
+    return vector
+
+
+def resolve_liquid_initial_velocity(settings, domain_origin, source_name):
+    """Resolve Blender world-space controls to a solver-local field.
+
+    The returned descriptor is constructed from the same normalized field
+    passed to the solver, so cache metadata records the values actually used.
+    """
+    source_name = str(source_name)
+    linear = _finite_vector3(
+        settings.initial_velocity, "Initial Velocity", source_name)
+    origin = _finite_vector3(domain_origin, "Domain Origin", source_name)
+    mode = str(settings.initial_velocity_mode)
+
+    if mode == "UNIFORM":
+        field = UniformVelocity(tuple(linear))
+        return field, {
+            "name": source_name,
+            "initial_velocity": list(field.value),
+            "initial_velocity_mode": mode,
+        }
+    if mode != "SOLID_BODY":
+        raise ValueError(
+            f"{source_name}: unknown Initial Velocity Mode {mode!r}")
+
+    center_world = _finite_vector3(
+        settings.rotation_center_world, "Rotation Center", source_name)
+    axis_authored = _finite_vector3(
+        settings.rotation_axis_world, "Rotation Axis", source_name)
+    axis_length = float(np.linalg.norm(axis_authored))
+    if not np.isfinite(axis_length) or axis_length <= 1e-12:
+        raise ValueError(f"{source_name}: Rotation Axis must be non-zero")
+    try:
+        angular_speed = float(settings.angular_speed)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{source_name}: Angular Speed must be finite") from exc
+    if not math.isfinite(angular_speed):
+        raise ValueError(f"{source_name}: Angular Speed must be finite")
+
+    axis_unit = axis_authored / axis_length
+    center_solver = center_world - origin
+    angular_velocity = axis_unit * angular_speed
+    field = SolidBodyRotation(
+        center=tuple(center_solver),
+        angular_velocity=tuple(angular_velocity),
+        linear_velocity=tuple(linear),
+    )
+    descriptor = {
+        "name": source_name,
+        "initial_velocity": list(field.linear_velocity),
+        "initial_velocity_mode": mode,
+        "solid_body_rotation": {
+            "center_world": [float(value) for value in center_world],
+            "center_solver_local": list(field.center),
+            "axis_world_authored": [float(value) for value in axis_authored],
+            "axis_world_unit": [float(value) for value in axis_unit],
+            "angular_speed_radians_per_second": angular_speed,
+            "angular_velocity_world": list(field.angular_velocity),
+        },
+    }
+    return field, descriptor
 
 
 def _system_available_memory_bytes() -> int | None:
@@ -548,6 +626,20 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
         deps = context.evaluated_depsgraph_get()
         dims, dx, origin = voxelize.domain_grid(st.domain, st.resolution)
+        try:
+            liquid_velocity_sources = [
+                (
+                    obj,
+                    *resolve_liquid_initial_velocity(
+                        obj.stflip, origin, obj.name),
+                )
+                for obj in liquids
+            ]
+        except ValueError as exc:
+            message = str(exc)
+            st.bake_status = f"Bake blocked: {message}"
+            self.report({"ERROR"}, message)
+            return False
         fps = scene.render.fps / scene.render.fps_base
         gravity = tuple(scene.gravity) if scene.use_gravity else (0.0, 0.0, 0.0)
         params = Params(
@@ -628,12 +720,12 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
         not_solid = (solid_sdf > 0.0) if solid_sdf is not None else None
         seeded = 0
-        for obj in liquids:
+        for obj, velocity_field, _descriptor in liquid_velocity_sources:
             mask = voxelize.mask_from_object(obj, deps, origin, dx, dims)
             if not_solid is not None:
                 mask &= not_solid
             seeded += solver.add_liquid_mask(
-                mask, tuple(obj.stflip.initial_velocity))
+                mask, velocity_field)
         for obj in inflows:
             mask = voxelize.mask_from_object(obj, deps, origin, dx, dims)
             if not_solid is not None:
@@ -689,9 +781,8 @@ class STFLIP_OT_bake(bpy.types.Operator):
                     st.collect_metrics and st.collect_enstrophy),
             },
             "liquid_sources": [
-                {"name": obj.name,
-                 "initial_velocity": list(obj.stflip.initial_velocity)}
-                for obj in liquids
+                descriptor
+                for _obj, _field, descriptor in liquid_velocity_sources
             ],
             "inflow_sources": [
                 {"name": obj.name,
@@ -702,7 +793,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 **solver.solid_aperture_stats(),
                 "obstacle_count": len(obstacles),
             },
-            "version": 3,
+            "version": 4,
         }
         from ..stflip.experiments import profile_provenance
 
