@@ -25,6 +25,8 @@ TOP_LEVEL_FILES = (
     "README.md",
 )
 PACKAGE_DIRS = ("addon", "stflip")
+NORMALIZED_TEXT_SUFFIXES = {".md", ".py", ".toml", ".txt"}
+NORMALIZED_TEXT_NAMES = {"LICENSE"}
 
 
 def package_files(root: Path = ROOT) -> list[Path]:
@@ -48,17 +50,34 @@ def default_output(root: Path = ROOT) -> Path:
     return root / "dist" / f"{manifest['id']}-{manifest['version']}.zip"
 
 
+def package_payload(path: Path) -> bytes:
+    """Return platform-neutral bytes for one allow-listed package file.
+
+    Git may materialize text files with CRLF on Windows and LF on Linux. The
+    extension archive is a release artifact, so normalize known text payloads
+    explicitly instead of letting checkout settings change its digest.
+    """
+    payload = path.read_bytes()
+    if (path.suffix.lower() in NORMALIZED_TEXT_SUFFIXES
+            or path.name in NORMALIZED_TEXT_NAMES):
+        payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return payload
+
+
 def build(output: Path | None = None, root: Path = ROOT) -> Path:
     output = (output or default_output(root)).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED,
-                         compresslevel=9) as archive:
+    # Source-only extensions are small. Storing entries verbatim avoids zlib
+    # implementation/version variance, making the complete ZIP reproducible
+    # once text payloads and metadata are normalized.
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
         for path in package_files(root):
             relative = path.relative_to(root).as_posix()
             info = zipfile.ZipInfo(relative, date_time=(2026, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3  # fixed Unix metadata on every build host
+            info.compress_type = zipfile.ZIP_STORED
             info.external_attr = 0o644 << 16
-            archive.writestr(info, path.read_bytes(), compresslevel=9)
+            archive.writestr(info, package_payload(path))
     return output
 
 
