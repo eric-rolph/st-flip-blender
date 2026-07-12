@@ -11,7 +11,7 @@ Large-time-step FLIP liquid simulation based on:
 bl_info = {
     "name": "ST-FLIP Fluid",
     "author": "Eric Rolph",
-    "version": (0, 15, 0),
+    "version": (0, 16, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > ST-FLIP",
     "description": "Large-time-step FLIP liquid simulation (ST-FLIP, "

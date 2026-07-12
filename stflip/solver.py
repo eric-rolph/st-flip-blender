@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import apertures, kernels, pressure, surface_tension, viscosity
+from . import apertures, forces, kernels, pressure, surface_tension, viscosity
 from .backend import Backend, get_backend
 from .velocity import VelocityField, VelocityInput, as_velocity_field
 
@@ -312,6 +312,11 @@ class STFLIPSolver:
         # Cell offset of the last stored (windowed) grids for sparse resync.
         self._full_shape = (nx, ny, nz)
         self._grid_origin = None
+        # Art-directable body forces (wind/vortex/turbulence); each is a spec
+        # dict consumed in _step_core.  The frame origin is the sparse-window
+        # cell offset so world-space forces stay put when the window moves.
+        self._forces: list[dict] = []
+        self._frame_origin_cells = np.zeros(3, dtype=np.float64)
 
         # Masks stay on-device for occupancy checks; immutable velocity fields
         # stay on the host so each refill is sampled deterministically at its
@@ -679,6 +684,68 @@ class STFLIPSolver:
             self._has_pressure_outflow = True
             self._pressure_outflow_faces = None
         self._outflow_geometry_stats_cache = None
+
+    def add_force(self, force_type: str, strength: float, *,
+                  direction=(0.0, 0.0, 1.0), center=(0.0, 0.0, 0.0),
+                  axis=(0.0, 0.0, 1.0), radius: float = 1e9,
+                  scale: float = 1.0, seed: int = 0) -> None:
+        """Register an art-directable body force applied like gravity.
+
+        ``force_type`` is 'DIRECTIONAL' (wind along ``direction``), 'VORTEX'
+        (swirl about ``axis`` through ``center`` with ``radius`` falloff), or
+        'TURBULENCE' (divergence-free curl noise of wavelength ``scale``).
+        ``strength`` is the acceleration magnitude; centre/axis are world-space.
+        """
+        ft = str(force_type).strip().upper()
+        if ft not in {"DIRECTIONAL", "VORTEX", "TURBULENCE"}:
+            raise ValueError(
+                "force_type must be DIRECTIONAL, VORTEX, or TURBULENCE")
+        if not math.isfinite(float(strength)):
+            raise ValueError("force strength must be finite")
+        self._forces.append({
+            "type": ft, "strength": float(strength),
+            "direction": tuple(float(v) for v in direction),
+            "center": tuple(float(v) for v in center),
+            "axis": tuple(float(v) for v in axis),
+            "radius": float(radius), "scale": float(scale), "seed": int(seed),
+        })
+
+    def _apply_forces(self, grids, dt: float) -> None:
+        """Add each registered body force to the face velocities (like gravity),
+        using world coordinates that respect the active sparse window."""
+        if not self._forces:
+            return
+        xp = self.be.xp
+        origin = self._frame_origin_cells
+        accel = None
+        for f in self._forces:
+            ft = f["type"]
+            if ft == "DIRECTIONAL":
+                a = forces.directional_accel(
+                    xp, self.shape, self.p.dx, f["direction"], f["strength"])
+            elif ft == "VORTEX":
+                a = forces.vortex_accel(
+                    xp, self.shape, self.p.dx, f["center"], f["axis"],
+                    f["strength"], f["radius"], origin)
+            else:
+                a = forces.turbulence_accel(
+                    xp, self.shape, self.p.dx, f["strength"], f["scale"],
+                    self.time, f["seed"], origin)
+            if a is None:
+                continue
+            accel = a if accel is None else accel + a
+        if accel is None:
+            return
+        # Cell-centred acceleration -> face acceleration -> velocity increment.
+        au = xp.zeros_like(grids["u"])
+        au[1:-1] = 0.5 * (accel[1:, :, :, 0] + accel[:-1, :, :, 0])
+        av = xp.zeros_like(grids["v"])
+        av[:, 1:-1] = 0.5 * (accel[:, 1:, :, 1] + accel[:, :-1, :, 1])
+        aw = xp.zeros_like(grids["w"])
+        aw[:, :, 1:-1] = 0.5 * (accel[:, :, 1:, 2] + accel[:, :, :-1, 2])
+        grids["u"] = grids["u"] + dt * au
+        grids["v"] = grids["v"] + dt * av
+        grids["w"] = grids["w"] + dt * aw
 
     def _validate_cell_mask(self, cell_mask: np.ndarray) -> np.ndarray:
         try:
@@ -1600,12 +1667,15 @@ class STFLIPSolver:
         self._clamp_hi = xp.asarray([n - eps for n in self.size],
                                     dtype=xp.float32)
         self._domain_size_dev = xp.asarray(self.size, dtype=xp.float32)
+        # World-space forces need the window's cell offset to stay put.
+        self._frame_origin_cells = np.asarray(lo, dtype=np.float64)
         return saved
 
     def _exit_window(self, saved):
         (self.shape, self.size, self.sdf, self._sdf_grad, self.solid_vel,
          self._solid_faces, self._solid_exterior_apertures, self._clamp_lo,
          self._clamp_hi, self._domain_size_dev) = saved
+        self._frame_origin_cells = np.zeros(3, dtype=np.float64)
 
     # ------------------------------------------------------------------- step
 
@@ -1644,11 +1714,13 @@ class STFLIPSolver:
         # Save post-P2G velocities for the FLIP delta (FLIP transfer only).
         old = ({g: grids[g].copy() for g in ("u", "v", "w")} if flip else None)
 
-        # External forces (grid-based, Sec 3.3).
+        # External forces (grid-based, Sec 3.3): gravity, then art-directable
+        # body forces (wind/vortex/turbulence).
         g = p.gravity
         grids["u"] = grids["u"] + g[0] * dt
         grids["v"] = grids["v"] + g[1] * dt
         grids["w"] = grids["w"] + g[2] * dt
+        self._apply_forces(grids, dt)
 
         # Face densities rho(phi_f) = rho_l phi_f + rho_g (1 - phi_f).
         # Free-surface: phi_u is the space-time accumulator so rho collapses to

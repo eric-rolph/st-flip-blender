@@ -2386,6 +2386,23 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 continue
             solver.add_outflow(mask, mode=mode)
 
+        # Art-directable force fields: the object's world +Z axis is the
+        # direction/vortex axis, its origin the vortex centre.
+        for obj in _fluid_objects(scene, "FORCE"):
+            fs = obj.stflip
+            mw = np.array(obj.matrix_world, dtype=np.float64).reshape(4, 4)
+            zaxis = mw[:3, 2]
+            norm = float(np.linalg.norm(zaxis))
+            if norm > 1e-9:
+                zaxis = zaxis / norm
+            center = tuple(float(v) for v in mw[:3, 3])
+            solver.add_force(
+                fs.force_type, float(fs.force_strength),
+                direction=tuple(float(v) for v in zaxis),
+                axis=tuple(float(v) for v in zaxis), center=center,
+                radius=float(fs.force_radius), scale=float(fs.force_scale),
+                seed=int(st.seed) + abs(hash(obj.name)) % 100000)
+
         initial_outflow_cull = (
             solver.cull_outflows() if not is_resume else {})
         seeded = int(solver.pos.shape[0])
