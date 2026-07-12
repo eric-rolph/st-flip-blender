@@ -776,6 +776,7 @@ def _solver_params(settings, dims, dx, gravity, fps):
         cfl_local=settings.local_cfl,
         pcg_tol=settings.pcg_tolerance,
         pcg_max_iter=settings.pcg_max_iterations,
+        pressure_solver=settings.pressure_solver,
         eps_rho_rel=settings.density_floor_relative,
         transfer=settings.transfer,
         two_phase=settings.two_phase,

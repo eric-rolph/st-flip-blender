@@ -265,6 +265,7 @@ class STFLIP_PT_advanced(bpy.types.Panel):
         col.prop(st, "local_cfl")
         col.prop(st, "pcg_tolerance")
         col.prop(st, "pcg_max_iterations")
+        col.prop(st, "pressure_solver")
 
 
 class STFLIP_PT_experiment(bpy.types.Panel):

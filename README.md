@@ -250,6 +250,7 @@ solid support.
 | Initial / Inflow Velocity | §4.8 | Liquid and inflow sources can use uniform or solid-body rotational fields; inflows can be limited to an inclusive scene-frame range |
 | Outflow Mode | §4.8 | Interior particle-removal volume or exterior half-cell `p=0` pressure outlet |
 | Advanced Solver | §3.3, §3.7 | Liquid density, local advection CFL, PCG tolerance/limit, and relative density floor |
+| Pressure Solver | §3.6–3.7 | PPE preconditioner: Jacobi-PCG (default) or a geometric multigrid V-cycle whose iteration count is nearly resolution-independent; multigrid falls back to Jacobi on grids too small to coarsen |
 | Paper MCF Surface | Appendix B | Fixed radius/voxel `0.5Δx`, Gaussian `σ=2Δx`, feature mask `θ=2, ζ=5`, and `0.5` isovalue; `kψ` defaults to 30 |
 
 ### Source velocity fields
