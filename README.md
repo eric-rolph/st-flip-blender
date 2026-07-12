@@ -438,6 +438,10 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
   particle/whitewater clouds) as an animated cache for render farms and
   other DCCs, from the ST-FLIP > Downstream Export panel or
   `bpy.ops.stflip.export_cache(filepath=...)` headless
+- **Motion blur setup**: one click enables render motion blur and samples
+  per-particle velocity onto the topology-changing surface (Geometry Nodes)
+  so the surface and point clouds motion-blur; surface deformation blur
+  needs Cycles
 - NumPy CPU + CuPy CUDA backends sharing one code path
 - Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy
