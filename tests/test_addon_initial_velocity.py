@@ -412,6 +412,12 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         pcg_tolerance=2e-5,
         pcg_max_iterations=321,
         density_floor_relative=7e-4,
+        transfer="apic",
+        two_phase=True,
+        rho_gas=1.3,
+        gas_particles_per_cell=5,
+        surface_tension=0.02,
+        sparse=True,
     )
 
     result = operators._solver_params(
@@ -436,6 +442,12 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         "pcg_tol": 2e-5,
         "pcg_max_iter": 321,
         "eps_rho_rel": 7e-4,
+        "transfer": "apic",
+        "two_phase": True,
+        "rho_gas": 1.3,
+        "gas_particles_per_cell": 5,
+        "surface_tension": 0.02,
+        "sparse": True,
     }
 
 
