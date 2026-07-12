@@ -13,6 +13,15 @@ This is an independent implementation of **ST-FLIP**:
 
 [![ST Flip Blender](https://img.youtube.com/vi/VwIIyES4_Gg/maxresdefault.jpg)](https://youtu.be/VwIIyES4_Gg)
 
+**New here?** The [User Guide](docs/README.md) has step-by-step tutorials:
+[getting started](docs/getting-started.md) ·
+[object roles](docs/object-roles.md) ·
+[recipes](docs/recipes.md) ·
+[settings guide](docs/settings-guide.md) ·
+[performance](docs/performance-and-scaling.md) ·
+[rendering & export](docs/rendering-and-export.md) ·
+[troubleshooting](docs/troubleshooting.md).
+
 ## Why ST-FLIP?
 
 Hybrid FLIP solvers can remain numerically stable when particles cross several
