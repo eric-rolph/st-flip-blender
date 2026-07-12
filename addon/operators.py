@@ -2755,12 +2755,13 @@ class STFLIP_OT_bake(bpy.types.Operator):
             collect_metrics = bool(st.collect_metrics)
             collect_enstrophy = bool(
                 st.collect_metrics and st.collect_enstrophy)
-            pos, vel = solver.get_render_particles()
+            pos, vel, attrs = solver.get_render_particles_ex()
             cache.write_frame(
                 cache_dir,
                 current_frame,
                 pos + origin[None, :].astype(np.float32),
                 vel,
+                attributes=attrs,
             )
             cache.write_checkpoint(
                 cache_dir,
@@ -2952,10 +2953,10 @@ class STFLIP_OT_bake(bpy.types.Operator):
         else:
             compute_wall_s = None
         b["frame"] += 1
-        pos, vel = solver.get_render_particles()
+        pos, vel, attrs = solver.get_render_particles_ex()
         world_positions = pos + b["origin"][None, :]
         cache.write_frame(b["cache_dir"], b["frame"],
-                          world_positions, vel)
+                          world_positions, vel, attributes=attrs)
         ww = b.get("whitewater")
         if ww is not None:
             try:

@@ -1456,3 +1456,55 @@ def test_gpu_backend_parity():
             cpu_grid_metrics["phase_threshold_volume_fraction_estimate"])
     assert gpu_grid_metrics["mac_grid_enstrophy_estimate"] == pytest.approx(
         cpu_grid_metrics["mac_grid_enstrophy_estimate"], rel=2e-4, abs=2e-6)
+
+
+def test_shading_attributes_age_source_speed():
+    """Exported attributes: age grows with time, source ids distinguish
+    seeding sources, speed matches |velocity|, all aligned to positions."""
+    import numpy as np
+    from stflip import Params, STFLIPSolver
+    n = 16
+    s = STFLIPSolver(Params(resolution=(n, n, n), dx=1.0 / n,
+                            gravity=(0, 0, -9.81), frame_dt=1 / 24,
+                            cfl_target=6.0, seed=0), "cpu")
+    a = np.zeros((n, n, n), bool)
+    a[:n // 3, :, :n // 2] = True
+    b = np.zeros((n, n, n), bool)
+    b[2 * n // 3:, :, :n // 2] = True
+    s.add_liquid_mask(a)          # source 0
+    s.add_liquid_mask(b)          # source 1
+    for _ in range(3):
+        s.step_frame()
+    pos, vel, attrs = s.get_render_particles_ex()
+    assert set(attrs) == {"age", "source", "speed"}
+    assert len(pos) == len(vel) == len(attrs["age"]) == len(attrs["source"])
+    assert len(attrs["speed"]) == len(pos)
+    # two sources present
+    assert set(np.unique(attrs["source"]).tolist()) == {0, 1}
+    # age is positive (particles have existed for 3 frames)
+    assert attrs["age"].min() > 0.0
+    assert attrs["age"].max() <= 3.0 / 24.0 + 1e-4
+    # speed equals |velocity|
+    assert np.allclose(attrs["speed"], np.linalg.norm(vel, axis=1), atol=1e-5)
+
+
+def test_shading_attributes_survive_outflow_and_reconcile():
+    import numpy as np
+    from stflip import Params, STFLIPSolver
+    n = 16
+    s = STFLIPSolver(Params(resolution=(n, n, n), dx=1.0 / n,
+                            gravity=(0, 0, -9.81), frame_dt=1 / 24,
+                            cfl_target=6.0, seed=1), "cpu")
+    m = np.zeros((n, n, n), bool)
+    m[:, :, n // 2:] = True
+    s.add_liquid_mask(m)
+    drain = np.zeros((n, n, n), bool)
+    drain[:, :, :2] = True
+    s.add_outflow(drain, mode="VOLUME")
+    for _ in range(4):
+        s.step_frame()
+    # attrs stay length-consistent with the culled particle set
+    assert s.age.shape[0] == s.pos.shape[0]
+    assert s.source_id.shape[0] == s.pos.shape[0]
+    pos, vel, attrs = s.get_render_particles_ex()
+    assert len(attrs["age"]) == len(pos)

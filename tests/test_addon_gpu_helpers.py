@@ -446,6 +446,11 @@ def test_runtime_paper_failure_does_not_abort_particle_frame_commit(
             np.zeros((1, 3), dtype=np.float32),
             np.zeros((1, 3), dtype=np.float32),
         ),
+        get_render_particles_ex=lambda: (
+            np.zeros((1, 3), dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+            {},
+        ),
         checkpoint_state=lambda: {},
     )
     settings = types.SimpleNamespace(

@@ -429,6 +429,9 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
 - **Sparse production grid** (v0.9): every step crops to a block-aligned active
   window (fluid + extrapolation band), bitwise-identical to the dense solve;
   disengages when outflows or cut-cell node-SDF solids are present
+- **Shading attributes** on the particle point cloud: `velocity`, `speed`,
+  `age` (seconds since seeding), and `source` (per-source id) for age-fade,
+  speed-driven effects, and per-source colouring in shaders/Geometry Nodes
 - NumPy CPU + CuPy CUDA backends sharing one code path
 - Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy
