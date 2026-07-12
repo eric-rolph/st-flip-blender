@@ -117,6 +117,9 @@ class Params:
     visc_tol: float = 1e-5            # implicit-diffusion CG tolerance
     visc_max_iter: int = 200
 
+    # --- Particle sheeting / anti-clumping (position-only) ---------------
+    sheeting: float = 0.0             # 0..~1 strength; spreads clumps, fills voids
+
     # --- Sparse production grid (active-block domain cropping) -----------
     sparse: bool = False              # crop grids to the active particle region
     block_size: int = 8               # active-block granularity (cells)
@@ -217,6 +220,10 @@ class Params:
         if not math.isfinite(visc) or visc < 0.0:
             raise ValueError("viscosity must be non-negative")
         self.viscosity = visc
+        sh = float(self.sheeting)
+        if not math.isfinite(sh) or sh < 0.0:
+            raise ValueError("sheeting must be non-negative")
+        self.sheeting = sh
         vt = float(self.visc_tol)
         if not math.isfinite(vt) or vt <= 0.0:
             raise ValueError("visc_tol must be positive")
@@ -1361,6 +1368,38 @@ class STFLIPSolver:
                              + Dinv[:, 2, 2] * b[:, 2])
         return u_new, C
 
+    def _apply_sheeting(self) -> None:
+        """Position-only anti-clumping (sheeting).
+
+        Nudges particles a small clamped step down the local density gradient,
+        spreading over-dense clumps and filling voids so thin sheets and
+        splashes hold together.  Touches only positions, not velocity, so it
+        adds no kinetic energy and cannot destabilise the sim."""
+        if self.pos.shape[0] == 0:
+            return
+        xp = self.be.xp
+        dx = self.p.dx
+        # Smooth the (aliased) per-cell count before differentiating so the
+        # gradient captures the macro dense->sparse trend, not per-cell noise.
+        counts = surface_tension.smooth_phase(
+            xp, self._cell_counts().astype(xp.float32), iters=2)
+        gx, gy, gz = xp.gradient(counts, dx)
+        g = xp.stack([self._sample_cells(gx, self.pos),
+                      self._sample_cells(gy, self.pos),
+                      self._sample_cells(gz, self.pos)], axis=1)
+        ref = max(float(self.p.particles_per_cell), 1.0)
+        disp = -(self.p.sheeting * dx * dx / ref) * g
+        mag = _norm_rows(xp, disp)
+        scale = xp.minimum(1.0, (0.3 * dx) / xp.maximum(mag, 1e-12))
+        # Gate to genuinely over-dense interior: cells below the reference
+        # count (surface, spray) get ~no push, so redistribution spreads bulk
+        # clumps without inflating the free surface down its density cliff.
+        local = self._sample_cells(counts, self.pos)
+        excess = xp.clip((local - ref) / ref, 0.0, 1.0)
+        weight = (scale * excess)[:, None]
+        self.pos = self._clamp_domain(
+            self._push_out_of_solids(self.pos + disp * weight))
+
     def _enforce_solid_velocity(self) -> None:
         """Remove the penetrating (inward) relative normal velocity of
         particles inside the solid band so animated obstacles push (rather than
@@ -1925,6 +1964,8 @@ class STFLIPSolver:
             )
         else:
             self.pos = self._advect(grids, self.pos, dt_act)
+        if p.sheeting > 0.0:
+            self._apply_sheeting()
         self._grids = grids
         self._dt_prev = dt
         self.time += dt

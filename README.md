@@ -445,6 +445,9 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
 - **Force fields / guides** (v0.16): a `Force Field` object role adds
   directional (wind), vortex, or divergence-free curl-noise turbulence body
   forces for art-directable flow (object +Z = axis, origin = centre)
+- **Particle sheeting / anti-clumping** (v0.17): a position-only nudge that
+  spreads genuinely over-dense clumps (density-gated so it never inflates
+  the free surface) to keep thin splashes and sheets intact; adds no energy
 - NumPy CPU + CuPy CUDA backends sharing one code path
 - Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy
