@@ -414,6 +414,8 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
   rising bubbles, air-driven spray
 - **APIC and PIC transfers** (v0.9, §3.9): per-particle affine matrix with the
   same temporal weighting; batched analytic 3×3 inverse (no `cupy.linalg`)
+- **Viscosity** (v0.13): implicit (unconditionally stable) diffusion solve for
+  oil/honey/lava — thickness that survives ST-FLIP's large time steps
 - **Surface tension** (v0.9, §3.9): CSF from a B-spline-smoothed phase field
 - **Animated moving-wall obstacles** (v0.9): per-cell solid velocity enters the
   projection as a `(1-alpha) u_solid` flux; near-wall particles shed only the

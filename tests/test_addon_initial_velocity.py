@@ -418,6 +418,7 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         gas_particles_per_cell=5,
         surface_tension=0.02,
         sparse=True,
+        viscosity=0.03,
     )
 
     result = operators._solver_params(
@@ -448,6 +449,7 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         "gas_particles_per_cell": 5,
         "surface_tension": 0.02,
         "sparse": True,
+        "viscosity": 0.03,
     }
 
 
