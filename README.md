@@ -239,6 +239,7 @@ solid support.
 | Two-Phase (Gas) + Gas Density | §3.1, 3.6 | Couple a light gas so air drives splashes and rising bubbles (glugging) |
 | Surface Tension (σ) | §3.9 | CSF surface tension; small-scale, needs high resolution |
 | Sparse Grid | — | Crop the solver to the active fluid region each step |
+| Whitewater | §4.9 | Foam/spray/bubble secondaries; with Two-Phase, spray and bubbles ride the simulated air field |
 | Random Seed | §3.10 | Reproducible particle placement and temporal jitter; seed 0 is an add-on default, not a published paper value |
 | Initial / Inflow Velocity | §4.8 | Liquid and inflow sources can use uniform or solid-body rotational fields; inflows can be limited to an inclusive scene-frame range |
 | Outflow Mode | §4.8 | Interior particle-removal volume or exterior half-cell `p=0` pressure outlet |
@@ -415,6 +416,14 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
 - **Animated moving-wall obstacles** (v0.9): per-cell solid velocity enters the
   projection as a `(1-alpha) u_solid` flux; near-wall particles shed only the
   penetrating normal velocity, so walls push yet fluid still separates
+- **Whitewater** (v0.10): foam/spray/bubble secondary particles emitted from
+  energetic interface regions; with Two-Phase on, spray and bubbles are driven
+  by the simulated air velocity field -- the paper's stated purpose for
+  two-phase simulation (§4.9). Streams to a `STFLIP Whitewater` point cloud
+  with `velocity`/`ww_kind`/`ww_life` attributes
+- **Vectorized voxelization** (v0.10): masks via NumPy ray-parity and obstacle
+  SDFs exact in a narrow surface band (256³ masks in seconds instead of
+  minutes); the BVH loop remains as an automatic fallback
 - **Sparse production grid** (v0.9): every step crops to a block-aligned active
   window (fluid + extrapolation band), bitwise-identical to the dense solve;
   disengages when outflows or cut-cell node-SDF solids are present

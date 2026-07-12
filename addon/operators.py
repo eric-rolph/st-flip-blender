@@ -2737,6 +2737,22 @@ class STFLIP_OT_bake(bpy.types.Operator):
             # leaves the frame/checkpoint pair outside the committed range.
             cache.write_meta(cache_dir, meta)
 
+        whitewater_system = None
+        if getattr(st, "whitewater", False):
+            from ..stflip.whitewater import Whitewater, WhitewaterParams
+            whitewater_system = Whitewater(solver, WhitewaterParams(
+                trapped_air_rate=60.0 * st.whitewater_rate,
+                crest_rate=40.0 * st.whitewater_rate,
+                max_particles=int(st.whitewater_max),
+                seed=int(st.seed),
+            ))
+            ww_obj = st.whitewater_object
+            if ww_obj is None or ww_obj.name not in bpy.data.objects:
+                ww_mesh = bpy.data.meshes.new("STFLIP Whitewater")
+                ww_obj = bpy.data.objects.new("STFLIP Whitewater", ww_mesh)
+                scene.collection.objects.link(ww_obj)
+                st.whitewater_object = ww_obj
+
         _BAKE.update(
             solver=solver,
             origin=origin.astype(np.float32),
@@ -2764,6 +2780,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 obj.name: np.array(obj.matrix_world, dtype=np.float64)
                 for obj in animated_obstacles
             },
+            whitewater=whitewater_system,
             vox_origin=origin.copy(),
             vox_dx=dx,
             vox_dims=dims,
@@ -2870,6 +2887,21 @@ class STFLIP_OT_bake(bpy.types.Operator):
         world_positions = pos + b["origin"][None, :]
         cache.write_frame(b["cache_dir"], b["frame"],
                           world_positions, vel)
+        ww = b.get("whitewater")
+        if ww is not None:
+            try:
+                ww.step(solver.p.frame_dt)
+                wpos, wvel, wkind, wlife = ww.get_render_particles()
+                np.savez(
+                    os.path.join(b["cache_dir"],
+                                 f"stflip_ww_{b['frame']:06d}.npz"),
+                    pos=wpos + b["origin"][None, :], vel=wvel,
+                    kind=wkind, life=wlife)
+            except Exception as exc:
+                b["whitewater"] = None
+                self.report(
+                    {"WARNING"},
+                    f"Whitewater failed and was disabled: {exc}")
         cache.write_checkpoint(
             b["cache_dir"],
             b["frame"],

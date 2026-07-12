@@ -253,6 +253,20 @@ class STFLIPSettings(bpy.types.PropertyGroup):
                     "Large speed/memory win for localized free-surface flows; "
                     "disengages when outflows or cut-cell solids are present",
     )
+    whitewater: BoolProperty(
+        name="Whitewater", default=False,
+        description="Emit foam/spray/bubble secondary particles from "
+                    "energetic interface regions. With Two-Phase enabled, "
+                    "spray and bubbles are driven by the simulated air field",
+    )
+    whitewater_rate: FloatProperty(
+        name="Whitewater Rate", default=1.0, min=0.0, soft_max=10.0,
+        description="Scales trapped-air and wave-crest emission rates",
+    )
+    whitewater_max: IntProperty(
+        name="Max Whitewater", default=500_000, min=1000, max=5_000_000,
+        description="Hard cap on live secondary particles (oldest dropped)",
+    )
     density: FloatProperty(
         name="Liquid Density", default=1000.0, min=1e-6,
         soft_max=5000.0,
@@ -388,6 +402,7 @@ class STFLIPSettings(bpy.types.PropertyGroup):
     )
     # Robust bindings to the bake outputs (survive renames; null on delete).
     particle_object: PointerProperty(type=bpy.types.Object)
+    whitewater_object: PointerProperty(type=bpy.types.Object)
     surface_object: PointerProperty(type=bpy.types.Object)
 
 
