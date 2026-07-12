@@ -141,3 +141,40 @@ def test_combined_sdfs_for_no_obstacles_have_expected_shapes(monkeypatch):
     assert node_sdf.shape == (3, 4, 5)
     assert np.all(cell_sdf == np.float32(1e9))
     assert np.all(node_sdf == np.float32(1e9))
+
+
+def test_solid_velocity_from_objects_rigid_translation(monkeypatch):
+    voxelize = _load_voxelize(monkeypatch)
+    dims = (8, 8, 8)
+    dx = 0.5
+    origin = np.zeros(3)
+    frame_dt = 0.1
+
+    inside = np.zeros(dims, dtype=bool)
+    inside[3:5, 3:5, 3:5] = True
+    monkeypatch.setattr(
+        voxelize, "mask_from_object",
+        lambda obj, deps, org, d, dm: inside.copy())
+
+    # Obstacle translated by (0.2, 0, -0.1) since the previous frame.
+    m_cur = np.eye(4)
+    m_cur[:3, 3] = (1.2, 0.0, -0.1)
+    m_prev = np.eye(4)
+    m_prev[:3, 3] = (1.0, 0.0, 0.0)
+    obj = types.SimpleNamespace(name="Piston", matrix_world=m_cur)
+
+    vel = voxelize.solid_velocity_from_objects(
+        [obj], {"Piston": m_prev}, None, origin, dx, dims, frame_dt)
+
+    assert vel is not None and vel.shape == dims + (3,)
+    expected = np.array([0.2, 0.0, -0.1]) / frame_dt
+    # Full velocity inside and in the dilated halo, zero far away.
+    assert np.allclose(vel[4, 4, 4], expected, atol=1e-5)
+    assert np.allclose(vel[2, 4, 4], expected, atol=1e-5)  # 1-cell halo
+    assert np.allclose(vel[0, 0, 0], 0.0)
+
+    # A static obstacle (matrix unchanged) contributes nothing.
+    static = types.SimpleNamespace(name="Floor", matrix_world=np.eye(4))
+    assert voxelize.solid_velocity_from_objects(
+        [static], {"Floor": np.eye(4)}, None, origin, dx, dims, frame_dt,
+    ) is None

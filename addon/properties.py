@@ -61,6 +61,12 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
         name="Emit Gas", default=False,
         description="Emit gas particles instead of liquid (two-phase only)",
     )
+    obstacle_animated: BoolProperty(
+        name="Animated (Moving Wall)", default=False,
+        description="Re-voxelize this obstacle every output frame and drive "
+                    "the fluid with its rigid motion. Slower; enable only for "
+                    "moving solids",
+    )
     inflow_use_frame_range: BoolProperty(
         name="Limit Active Frames",
         default=False,

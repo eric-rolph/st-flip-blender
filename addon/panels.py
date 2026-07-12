@@ -134,6 +134,8 @@ class STFLIP_PT_object(bpy.types.Panel):
             frames.prop(settings, "inflow_end_frame")
             layout.label(text="Inclusive evolved output frames.",
                          icon="INFO")
+        elif obj.stflip.role == "OBSTACLE":
+            layout.prop(obj.stflip, "obstacle_animated")
         elif obj.stflip.role == "OUTFLOW":
             layout.prop(obj.stflip, "outflow_mode")
             if obj.stflip.outflow_mode == "VOLUME":

@@ -972,6 +972,25 @@ def _scene_setup_provenance(scene):
     return None
 
 
+def _refresh_animated_obstacles(scene, b) -> None:
+    """Advance the scene to the next output frame, re-voxelize the obstacles,
+    and hand the solver the updated SDF plus a differenced rigid velocity."""
+    target = b["frame"] + 1
+    scene.frame_set(target)
+    deps = bpy.context.evaluated_depsgraph_get()
+    sdf, node_sdf = voxelize.solid_sdfs_from_objects(
+        b["obstacles_all"], deps, b["vox_origin"], b["vox_dx"], b["vox_dims"])
+    vel = voxelize.solid_velocity_from_objects(
+        b["animated_obstacles"], b["prev_solid_matrices"], deps,
+        b["vox_origin"], b["vox_dx"], b["vox_dims"],
+        b["solver"].p.frame_dt)
+    b["solver"].set_solid_sdf(sdf, node_sdf, solid_vel=vel)
+    b["prev_solid_matrices"] = {
+        obj.name: np.array(obj.matrix_world, dtype=np.float64)
+        for obj in b["animated_obstacles"]
+    }
+
+
 def _fluid_objects(scene, role: str):
     return [o for o in scene.objects
             if o.type == "MESH" and o.stflip.role == role]
@@ -2177,6 +2196,21 @@ class STFLIP_OT_bake(bpy.types.Operator):
         if solid_sdf is not None:
             solver.set_solid_sdf(solid_sdf, solid_node_sdf)
 
+        # Animated moving-wall obstacles: re-voxelized every output frame with
+        # a differenced rigid velocity.  The fingerprint/resume machinery only
+        # captures the setup-frame pose, so warn on resume.
+        animated_obstacles = [
+            obj for obj in obstacles
+            if getattr(obj.stflip, "obstacle_animated", False)
+        ]
+        if animated_obstacles and is_resume:
+            self.report(
+                {"WARNING"},
+                "Resuming with animated obstacles re-samples their motion "
+                "from the current frame; results may differ slightly from "
+                "an uninterrupted bake",
+            )
+
         not_solid = (solid_sdf > 0.0) if solid_sdf is not None else None
         seeded = 0
         liquid_records = []
@@ -2723,6 +2757,16 @@ class STFLIP_OT_bake(bpy.types.Operator):
             running=True,
             cancel_requested=False,
             resumed=is_resume,
+            # Moving-wall bookkeeping (empty unless obstacles animate).
+            animated_obstacles=animated_obstacles,
+            obstacles_all=obstacles,
+            prev_solid_matrices={
+                obj.name: np.array(obj.matrix_world, dtype=np.float64)
+                for obj in animated_obstacles
+            },
+            vox_origin=origin.copy(),
+            vox_dx=dx,
+            vox_dims=dims,
         )
 
         particle_obj = mesher.ensure_particle_object(
@@ -2812,6 +2856,8 @@ class STFLIP_OT_bake(bpy.types.Operator):
         if b["frame"] >= b["end"]:
             return False
         solver: STFLIPSolver = b["solver"]
+        if b.get("animated_obstacles"):
+            _refresh_animated_obstacles(scene, b)
         compute_started = time.perf_counter()
         stats = solver.step_frame()
         if b.get("collect_metrics"):

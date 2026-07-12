@@ -344,7 +344,7 @@ it is still not a full reproduction of every production example in the paper
 | Surface tension (CSF) | Implemented (v0.9): curvature from a cubic-B-spline-smoothed phase field, `σ·κ·∇φ` face acceleration |
 | Sparse/adaptive grids | Implemented (v0.9) as a block-aligned active-window crop (bitwise-identical to dense); billion-particle production scale still out of reach on a single workstation |
 | Appendix B mean-curvature-flow output reconstruction | Implemented with default `kψ=30`; OpenVDB extracts the render mesh and Fast Preview remains a separate approximation |
-| Animated/deforming obstacle boundary conditions | Implemented (v0.9) at the solver level via `set_solid_sdf(..., solid_vel=...)`; rigid moving walls push and separate from fluid without tunneling |
+| Animated/deforming obstacle boundary conditions | Implemented (v0.9) for rigid moving walls: per-object "Animated (Moving Wall)" toggle re-voxelizes each output frame with a differenced rigid velocity (`set_solid_sdf(..., solid_vel=...)`); walls push and separate from fluid without tunneling. Deforming solids remain unsupported |
 
 Experiment-level coverage is narrower than method-level coverage:
 
@@ -377,8 +377,9 @@ uses `ρ = 1000` and a 400-iteration PCG limit. Paper MCF defaults to `kψ=30`.
 The Solver panel additionally exposes the velocity transfer scheme
 (FLIP/APIC/PIC), two-phase gas coupling with gas density and gas particles/cell,
 the surface-tension coefficient, and the sparse-grid toggle; inflows gain an
-"Emit Gas" option in two-phase mode. Animated moving walls are available through
-the solver's `set_solid_sdf(..., solid_vel=...)` Python API.
+"Emit Gas" option in two-phase mode, and obstacles an "Animated (Moving Wall)"
+toggle that re-voxelizes them per output frame with a differenced rigid
+velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
 
 ## What's implemented
 
@@ -433,9 +434,10 @@ Known limitations: two-phase and the sparse grid do not combine usefully (gas
 fills the domain, so the active window is the whole grid), and the sparse
 window also disengages when outflows or cut-cell node-SDF obstacles are present.
 The disk resume checkpoint does not persist the gas tag or APIC matrix, so a
-resumed two-phase bake restarts as single-phase liquid. Animated moving walls
-are driven through the solver API (`set_solid_sdf(..., solid_vel=...)`); the
-add-on bake loop still voxelizes source/outlet/obstacle geometry once at the
+resumed two-phase bake restarts as single-phase liquid. Obstacles marked
+"Animated (Moving Wall)" are re-voxelized every output frame with a differenced
+rigid velocity (slower; resume re-samples their motion from the current frame);
+source/outlet and static-obstacle geometry is still voxelized once at the
 first frame. Scene voxelization (mesh → grid masks/SDF) is a pure
 Python BVH loop and gets slow above resolution ~128 — vectorizing it is on
 the roadmap. Temporal jitter randoms are drawn on the host for cross-backend

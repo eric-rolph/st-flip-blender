@@ -175,3 +175,58 @@ def solid_sdfs_from_objects(
         ),
     )
     return cell_sdf, node_sdf
+
+
+def _dilate(mask: np.ndarray, cells: int) -> np.ndarray:
+    """Binary-dilate ``mask`` by ``cells`` in the 6-neighbourhood."""
+    out = mask.copy()
+    for _ in range(max(int(cells), 0)):
+        grown = out.copy()
+        grown[1:] |= out[:-1]
+        grown[:-1] |= out[1:]
+        grown[:, 1:] |= out[:, :-1]
+        grown[:, :-1] |= out[:, 1:]
+        grown[:, :, 1:] |= out[:, :, :-1]
+        grown[:, :, :-1] |= out[:, :, 1:]
+        out = grown
+    return out
+
+
+def solid_velocity_from_objects(
+    objects, prev_matrices, depsgraph, origin, dx, dims, frame_dt,
+    band_cells: int = 2,
+):
+    """Cell-centred rigid solid velocity for animated moving-wall obstacles.
+
+    ``prev_matrices`` maps object name to the 4x4 world matrix (as a NumPy
+    array) captured at the previous output frame.  For each animated obstacle
+    the rigid velocity v(x) = (x - M_prev M_cur^-1 x) / frame_dt is stamped
+    into the cells inside the obstacle plus a ``band_cells`` halo, so boundary
+    faces and the near-solid particle band see the full wall speed.  Returns
+    an ``dims + (3,)`` float32 field, or None when nothing moved.
+    """
+    if not objects or frame_dt <= 0.0:
+        return None
+    vel = None
+    for obj in objects:
+        m_prev = prev_matrices.get(obj.name)
+        if m_prev is None:
+            continue
+        m_cur = np.array(obj.matrix_world, dtype=np.float64).reshape(4, 4)
+        if np.allclose(m_cur, m_prev, atol=1e-12):
+            continue
+        mask = mask_from_object(obj, depsgraph, origin, dx, dims)
+        if not mask.any():
+            continue
+        mask = _dilate(mask, band_cells)
+        idx = np.argwhere(mask)
+        world = np.asarray(origin, dtype=np.float64)[None, :] \
+            + (idx.astype(np.float64) + 0.5) * dx
+        # Same material point at the previous frame: x_prev = M_prev M_cur^-1 x.
+        transform = m_prev @ np.linalg.inv(m_cur)
+        prev_pts = world @ transform[:3, :3].T + transform[:3, 3][None, :]
+        v = ((world - prev_pts) / frame_dt).astype(np.float32)
+        if vel is None:
+            vel = np.zeros(tuple(dims) + (3,), dtype=np.float32)
+        vel[mask] = v
+    return vel
