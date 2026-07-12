@@ -711,6 +711,70 @@ def test_raw_checkpoint_round_trip_preserves_complete_solver_state(tmp_path):
     assert np.array_equal(expected.random(16), actual.random(16))
 
 
+def _checkpoint_state_v2(n=3, *, affine_rows=None):
+    state = _checkpoint_state(n)
+    rows = n if affine_rows is None else affine_rows
+    state["phase"] = np.array(
+        [1.0, 0.0, 1.0][:n] + [1.0] * max(0, n - 3), dtype=np.float32)
+    state["C"] = (np.arange(rows * 9, dtype=np.float32).reshape(rows, 3, 3)
+                  * 0.01)
+    state["age"] = np.linspace(0.0, 0.5, n, dtype=np.float32)
+    state["source_id"] = np.arange(n, dtype=np.int32)
+    return state
+
+
+def test_checkpoint_v2_round_trip_preserves_phase_affine_and_shading(tmp_path):
+    state = _checkpoint_state_v2(3)
+    fingerprint = "a" * 64
+
+    cache.write_checkpoint(str(tmp_path), 7, state, fingerprint=fingerprint)
+    loaded = cache.read_checkpoint(
+        str(tmp_path), 7, expected_fingerprint=fingerprint)
+
+    for name in ("phase", "C", "age", "source_id"):
+        np.testing.assert_array_equal(loaded[name], state[name])
+    assert loaded["C"].dtype == np.float32
+    assert loaded["source_id"].dtype == np.int32
+
+
+def test_checkpoint_v2_round_trip_allows_empty_affine(tmp_path):
+    # Non-APIC runs store C with shape (0, 3, 3); that must survive the trip.
+    state = _checkpoint_state_v2(3, affine_rows=0)
+    cache.write_checkpoint(str(tmp_path), 8, state)
+    loaded = cache.read_checkpoint(str(tmp_path), 8)
+    assert loaded["C"].shape == (0, 3, 3)
+
+
+def test_checkpoint_write_upgrades_base_only_state_to_v2(tmp_path):
+    # A base-only state (no extras) is written as a valid v2 archive whose
+    # extras hold the historical defaults.
+    cache.write_checkpoint(str(tmp_path), 9, _checkpoint_state(2))
+    path = Path(cache.checkpoint_path(str(tmp_path), 9))
+    with np.load(path, allow_pickle=False) as data:
+        assert int(data["version"]) == 2
+        assert set(data.files) == cache._CHECKPOINT_KEYS_V2
+        assert np.array_equal(data["phase"], np.ones(2, dtype=np.float32))
+        assert data["affine_c"].shape == (0, 3, 3)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("phase", np.zeros((2,), dtype=np.float32)),          # wrong length
+        ("C", np.zeros((2, 3, 3), dtype=np.float32)),         # wrong count
+        ("C", np.zeros((3, 2, 2), dtype=np.float32)),         # wrong matrix
+        ("age", np.array([np.nan, 0.0, 0.0], dtype=np.float32)),
+        ("source_id", np.array([-1, 0, 1], dtype=np.int32)),  # negative id
+        ("source_id", np.zeros((3,), dtype=np.int64)),        # wrong dtype
+    ],
+)
+def test_checkpoint_v2_state_rejects_invalid_optional_values(field, bad_value):
+    state = _checkpoint_state_v2(3)
+    state[field] = bad_value
+    with pytest.raises(cache.CheckpointError, match=field):
+        cache.validate_checkpoint_state(state)
+
+
 def test_checkpoint_rejects_renamed_frame_and_wrong_fingerprint(tmp_path):
     fingerprint = "d" * 64
     cache.write_checkpoint(

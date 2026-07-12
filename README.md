@@ -467,8 +467,10 @@ production-scale scenes.
 Known limitations: two-phase and the sparse grid do not combine usefully (gas
 fills the domain, so the active window is the whole grid), and the sparse
 window also disengages when outflows or cut-cell node-SDF obstacles are present.
-The disk resume checkpoint does not persist the gas tag or APIC matrix, so a
-resumed two-phase bake restarts as single-phase liquid. Obstacles marked
+The disk resume checkpoint (schema v2) persists the gas tag, APIC affine matrix,
+and shading attributes, so a resumed two-phase/APIC bake continues without a
+discontinuity; older v1 checkpoints still load and fall back to single-phase
+liquid with a fresh affine field. Obstacles marked
 "Animated (Moving Wall)" are re-voxelized every output frame with a differenced
 rigid velocity (slower; resume re-samples their motion from the current frame);
 source/outlet and static-obstacle geometry is still voxelized once at the

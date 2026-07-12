@@ -23,7 +23,7 @@ from .metrics import (
 META_NAME = "stflip_meta.json"
 METRICS_NAME = "stflip_metrics.jsonl"
 CHECKPOINT_SCHEMA = "stflip-solver-checkpoint"
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 SURFACE_SCHEMA = "stflip-paper-surface"
 SURFACE_VERSION = 1
 SURFACE_CONFIG_SCHEMA = "stflip-paper-surface-config"
@@ -33,7 +33,12 @@ _FRAME_RE = re.compile(r"^stflip_(-?\d+)\.npz$")
 _CHECKPOINT_RE = re.compile(r"^stflip_checkpoint_(-?\d+)\.npz$")
 _SURFACE_RE = re.compile(
     r"^stflip_surface_([0-9a-f]{64})_(-?\d+)\.npz$")
-_CHECKPOINT_KEYS = frozenset({
+# Version 1 stored only base trajectory state. Version 2 additionally persists
+# the two-phase tag, APIC affine matrix, and shading attributes as separate
+# archive members, so a resumed two-phase/APIC bake continues without a visible
+# discontinuity. Version-1 archives are still readable: their missing members
+# restore to the historical defaults (liquid phase, empty affine, zero shading).
+_CHECKPOINT_KEYS_V1 = frozenset({
     "schema",
     "version",
     "frame",
@@ -48,6 +53,22 @@ _CHECKPOINT_KEYS = frozenset({
     "volume_outflow_removed_total",
     "pressure_outflow_removed_total",
 })
+# Extra per-particle members introduced by version 2. ``affine_c`` is the APIC
+# 3x3 matrix per particle; it is stored with shape (0, 3, 3) when APIC is off.
+_CHECKPOINT_EXTRA_KEYS = frozenset({
+    "phase",
+    "affine_c",
+    "age",
+    "source_id",
+})
+_CHECKPOINT_KEYS_V2 = _CHECKPOINT_KEYS_V1 | _CHECKPOINT_EXTRA_KEYS
+_CHECKPOINT_KEYS_BY_VERSION = {
+    1: _CHECKPOINT_KEYS_V1,
+    2: _CHECKPOINT_KEYS_V2,
+}
+# Optional keys in the in-memory checkpoint-state mapping (npz ``affine_c`` maps
+# to state key ``C`` to match the solver's attribute name).
+_CHECKPOINT_OPTIONAL_STATE_KEYS = frozenset({"phase", "C", "age", "source_id"})
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _SURFACE_KEYS = frozenset({
     "schema",
@@ -479,6 +500,37 @@ def _checkpoint_counter(value, name: str) -> int:
     return result
 
 
+def _checkpoint_affine(value, count: int) -> np.ndarray:
+    """Validate an APIC affine matrix stack: (N, 3, 3) or empty (0, 3, 3)."""
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise CheckpointError("checkpoint C is not a numeric array") from exc
+    if array.dtype != np.dtype(np.float32) or array.ndim != 3 \
+            or array.shape[1:] != (3, 3) or array.shape[0] not in (0, count):
+        raise CheckpointError(
+            f"checkpoint C must be float32 with shape ({count}, 3, 3) "
+            "or (0, 3, 3)")
+    if not bool(np.all(np.isfinite(array))):
+        raise CheckpointError("checkpoint C contains non-finite values")
+    return np.array(array, dtype=np.float32, order="C", copy=True)
+
+
+def _checkpoint_source_id(value, count: int) -> np.ndarray:
+    """Validate the per-particle source id array: int32, shape (N,), >= 0."""
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise CheckpointError(
+            "checkpoint source_id is not a numeric array") from exc
+    if array.dtype != np.dtype(np.int32) or array.shape != (count,):
+        raise CheckpointError(
+            f"checkpoint source_id must be int32 with shape ({count},)")
+    if array.size and int(array.min()) < 0:
+        raise CheckpointError("checkpoint source_id must be non-negative")
+    return np.array(array, dtype=np.int32, order="C", copy=True)
+
+
 def _checkpoint_rng_json(value) -> tuple[dict, np.ndarray]:
     """Validate and canonically encode one NumPy bit-generator state."""
     if not isinstance(value, dict):
@@ -512,9 +564,10 @@ def validate_checkpoint_state(state: dict) -> dict:
         "rng_state", "outflow_removed_total", "volume_outflow_removed_total",
         "pressure_outflow_removed_total",
     }
-    if set(state) != required:
+    allowed = required | _CHECKPOINT_OPTIONAL_STATE_KEYS
+    if not required <= set(state) or not set(state) <= allowed:
         missing = sorted(required - set(state))
-        extra = sorted(set(state) - required)
+        extra = sorted(set(state) - allowed)
         raise CheckpointError(
             f"checkpoint state keys mismatch (missing={missing}, extra={extra})")
 
@@ -523,12 +576,13 @@ def validate_checkpoint_state(state: dict) -> dict:
         raise CheckpointError("checkpoint pos must have shape (N, 3)")
     positions = _checkpoint_array(
         positions_value, positions_value.shape, "pos")
+    count = positions.shape[0]
     velocities = _checkpoint_array(
         state["vel"], positions.shape, "vel")
     dt_resid = _checkpoint_array(
-        state["dt_resid"], (positions.shape[0],), "dt_resid")
+        state["dt_resid"], (count,), "dt_resid")
     rng_state, _ = _checkpoint_rng_json(state["rng_state"])
-    return {
+    normalized = {
         "pos": positions,
         "vel": velocities,
         "dt_resid": dt_resid,
@@ -544,6 +598,17 @@ def validate_checkpoint_state(state: dict) -> dict:
             state["pressure_outflow_removed_total"],
             "pressure_outflow_removed_total"),
     }
+    # Optional per-particle members are validated only when present so that a
+    # version-1 checkpoint (which omits them) still normalizes cleanly.
+    if "phase" in state:
+        normalized["phase"] = _checkpoint_array(state["phase"], (count,), "phase")
+    if "C" in state:
+        normalized["C"] = _checkpoint_affine(state["C"], count)
+    if "age" in state:
+        normalized["age"] = _checkpoint_array(state["age"], (count,), "age")
+    if "source_id" in state:
+        normalized["source_id"] = _checkpoint_source_id(state["source_id"], count)
+    return normalized
 
 
 def _checkpoint_fingerprint(value, *, allow_empty: bool) -> str:
@@ -577,6 +642,18 @@ def write_checkpoint(
     _, rng_bytes = _checkpoint_rng_json(normalized["rng_state"])
     path = checkpoint_path(cache_dir, frame)
     fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=True)
+    # A version-2 archive always carries the extra per-particle members. When a
+    # caller supplies only base state, persist the historical defaults so the
+    # archive still round-trips (liquid phase, empty affine, zero shading).
+    count = normalized["pos"].shape[0]
+    phase = normalized.get(
+        "phase", np.ones((count,), dtype=np.float32))
+    affine_c = normalized.get(
+        "C", np.zeros((0, 3, 3), dtype=np.float32))
+    age = normalized.get(
+        "age", np.zeros((count,), dtype=np.float32))
+    source_id = normalized.get(
+        "source_id", np.zeros((count,), dtype=np.int32))
     fd, temporary = _atomic_path(cache_dir, ".npz")
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -598,6 +675,10 @@ def write_checkpoint(
                     normalized["volume_outflow_removed_total"], dtype=np.int64),
                 pressure_outflow_removed_total=np.asarray(
                     normalized["pressure_outflow_removed_total"], dtype=np.int64),
+                phase=phase,
+                affine_c=affine_c,
+                age=age,
+                source_id=source_id,
             )
             stream.flush()
             os.fsync(stream.fileno())
@@ -625,16 +706,22 @@ def read_checkpoint(
         return None
     try:
         with np.load(path, allow_pickle=False) as data:
-            if set(data.files) != _CHECKPOINT_KEYS:
-                raise CheckpointError("checkpoint archive keys do not match schema")
-            schema = data["schema"]
+            files = set(data.files)
+            if "version" not in files or "schema" not in files:
+                raise CheckpointError(
+                    "checkpoint archive keys do not match schema")
             version = data["version"]
+            if (version.shape != () or version.dtype != np.dtype(np.int64)
+                    or int(version) not in _CHECKPOINT_KEYS_BY_VERSION):
+                raise CheckpointError("checkpoint schema version is unsupported")
+            archived_version = int(version)
+            if files != _CHECKPOINT_KEYS_BY_VERSION[archived_version]:
+                raise CheckpointError(
+                    "checkpoint archive keys do not match schema")
+            schema = data["schema"]
             if (schema.shape != () or schema.dtype.kind not in {"U", "S"}
                     or str(schema.item()) != CHECKPOINT_SCHEMA):
                 raise CheckpointError("checkpoint schema identifier is invalid")
-            if (version.shape != () or version.dtype != np.dtype(np.int64)
-                    or int(version) != CHECKPOINT_VERSION):
-                raise CheckpointError("checkpoint schema version is unsupported")
             archived_frame = data["frame"]
             if (archived_frame.shape != ()
                     or archived_frame.dtype != np.dtype(np.int64)
@@ -668,6 +755,12 @@ def read_checkpoint(
                 "pressure_outflow_removed_total": data[
                     "pressure_outflow_removed_total"],
             }
+            if archived_version >= 2:
+                # ``affine_c`` maps to the solver's ``C`` attribute name.
+                state["phase"] = data["phase"]
+                state["C"] = data["affine_c"]
+                state["age"] = data["age"]
+                state["source_id"] = data["source_id"]
             return validate_checkpoint_state(state)
     except CheckpointError:
         raise

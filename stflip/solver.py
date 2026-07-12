@@ -393,10 +393,10 @@ class STFLIPSolver:
         The NumPy RNG state and previous adaptive timestep are trajectory state
         and therefore must be captured alongside particle arrays.
 
-        The disk checkpoint schema is intentionally unchanged from the base
-        solver: the two-phase gas tag and APIC affine matrix are not persisted,
-        so a resumed two-phase bake restarts as single-phase liquid.  This is a
-        deliberate, documented limitation to keep the on-disk format stable.
+        The two-phase gas tag, APIC affine matrix, and shading attributes (age,
+        source id) are persisted so a resumed two-phase/APIC bake continues
+        without a discontinuity at the resume frame. ``C`` keeps its live shape:
+        (N, 3, 3) under APIC, or (0, 3, 3) otherwise.
         """
         return {
             "pos": np.array(
@@ -416,16 +416,36 @@ class STFLIPSolver:
                 self._volume_outflow_removed_total),
             "pressure_outflow_removed_total": int(
                 self._pressure_outflow_removed_total),
+            "phase": np.array(
+                self.be.to_numpy(self.phase), dtype=np.float32, order="C",
+                copy=True),
+            "C": np.array(
+                self.be.to_numpy(self.C), dtype=np.float32, order="C",
+                copy=True),
+            "age": np.array(
+                self.be.to_numpy(self.age), dtype=np.float32, order="C",
+                copy=True),
+            "source_id": np.array(
+                self.be.to_numpy(self.source_id), dtype=np.int32, order="C",
+                copy=True),
         }
 
     def restore_state(self, state: dict) -> None:
-        """Strictly restore a snapshot into this configured solver instance."""
+        """Strictly restore a snapshot into this configured solver instance.
+
+        Version-2 checkpoints carry the phase tag, APIC affine matrix, and
+        shading attributes; version-1 checkpoints omit them and restore to the
+        historical defaults (liquid phase, empty affine, zero age/source).
+        """
         required = {
             "pos", "vel", "dt_resid", "time", "dt_prev", "rng_state",
             "outflow_removed_total", "volume_outflow_removed_total",
             "pressure_outflow_removed_total",
         }
-        if not isinstance(state, dict) or set(state) != required:
+        optional = {"phase", "C", "age", "source_id"}
+        if (not isinstance(state, dict)
+                or not required <= set(state)
+                or not set(state) <= (required | optional)):
             raise ValueError("checkpoint state has an incompatible schema")
 
         def particle_array(name, shape=None):
@@ -491,20 +511,69 @@ class STFLIPSolver:
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("checkpoint rng_state is invalid") from exc
 
+        # Validate the optional per-particle members (if present) before any
+        # mutation, so a malformed extra cannot leave the solver half-restored.
+        xp = self.be.xp
+        count = pos.shape[0]
+        phase_restore = None
+        if "phase" in state:
+            phase_np = particle_array("phase", (count,))
+            phase_restore = self.be.from_numpy(phase_np)
+        affine_restore = None
+        if "C" in state and self._use_apic:
+            affine_np = np.asarray(state["C"])
+            if (affine_np.dtype != np.dtype(np.float32) or affine_np.ndim != 3
+                    or affine_np.shape[1:] != (3, 3)
+                    or affine_np.shape[0] not in (0, count)):
+                raise ValueError("checkpoint C has an incompatible shape")
+            if not bool(np.all(np.isfinite(affine_np))):
+                raise ValueError("checkpoint C contains non-finite values")
+            affine_restore = self.be.from_numpy(
+                np.array(affine_np, dtype=np.float32, order="C", copy=True))
+        age_restore = None
+        if "age" in state:
+            age_np = particle_array("age", (count,))
+            age_restore = self.be.from_numpy(age_np)
+        source_restore = None
+        if "source_id" in state:
+            source_np = np.asarray(state["source_id"])
+            if source_np.dtype != np.dtype(np.int32) \
+                    or source_np.shape != (count,):
+                raise ValueError("checkpoint source_id has an incompatible shape")
+            if source_np.size and int(source_np.min()) < 0:
+                raise ValueError("checkpoint source_id must be non-negative")
+            source_restore = self.be.from_numpy(
+                np.array(source_np, dtype=np.int32, order="C", copy=True))
+
         # Commit only after the complete state validates, so a rejected restore
         # cannot leave a running solver partially mutated.
         self.pos = self.be.from_numpy(pos)
         self.vel = self.be.from_numpy(vel)
         self.dt_resid = self.be.from_numpy(dt_resid)
-        # phase/C are not persisted in the disk schema: a resumed bake restarts
-        # as single-phase liquid with a fresh (zero) affine field.
-        self.phase = self.be.xp.ones((pos.shape[0],), dtype=self.be.xp.float32)
-        self.C = self.be.xp.zeros((0, 3, 3), dtype=self.be.xp.float32)
-        # Shading attributes are not persisted in the disk schema; a resumed
-        # bake restarts ages at zero and source ids at zero.
-        self.age = self.be.xp.zeros((pos.shape[0],), dtype=self.be.xp.float32)
-        self.source_id = self.be.xp.zeros((pos.shape[0],),
-                                          dtype=self.be.xp.int32)
+        # Restore the two-phase tag when persisted; otherwise (version-1
+        # checkpoint) fall back to single-phase liquid.
+        self.phase = (
+            phase_restore if phase_restore is not None
+            else xp.ones((count,), dtype=xp.float32))
+        # Under APIC, restore the affine field: a stored (N, 3, 3) is used as
+        # is, while an empty (0, 3, 3) is regrown to zeros on the next step.
+        # Without APIC the field stays empty regardless of what was stored.
+        self.C = (
+            affine_restore if affine_restore is not None
+            else xp.zeros((0, 3, 3), dtype=xp.float32))
+        # Restore shading attributes when persisted; version-1 checkpoints
+        # restart ages at zero and source ids at zero.
+        self.age = (
+            age_restore if age_restore is not None
+            else xp.zeros((count,), dtype=xp.float32))
+        self.source_id = (
+            source_restore if source_restore is not None
+            else xp.zeros((count,), dtype=xp.int32))
+        # New sources seeded after a resume must not reuse a restored id, so
+        # advance the counter past the largest restored source id.
+        if source_restore is not None and count:
+            self._next_source = max(
+                self._next_source, int(self.be.to_numpy(self.source_id).max()) + 1)
         self.time = time_value
         self._dt_prev = dt_prev
         self._rng = restored_rng

@@ -1,6 +1,6 @@
 [project]
 name = "st-flip-blender"
-version = "0.18.0"
+version = "0.19.0"
 description = "ST-FLIP large-time-step liquid simulation for Blender"
 requires-python = ">=3.11"
 dependencies = ["numpy>=1.24"]
