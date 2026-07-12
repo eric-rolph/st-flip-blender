@@ -389,6 +389,29 @@ def _activate_runtime_path(candidate: Path | None) -> None:
         # NumPy is already loaded by addon.handlers before operators.  Put the
         # isolated runtime first so an obsolete legacy CuPy cannot shadow it.
         sys.path.insert(0, text)
+    # The runtime bundles its own CUDA-13 stack (nvidia-* wheels: DLLs and
+    # NVRTC headers).  A system CUDA_PATH pointing at a different toolkit
+    # (e.g. 12.x) wins CuPy's DLL search and breaks the import with a version
+    # mismatch, so retarget CUDA_PATH at the bundled toolkit (headers for
+    # runtime kernel compilation) and register the bundled DLL directories.
+    os.environ.pop("CUDA_PATH", None)
+    os.environ.pop("CUDA_HOME", None)
+    bundled = sorted(candidate.glob("nvidia/cu*"))
+    for toolkit in bundled:
+        if (toolkit / "include").is_dir():
+            os.environ["CUDA_PATH"] = str(toolkit)
+            break
+    dll_dirs = sorted({str(p.parent)
+                       for p in candidate.glob("nvidia/**/*.dll")})
+    for dll_dir in dll_dirs:
+        try:
+            os.add_dll_directory(dll_dir)
+        except (OSError, AttributeError):
+            pass
+    if dll_dirs:
+        os.environ["PATH"] = (
+            os.pathsep.join(dll_dirs) + os.pathsep
+            + os.environ.get("PATH", ""))
     importlib.invalidate_caches()
 
 
@@ -3627,8 +3650,12 @@ class STFLIP_OT_install_gpu(bpy.types.Operator):
 
         attempts = []
         for candidate in GPU_INSTALL_CANDIDATES:
-            install_dir = root / (
-                f"{candidate['slug']}-{CUPY_VERSION}-{time.time_ns()}")
+            # Keep the directory name SHORT: on MS-Store Blender the modules
+            # root is already ~165 characters deep and CuPy's longest .pyd
+            # path breaks Windows' 260-char MAX_PATH with a verbose name
+            # ("DLL load failed ... filename or extension is too long").
+            nonce = format(time.time_ns() % 0xFFFFFF, "x")
+            install_dir = root / f"{candidate['slug']}-{nonce}"
             install_dir.mkdir(parents=True, exist_ok=False)
             installing_marker = install_dir / _INSTALLING_RUNTIME_FILE
             installing_marker.write_text(
