@@ -1819,6 +1819,150 @@ class STFLIP_OT_quick_setup(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _preset_box(context, name, loc, scale, tag, role="NONE"):
+    bpy.ops.mesh.primitive_cube_add(size=2.0, location=loc)
+    o = context.active_object
+    o.name = name
+    o.scale = scale
+    o.display_type = "WIRE"
+    o.hide_render = True
+    o[_SETUP_OBJECT_KEY] = tag
+    if role != "NONE":
+        o.stflip.role = role
+    return o
+
+
+def _preset_viscous_pour(context, st, tag):
+    st.domain = _preset_box(context, "STFLIP Domain", (0, 0, 0.9),
+                            (0.8, 0.8, 0.9), tag)
+    src = _preset_box(context, "STFLIP Honey Inflow", (0, 0, 1.55),
+                      (0.12, 0.12, 0.06), tag, role="INFLOW")
+    src.stflip.inflow_velocity = (0.0, 0.0, -0.4)
+    st.viscosity = 0.08
+    st.transfer = "apic"
+    st.cfl_target = 6.0
+    st.whitewater = False
+    return "Viscous pour (honey) — high viscosity + APIC"
+
+
+def _preset_stormy_pool(context, st, tag):
+    st.domain = _preset_box(context, "STFLIP Domain", (0, 0, 0.6),
+                            (1.2, 1.2, 0.6), tag)
+    _preset_box(context, "STFLIP Pool", (0, 0, 0.28), (1.15, 1.15, 0.28),
+                tag, role="LIQUID")
+    bpy.ops.object.empty_add(location=(0, 0, 0.4))
+    frc = context.active_object
+    frc.name = "STFLIP Turbulence"
+    frc[_SETUP_OBJECT_KEY] = tag
+    frc.stflip.role = "FORCE"
+    frc.stflip.force_type = "TURBULENCE"
+    frc.stflip.force_strength = 8.0
+    frc.stflip.force_scale = 0.5
+    st.cfl_target = 8.0
+    st.whitewater = True
+    st.whitewater_rate = 1.8
+    st.sheeting = 0.5
+    return "Stormy pool — turbulence force + whitewater + sheeting"
+
+
+def _preset_two_phase_glug(context, st, tag):
+    st.domain = _preset_box(context, "STFLIP Domain", (0, 0, 0.8),
+                            (0.6, 0.6, 0.8), tag)
+    _preset_box(context, "STFLIP Pool", (0, 0, 0.3), (0.55, 0.55, 0.3),
+                tag, role="LIQUID")
+    src = _preset_box(context, "STFLIP Inflow", (0, 0, 1.45),
+                      (0.1, 0.1, 0.06), tag, role="INFLOW")
+    src.stflip.inflow_velocity = (0.0, 0.0, -2.5)
+    st.two_phase = True
+    st.rho_gas = 1.2
+    st.cfl_target = 6.0
+    st.whitewater = True
+    st.whitewater_rate = 1.5
+    return "Two-phase glug — pouring stream entrains air bubbles"
+
+
+def _preset_fountain(context, st, tag):
+    st.domain = _preset_box(context, "STFLIP Domain", (0, 0, 0.9),
+                            (1.0, 1.0, 0.9), tag)
+    _preset_box(context, "STFLIP Pool", (0, 0, 0.12), (0.95, 0.95, 0.12),
+                tag, role="LIQUID")
+    src = _preset_box(context, "STFLIP Jet", (0, 0, 0.28),
+                      (0.06, 0.06, 0.06), tag, role="INFLOW")
+    src.stflip.inflow_velocity = (0.0, 0.0, 4.5)
+    drain = _preset_box(context, "STFLIP Drain", (0.9, 0, 0.06),
+                        (0.06, 0.9, 0.06), tag, role="OUTFLOW")
+    drain.stflip.outflow_mode = "VOLUME"
+    st.cfl_target = 8.0
+    st.whitewater = True
+    st.whitewater_rate = 2.0
+    return "Fountain — upward jet inflow + volume outflow + spray"
+
+
+def _reset_preset_params(st):
+    """Return feature parameters to defaults so switching presets gives a
+    clean scene (each builder then sets only what it needs)."""
+    st.viscosity = 0.0
+    st.surface_tension = 0.0
+    st.sheeting = 0.0
+    st.two_phase = False
+    st.sparse = False
+    st.transfer = "flip"
+    st.whitewater = False
+    st.whitewater_rate = 1.0
+
+
+_PRESET_BUILDERS = {
+    "VISCOUS_POUR": _preset_viscous_pour,
+    "STORMY_POOL": _preset_stormy_pool,
+    "TWO_PHASE_GLUG": _preset_two_phase_glug,
+    "FOUNTAIN": _preset_fountain,
+}
+
+
+class STFLIP_OT_add_preset(bpy.types.Operator):
+    """Replace generated setup objects and this scene's bake with a ready-to-
+    bake example that showcases a feature; deleting cache files cannot be undone
+    """
+    bl_idname = "stflip.add_preset"
+    bl_label = "Add ST-FLIP Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset: bpy.props.EnumProperty(
+        name="Preset",
+        items=[
+            ("VISCOUS_POUR", "Viscous Pour", "Honey-like high-viscosity pour"),
+            ("STORMY_POOL", "Stormy Pool", "Turbulent pool with whitewater"),
+            ("TWO_PHASE_GLUG", "Two-Phase Glug", "Pour that entrains air"),
+            ("FOUNTAIN", "Fountain", "Upward jet with outflow drain"),
+        ],
+        default="STORMY_POOL",
+    )
+
+    def invoke(self, context, event):
+        return _invoke_setup_replace_confirmation(self, context, event)
+
+    def execute(self, context):
+        if _BAKE.get("running") or _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake or rebuild first")
+            return {"CANCELLED"}
+        scene = context.scene
+        try:
+            removed = _clear_bake_for_new_setup(scene)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        _remove_generated_setup_objects(scene)
+        tag = self.preset
+        _reset_preset_params(scene.stflip)
+        desc = _PRESET_BUILDERS[self.preset](context, scene.stflip, tag)
+        scene["stflip_setup"] = tag
+        scene.frame_start = 1
+        scene.frame_end = 96
+        detail = (f"; cleared {removed} previous bake files" if removed else "")
+        self.report({"INFO"}, f"{desc}; press Bake{detail}")
+        return {"FINISHED"}
+
+
 class STFLIP_OT_whirlpool_preview(bpy.types.Operator):
     """Create a practical approximation of the paper's whirlpool scene."""
     bl_idname = "stflip.whirlpool_preview"
@@ -3982,6 +4126,7 @@ class STFLIP_OT_setup_motion_blur(bpy.types.Operator):
 
 CLASSES = (
     STFLIP_OT_quick_setup,
+    STFLIP_OT_add_preset,
     STFLIP_OT_whirlpool_preview,
     STFLIP_OT_high_cfl_jet_leak,
     STFLIP_OT_bake,

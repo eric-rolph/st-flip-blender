@@ -79,6 +79,29 @@ class STFLIP_PT_main(bpy.types.Panel):
             layout.label(text=st.bake_error, icon="ERROR")
 
 
+class STFLIP_PT_presets(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "Presets"
+    bl_parent_id = "STFLIP_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.enabled = context.scene.stflip.bake_state != "RUNNING"
+        col = layout.column(align=True)
+        col.label(text="Ready-to-bake feature examples:")
+        for preset, label, icon in (
+            ("VISCOUS_POUR", "Viscous Pour (honey)", "MOD_FLUIDSIM"),
+            ("STORMY_POOL", "Stormy Pool (turbulence)", "MOD_FLUIDSIM"),
+            ("TWO_PHASE_GLUG", "Two-Phase Glug (air)", "MOD_FLUIDSIM"),
+            ("FOUNTAIN", "Fountain (jet + drain)", "MOD_FLUIDSIM"),
+        ):
+            col.operator("stflip.add_preset", text=label,
+                         icon=icon).preset = preset
+
+
 class STFLIP_PT_object(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -364,6 +387,7 @@ class STFLIP_PT_display(bpy.types.Panel):
 
 CLASSES = (
     STFLIP_PT_main,
+    STFLIP_PT_presets,
     STFLIP_PT_object,
     STFLIP_PT_solver,
     STFLIP_PT_advanced,
