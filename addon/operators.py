@@ -3877,6 +3877,91 @@ class STFLIP_OT_export_cache(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _build_surface_velocity_group():
+    """Geometry Nodes group that samples the nearest baked particle's velocity
+    onto the surface as a "velocity" attribute, giving the topology-changing
+    reconstructed mesh a velocity field for deformation motion blur."""
+    name = "STFLIP_SurfaceVelocity"
+    ng = bpy.data.node_groups.get(name)
+    if ng is not None:
+        return ng
+    ng = bpy.data.node_groups.new(name, "GeometryNodeTree")
+    ng.is_modifier = True
+    ng.interface.new_socket("Geometry", in_out="INPUT",
+                            socket_type="NodeSocketGeometry")
+    ng.interface.new_socket("Particles", in_out="INPUT",
+                            socket_type="NodeSocketObject")
+    ng.interface.new_socket("Geometry", in_out="OUTPUT",
+                            socket_type="NodeSocketGeometry")
+    n_in = ng.nodes.new("NodeGroupInput")
+    n_out = ng.nodes.new("NodeGroupOutput")
+    info = ng.nodes.new("GeometryNodeObjectInfo")
+    info.transform_space = "RELATIVE"
+    named = ng.nodes.new("GeometryNodeInputNamedAttribute")
+    named.data_type = "FLOAT_VECTOR"
+    named.inputs["Name"].default_value = "velocity"
+    nearest = ng.nodes.new("GeometryNodeSampleNearest")
+    sample = ng.nodes.new("GeometryNodeSampleIndex")
+    sample.data_type = "FLOAT_VECTOR"
+    sample.domain = "POINT"
+    store = ng.nodes.new("GeometryNodeStoreNamedAttribute")
+    store.data_type = "FLOAT_VECTOR"
+    store.domain = "POINT"
+    store.inputs["Name"].default_value = "velocity"
+    ln = ng.links.new
+    ln(n_in.outputs["Particles"], info.inputs["Object"])
+    ln(info.outputs["Geometry"], nearest.inputs["Geometry"])
+    ln(info.outputs["Geometry"], sample.inputs["Geometry"])
+    ln(named.outputs["Attribute"], sample.inputs["Value"])
+    ln(nearest.outputs["Index"], sample.inputs["Index"])
+    ln(n_in.outputs["Geometry"], store.inputs["Geometry"])
+    ln(sample.outputs["Value"], store.inputs["Value"])
+    ln(store.outputs["Geometry"], n_out.inputs["Geometry"])
+    return ng
+
+
+class STFLIP_OT_setup_motion_blur(bpy.types.Operator):
+    """Enable render motion blur and give the liquid surface a velocity
+    attribute (sampled from the particles) so it and the point clouds motion-
+    blur. Deformation motion blur on the reconstructed surface needs Cycles"""
+    bl_idname = "stflip.setup_motion_blur"
+    bl_label = "Set Up Motion Blur"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        st = scene.stflip
+        scene.render.use_motion_blur = True
+        if hasattr(scene.render, "motion_blur_shutter"):
+            scene.render.motion_blur_shutter = 0.5
+        done = []
+        # Particle + whitewater clouds already carry the velocity attribute.
+        for obj in (st.particle_object, st.whitewater_object):
+            if obj is not None and obj.name in bpy.data.objects:
+                done.append(obj.name)
+        # Surface: attach the velocity-transfer group bound to the particles.
+        surf = st.surface_object
+        particles = st.particle_object
+        if surf is not None and particles is not None:
+            mod = surf.modifiers.get("STFLIP Motion Blur")
+            if mod is None:
+                mod = surf.modifiers.new("STFLIP Motion Blur", "NODES")
+            mod.node_group = _build_surface_velocity_group()
+            ident = None
+            for item in mod.node_group.interface.items_tree:
+                if getattr(item, "name", "") == "Particles" and \
+                        getattr(item, "in_out", "") == "INPUT":
+                    ident = item.identifier
+            if ident is not None:
+                mod[ident] = particles
+            done.append(surf.name)
+        self.report(
+            {"INFO"},
+            "Motion blur enabled for: " + (", ".join(done) or "no outputs "
+            "(bake first)") + ". Surface deformation blur requires Cycles.")
+        return {"FINISHED"}
+
+
 CLASSES = (
     STFLIP_OT_quick_setup,
     STFLIP_OT_whirlpool_preview,
@@ -3890,6 +3975,7 @@ CLASSES = (
     STFLIP_OT_free_bake,
     STFLIP_OT_install_gpu,
     STFLIP_OT_export_cache,
+    STFLIP_OT_setup_motion_blur,
 )
 
 

@@ -284,6 +284,8 @@ class STFLIP_PT_export(bpy.types.Panel):
                      icon="MESH_DATA")
         layout.operator("stflip.export_cache", icon="EXPORT",
                         text="Export Alembic/USD")
+        layout.operator("stflip.setup_motion_blur", icon="ONIONSKIN_ON",
+                        text="Set Up Motion Blur")
         if st.bake_state == "IDLE":
             layout.label(text="Bake first to enable export.", icon="INFO")
 
