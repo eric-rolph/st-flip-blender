@@ -1877,11 +1877,27 @@ class STFLIPSolver:
 
     # ----------------------------------------------------------------- export
 
+    def _liquid_render_filter(self, pos_h: np.ndarray, vel_h: np.ndarray,
+                              keep_h: np.ndarray | None = None):
+        """Restrict render output to liquid particles in two-phase mode.
+
+        Gas particles are simulation state, not renderable water: exporting
+        them lets the surface mesher solidify the entire air region.  ``keep_h``
+        is the host outflow-survivor mask when the caller already subset the
+        arrays with it."""
+        if not self.p.two_phase or self.phase.shape[0] != self.pos.shape[0]:
+            return pos_h, vel_h
+        liquid = self.be.to_numpy(self.phase) > 0.5
+        if keep_h is not None:
+            liquid = liquid[keep_h]
+        return pos_h[liquid], vel_h[liquid]
+
     def get_render_particles(self) -> tuple[np.ndarray, np.ndarray]:
         """Positions re-synchronised to the global time (Alg. 1 l.31-34) and
-        velocities, as host arrays."""
+        velocities, as host arrays.  Two-phase gas particles are excluded."""
         if self.pos.shape[0] == 0 or not self._grids:
-            return (self.be.to_numpy(self.pos), self.be.to_numpy(self.vel))
+            return self._liquid_render_filter(
+                self.be.to_numpy(self.pos), self.be.to_numpy(self.vel))
         has_outflows = self._has_volume_outflow or self._has_pressure_outflow
         if has_outflows:
             pos, volume_removed, pressure_removed = self._advect(
@@ -1891,7 +1907,9 @@ class STFLIPSolver:
                 track_outflows=True,
             )
             keep = ~(volume_removed | pressure_removed)
-            return self.be.to_numpy(pos[keep]), self.be.to_numpy(self.vel[keep])
+            return self._liquid_render_filter(
+                self.be.to_numpy(pos[keep]), self.be.to_numpy(self.vel[keep]),
+                keep_h=self.be.to_numpy(keep))
         if self._grid_origin is not None:
             # Grids from the last step live in a cropped window; resync there.
             xp = self.be.xp
@@ -1905,6 +1923,8 @@ class STFLIPSolver:
                                    self.dt_resid) + dxlo
             finally:
                 self._exit_window(saved)
-            return self.be.to_numpy(pos), self.be.to_numpy(self.vel)
+            return self._liquid_render_filter(
+                self.be.to_numpy(pos), self.be.to_numpy(self.vel))
         pos = self._advect(self._grids, self.pos.copy(), self.dt_resid)
-        return self.be.to_numpy(pos), self.be.to_numpy(self.vel)
+        return self._liquid_render_filter(
+            self.be.to_numpy(pos), self.be.to_numpy(self.vel))
