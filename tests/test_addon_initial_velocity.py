@@ -419,6 +419,7 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         surface_tension=0.02,
         sparse=True,
         viscosity=0.03,
+        sheeting=0.4,
     )
 
     result = operators._solver_params(
@@ -450,6 +451,7 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         "surface_tension": 0.02,
         "sparse": True,
         "viscosity": 0.03,
+        "sheeting": 0.4,
     }
 
 

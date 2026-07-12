@@ -279,6 +279,12 @@ class STFLIPSettings(bpy.types.PropertyGroup):
                     "raise for oil, honey, lava. Solved implicitly so large "
                     "time steps stay stable",
     )
+    sheeting: FloatProperty(
+        name="Sheeting", default=0.0, min=0.0, soft_max=2.0,
+        description="Anti-clumping strength: spreads over-dense particle "
+                    "clumps to keep thin splashes and sheets intact. "
+                    "Position-only, so it adds no energy",
+    )
     sparse: BoolProperty(
         name="Sparse Grid", default=False,
         description="Crop the solver to the active fluid region each step. "
