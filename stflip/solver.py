@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import apertures, kernels, pressure, surface_tension
+from . import apertures, kernels, pressure, surface_tension, viscosity
 from .backend import Backend, get_backend
 from .velocity import VelocityField, VelocityInput, as_velocity_field
 
@@ -111,6 +111,11 @@ class Params:
     # --- Surface tension (Sec 3.9, CSF model) ----------------------------
     surface_tension: float = 0.0      # sigma (N/m); 0 disables the CSF force
     st_smooth_iters: int = 2          # B-spline smoothing passes for curvature
+
+    # --- Viscosity (implicit diffusion) ----------------------------------
+    viscosity: float = 0.0            # kinematic viscosity (dx^2/s); 0 = inviscid
+    visc_tol: float = 1e-5            # implicit-diffusion CG tolerance
+    visc_max_iter: int = 200
 
     # --- Sparse production grid (active-block domain cropping) -----------
     sparse: bool = False              # crop grids to the active particle region
@@ -208,6 +213,19 @@ class Params:
         if not math.isfinite(st) or st < 0.0:
             raise ValueError("surface_tension must be non-negative")
         self.surface_tension = st
+        visc = float(self.viscosity)
+        if not math.isfinite(visc) or visc < 0.0:
+            raise ValueError("viscosity must be non-negative")
+        self.viscosity = visc
+        vt = float(self.visc_tol)
+        if not math.isfinite(vt) or vt <= 0.0:
+            raise ValueError("visc_tol must be positive")
+        self.visc_tol = vt
+        if (isinstance(self.visc_max_iter, bool)
+                or not isinstance(self.visc_max_iter, numbers.Integral)
+                or int(self.visc_max_iter) <= 0):
+            raise ValueError("visc_max_iter must be a positive integer")
+        self.visc_max_iter = int(self.visc_max_iter)
         for name in ("gas_particles_per_cell", "block_size"):
             value = getattr(self, name)
             if (isinstance(value, bool)
@@ -1665,6 +1683,21 @@ class STFLIPSolver:
             grids["u"] = grids["u"] + dt * fu * inv_rho_u
             grids["v"] = grids["v"] + dt * fv * inv_rho_v
             grids["w"] = grids["w"] + dt * fw * inv_rho_w
+
+        # Implicit viscosity (Stam-style diffusion): unconditionally stable, so
+        # it preserves large time steps for thick fluids.  Fully-blocked solid
+        # faces are no-slip Dirichlet at the solid velocity.
+        if p.viscosity > 0.0:
+            coef = dt * p.viscosity / (p.dx * p.dx)
+            grids["u"] = viscosity.diffuse_component(
+                xp, grids["u"], coef, ~open_u, us_sol,
+                tol=p.visc_tol, max_iter=p.visc_max_iter)
+            grids["v"] = viscosity.diffuse_component(
+                xp, grids["v"], coef, ~open_v, vs_sol,
+                tol=p.visc_tol, max_iter=p.visc_max_iter)
+            grids["w"] = viscosity.diffuse_component(
+                xp, grids["w"], coef, ~open_w, ws_sol,
+                tol=p.visc_tol, max_iter=p.visc_max_iter)
 
         # No-through on fully blocked faces (u . n = u_solid . n) before the
         # aperture-weighted flux divergence.  A partially open face stores the

@@ -182,6 +182,7 @@ class STFLIP_PT_solver(bpy.types.Panel):
         gas.prop(st, "rho_gas")
         gas.prop(st, "gas_particles_per_cell")
         layout.prop(st, "surface_tension")
+        layout.prop(st, "viscosity")
         layout.prop(st, "sparse")
 
         layout.prop(st, "whitewater")

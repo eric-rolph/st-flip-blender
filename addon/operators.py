@@ -782,6 +782,7 @@ def _solver_params(settings, dims, dx, gravity, fps):
         rho_gas=settings.rho_gas,
         gas_particles_per_cell=settings.gas_particles_per_cell,
         surface_tension=settings.surface_tension,
+        viscosity=settings.viscosity,
         sparse=settings.sparse,
     )
 

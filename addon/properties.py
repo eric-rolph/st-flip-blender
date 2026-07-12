@@ -247,6 +247,12 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         description="CSF surface-tension coefficient sigma. 0 disables. "
                     "Small-scale effect; needs high resolution (paper Sec 3.9)",
     )
+    viscosity: FloatProperty(
+        name="Viscosity", default=0.0, min=0.0, soft_max=1.0, precision=4,
+        description="Kinematic viscosity (thickness). 0 = inviscid water; "
+                    "raise for oil, honey, lava. Solved implicitly so large "
+                    "time steps stay stable",
+    )
     sparse: BoolProperty(
         name="Sparse Grid", default=False,
         description="Crop the solver to the active fluid region each step. "
