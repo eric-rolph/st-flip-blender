@@ -118,6 +118,22 @@ def _solid_sdfs_from_objects(objects, depsgraph, origin, dx, grids):
 def mask_from_object(obj, depsgraph, origin, dx, dims) -> np.ndarray:
     """Boolean cell mask: cell centres inside the (closed) mesh."""
     mask = np.zeros(dims, dtype=bool)
+    # Vectorized parity fast path; fall back to the BVH loop on any failure
+    # (e.g. non-mesh evaluation or the mocked objects in the test suite).
+    try:
+        tris = _extract_triangles(obj, depsgraph)
+    except Exception:
+        tris = None
+    if tris is not None:
+        rng = _fast_subrange(tris, origin, dx, dims, pad=1)
+        if rng is None:
+            return mask
+        lo, hi = rng
+        counts = tuple(hi[i] - lo[i] for i in range(3))
+        sub_origin = tuple(origin[i] + lo[i] * dx for i in range(3))
+        mask[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = _parity_inside(
+            tris, sub_origin, dx, counts, (0.5, 0.5, 0.5))
+        return mask
     bvh, orientation, bounds = _world_bvh(obj, depsgraph)
     if bvh is None:
         return mask
@@ -164,16 +180,45 @@ def solid_sdfs_from_objects(
     cell_sdf = np.full(dims, _FAR_SDF, dtype=np.float32)
     node_shape = tuple(int(axis) + 1 for axis in dims)
     node_sdf = np.full(node_shape, _FAR_SDF, dtype=np.float32)
-    _solid_sdfs_from_objects(
-        objects,
-        depsgraph,
-        origin,
-        dx,
-        (
-            (cell_sdf, (0.5, 0.5, 0.5)),
-            (node_sdf, (0.0, 0.0, 0.0)),
-        ),
-    )
+    slow_objects = []
+    for obj in objects:
+        try:
+            tris = _extract_triangles(obj, depsgraph)
+        except Exception:
+            tris = None
+        if tris is None:
+            slow_objects.append(obj)
+            continue
+        # Band-exact signed distance on the padded sub-lattice, min-combined
+        # into the global grids (union of solids).  pad covers the exact band
+        # plus one saturated ring, matching the BVH path's pad=4 semantics.
+        band = 3
+        for grid, offset, extra in (
+            (cell_sdf, (0.5, 0.5, 0.5), 0),
+            (node_sdf, (0.0, 0.0, 0.0), 1),
+        ):
+            rng = _fast_subrange(tris, origin, dx, dims, pad=band + 1)
+            if rng is None:
+                continue
+            lo, hi = rng
+            hi = [min(hi[i] + extra, dims[i] + extra) for i in range(3)]
+            counts = tuple(hi[i] - lo[i] for i in range(3))
+            sub_origin = tuple(origin[i] + lo[i] * dx for i in range(3))
+            sub = _signed_band_sdf(tris, sub_origin, dx, counts, offset,
+                                   band=band)
+            view = grid[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
+            np.minimum(view, sub, out=view)
+    if slow_objects:
+        _solid_sdfs_from_objects(
+            slow_objects,
+            depsgraph,
+            origin,
+            dx,
+            (
+                (cell_sdf, (0.5, 0.5, 0.5)),
+                (node_sdf, (0.0, 0.0, 0.0)),
+            ),
+        )
     return cell_sdf, node_sdf
 
 
@@ -230,3 +275,189 @@ def solid_velocity_from_objects(
             vel = np.zeros(tuple(dims) + (3,), dtype=np.float32)
         vel[mask] = v
     return vel
+
+
+# --------------------------------------------------------------------------
+# Vectorized fast path (issue #12).
+#
+# The BVH loops above cost microseconds of Python per cell, which dominates
+# bake setup above resolution ~128 and every frame with animated obstacles.
+# The fast path extracts the evaluated triangle soup once and then works in
+# NumPy: inside/outside via +x ray-crossing parity (exact for closed meshes),
+# and signed distance that is exact in a narrow band around the surface and
+# sign-correct-but-saturated elsewhere -- which is all the solver consumes
+# (masks, apertures near the surface, push-out and gradients within ~1 cell).
+# Any extraction failure falls back to the original BVH loops.
+
+def _extract_triangles(obj, depsgraph):
+    """World-space (T, 3, 3) float64 triangle array of the evaluated mesh."""
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        mesh.calc_loop_triangles()
+        n_v = len(mesh.vertices)
+        n_t = len(mesh.loop_triangles)
+        if n_v == 0 or n_t == 0:
+            return None
+        co = np.empty(n_v * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", co)
+        idx = np.empty(n_t * 3, dtype=np.int64)
+        mesh.loop_triangles.foreach_get("vertices", idx)
+        matrix = np.array(evaluated.matrix_world, dtype=np.float64)
+        world = co.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+        return world[idx.reshape(-1, 3)]
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def _parity_inside(tris, origin, dx, counts, offset,
+                   ray_chunk=4096, tri_chunk=16384):
+    """Inside mask on the sample lattice origin + (index + offset) * dx.
+
+    Casts one +x ray per (j, k) lattice column, intersects it with every
+    triangle via 2D barycentrics in the yz-plane, histograms the crossing
+    x-positions into lattice bins, and takes the running-parity cumsum.
+    Ray origins carry a fixed sub-cell jitter so edge/vertex grazing hits
+    (which would double-count) have measure zero.
+    """
+    nx, ny, nz = counts
+    inside = np.zeros(counts, dtype=bool)
+    if len(tris) == 0 or min(counts) <= 0:
+        return inside
+    jy = 2.718281e-5 * dx
+    jz = 3.141592e-5 * dx
+    ys = origin[1] + (np.arange(ny) + offset[1]) * dx + jy
+    zs = origin[2] + (np.arange(nz) + offset[2]) * dx + jz
+    ray_y, ray_z = np.meshgrid(ys, zs, indexing="ij")
+    ray_y = ray_y.ravel()
+    ray_z = ray_z.ravel()
+    n_rays = ray_y.shape[0]
+    hist = np.zeros((nx + 1, n_rays), dtype=np.int32)
+    for ts in range(0, len(tris), tri_chunk):
+        tri = tris[ts:ts + tri_chunk]
+        ax, ay, az = tri[:, 0, 0], tri[:, 0, 1], tri[:, 0, 2]
+        by_a = tri[:, 1, 1] - ay
+        bz_a = tri[:, 1, 2] - az
+        cy_a = tri[:, 2, 1] - ay
+        cz_a = tri[:, 2, 2] - az
+        det = by_a * cz_a - bz_a * cy_a
+        ok_t = np.abs(det) > 1e-30
+        inv_det = np.where(ok_t, det, 1.0)
+        bx_a = tri[:, 1, 0] - ax
+        cx_a = tri[:, 2, 0] - ax
+        for rs in range(0, n_rays, ray_chunk):
+            py = ray_y[rs:rs + ray_chunk, None] - ay[None, :]
+            pz = ray_z[rs:rs + ray_chunk, None] - az[None, :]
+            u = (py * cz_a[None, :] - pz * cy_a[None, :]) / inv_det[None, :]
+            v = (by_a[None, :] * pz - bz_a[None, :] * py) / inv_det[None, :]
+            hit = (ok_t[None, :] & (u >= 0.0) & (v >= 0.0)
+                   & (u + v <= 1.0))
+            if not hit.any():
+                continue
+            rid, tid = np.nonzero(hit)
+            x_hit = (ax[tid] + u[rid, tid] * bx_a[tid]
+                     + v[rid, tid] * cx_a[tid])
+            # First lattice sample strictly past the crossing.
+            i0 = np.floor((x_hit - origin[0]) / dx - offset[0]).astype(
+                np.int64) + 1
+            i0 = np.clip(i0, 0, nx)
+            np.add.at(hist, (i0, rid + rs), 1)
+    parity = (np.cumsum(hist[:nx], axis=0) % 2).astype(bool)
+    return parity.reshape(nx, ny, nz)
+
+
+def _point_triangle_distance(points, tris, bound, chunk=512):
+    """Min distance from each point to the triangle soup, capped at ``bound``.
+
+    Closest-point-on-triangle (Ericson) evaluated as a vectorized where-
+    cascade over (chunk, T) pairs, with a per-chunk triangle bbox prefilter
+    so only nearby triangles are tested.
+    """
+    out = np.full(len(points), bound, dtype=np.float64)
+    if len(tris) == 0 or len(points) == 0:
+        return out
+    tmin = tris.min(axis=1)
+    tmax = tris.max(axis=1)
+    for s in range(0, len(points), chunk):
+        p = points[s:s + chunk]
+        sel = (np.all(tmax >= p.min(axis=0) - bound, axis=1)
+               & np.all(tmin <= p.max(axis=0) + bound, axis=1))
+        if not sel.any():
+            continue
+        a = tris[sel, 0][None]
+        b = tris[sel, 1][None]
+        c = tris[sel, 2][None]
+        q = p[:, None, :]
+        ab = b - a
+        ac = c - a
+        ap = q - a
+        d1 = (ab * ap).sum(-1)
+        d2 = (ac * ap).sum(-1)
+        bp = q - b
+        d3 = (ab * bp).sum(-1)
+        d4 = (ac * bp).sum(-1)
+        cp = q - c
+        d5 = (ab * cp).sum(-1)
+        d6 = (ac * cp).sum(-1)
+        va = d3 * d6 - d5 * d4
+        vb = d5 * d2 - d1 * d6
+        vc = d1 * d4 - d3 * d2
+        denom = va + vb + vc
+        denom = np.where(np.abs(denom) > 1e-30, denom, 1e-30)
+        closest = (a + ab * (vb / denom)[..., None]
+                   + ac * (vc / denom)[..., None])
+
+        def _edge(base, edge, t_num, t_den, cond, current):
+            t_den = np.where(np.abs(t_den) > 1e-30, t_den, 1e-30)
+            t = np.clip(t_num / t_den, 0.0, 1.0)
+            return np.where(cond[..., None], base + edge * t[..., None],
+                            current)
+
+        closest = _edge(b, c - b, d4 - d3, (d4 - d3) + (d5 - d6),
+                        (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0),
+                        closest)
+        closest = _edge(a, ac, d2, d2 - d6,
+                        (vb <= 0) & (d2 >= 0) & (d6 <= 0), closest)
+        closest = _edge(a, ab, d1, d1 - d3,
+                        (vc <= 0) & (d1 >= 0) & (d3 <= 0), closest)
+        closest = np.where(((d6 >= 0) & (d5 <= d6))[..., None], c, closest)
+        closest = np.where(((d3 >= 0) & (d4 <= d3))[..., None], b, closest)
+        closest = np.where(((d1 <= 0) & (d2 <= 0))[..., None], a, closest)
+        dist = np.sqrt(((q - closest) ** 2).sum(-1)).min(axis=1)
+        out[s:s + chunk] = np.minimum(out[s:s + chunk], dist)
+    return out
+
+
+def _signed_band_sdf(tris, origin, dx, counts, offset, band=3):
+    """Signed distance on a lattice: exact within ``band`` cells of the
+    surface, sign-correct but saturated to +/-(band+1)*dx beyond it."""
+    inside = _parity_inside(tris, origin, dx, counts, offset)
+    surface = np.zeros_like(inside)
+    surface[1:] |= inside[1:] != inside[:-1]
+    surface[:-1] |= inside[1:] != inside[:-1]
+    surface[:, 1:] |= inside[:, 1:] != inside[:, :-1]
+    surface[:, :-1] |= inside[:, 1:] != inside[:, :-1]
+    surface[:, :, 1:] |= inside[:, :, 1:] != inside[:, :, :-1]
+    surface[:, :, :-1] |= inside[:, :, 1:] != inside[:, :, :-1]
+    band_mask = _dilate(surface, band)
+    sat = (band + 1) * dx
+    sdf = np.where(inside, -sat, sat).astype(np.float32)
+    idx = np.argwhere(band_mask)
+    if len(idx):
+        pts = (np.asarray(origin, dtype=np.float64)[None, :]
+               + (idx.astype(np.float64) + np.asarray(offset)) * dx)
+        dist = _point_triangle_distance(pts, tris, bound=sat)
+        signs = np.where(inside[band_mask], -1.0, 1.0)
+        sdf[band_mask] = (signs * dist).astype(np.float32)
+    return sdf
+
+
+def _fast_subrange(tris, origin, dx, dims, pad):
+    """Padded, clamped lattice index range covering the triangle bounds."""
+    lo = [max(0, int((float(tris[..., i].min()) - origin[i]) / dx) - pad)
+          for i in range(3)]
+    hi = [min(int(dims[i]), int((float(tris[..., i].max()) - origin[i]) / dx)
+              + 1 + pad) for i in range(3)]
+    if any(hi[i] <= lo[i] for i in range(3)):
+        return None
+    return lo, hi
