@@ -124,6 +124,8 @@ class STFLIP_PT_object(bpy.types.Panel):
                 col.prop(settings, "rotation_center_world")
                 col.prop(settings, "rotation_axis_world")
                 col.prop(settings, "angular_speed")
+            if context.scene.stflip.two_phase:
+                layout.prop(settings, "inflow_is_gas")
             layout.separator()
             layout.prop(settings, "inflow_use_frame_range")
             frames = layout.row(align=True)
@@ -163,8 +165,22 @@ class STFLIP_PT_solver(bpy.types.Panel):
         sub.prop(st, "jitter_strength")
         sub.prop(st, "adaptive_gamma")
         sub.prop(st, "eta_phi")
-        layout.prop(st, "flip_blend")
+
+        layout.separator()
+        layout.prop(st, "transfer")
+        row = layout.row()
+        row.enabled = st.transfer == "flip"
+        row.prop(st, "flip_blend")
         layout.prop(st, "seed")
+
+        layout.separator()
+        layout.prop(st, "two_phase")
+        gas = layout.column(align=True)
+        gas.enabled = st.two_phase
+        gas.prop(st, "rho_gas")
+        gas.prop(st, "gas_particles_per_cell")
+        layout.prop(st, "surface_tension")
+        layout.prop(st, "sparse")
 
         layout.separator()
         layout.prop(st, "backend")

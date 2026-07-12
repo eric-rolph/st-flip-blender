@@ -57,6 +57,10 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
         items=_VELOCITY_MODE_ITEMS,
         default="UNIFORM",
     )
+    inflow_is_gas: BoolProperty(
+        name="Emit Gas", default=False,
+        description="Emit gas particles instead of liquid (two-phase only)",
+    )
     inflow_use_frame_range: BoolProperty(
         name="Limit Active Frames",
         default=False,
@@ -208,6 +212,40 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         description="Phase-field eta (paper Eq. 13): smaller steepens the "
                     "transition and levels sampling wells more aggressively; "
                     "larger preserves more detail but also more noise",
+    )
+    transfer: EnumProperty(
+        name="Transfer",
+        items=[
+            ("flip", "FLIP", "FLIP/PIC blend (detail-preserving, noisier)"),
+            ("apic", "APIC", "Affine PIC (low dissipation, smooth, stable)"),
+            ("pic", "PIC", "Pure PIC (very smooth, dissipative)"),
+        ],
+        default="flip",
+        description="Particle-grid velocity transfer scheme (paper Sec. 3.9)",
+    )
+    two_phase: BoolProperty(
+        name="Two-Phase (Gas)", default=False,
+        description="Couple a light gas phase to the liquid so air can drive "
+                    "splashes and rising bubbles (glugging). Fills the domain "
+                    "with gas particles; not combined with the sparse grid",
+    )
+    rho_gas: FloatProperty(
+        name="Gas Density", default=1.2, min=1e-3, soft_max=100.0,
+        description="Density of the gas phase (air ~ 1.2 mass/unit^3)",
+    )
+    gas_particles_per_cell: IntProperty(
+        name="Gas Particles / Cell", default=8, min=1, max=64,
+    )
+    surface_tension: FloatProperty(
+        name="Surface Tension", default=0.0, min=0.0, soft_max=1.0,
+        description="CSF surface-tension coefficient sigma. 0 disables. "
+                    "Small-scale effect; needs high resolution (paper Sec 3.9)",
+    )
+    sparse: BoolProperty(
+        name="Sparse Grid", default=False,
+        description="Crop the solver to the active fluid region each step. "
+                    "Large speed/memory win for localized free-surface flows; "
+                    "disengages when outflows or cut-cell solids are present",
     )
     density: FloatProperty(
         name="Liquid Density", default=1000.0, min=1e-6,

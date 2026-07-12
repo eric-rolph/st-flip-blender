@@ -723,6 +723,12 @@ def _solver_params(settings, dims, dx, gravity, fps):
         pcg_tol=settings.pcg_tolerance,
         pcg_max_iter=settings.pcg_max_iterations,
         eps_rho_rel=settings.density_floor_relative,
+        transfer=settings.transfer,
+        two_phase=settings.two_phase,
+        rho_gas=settings.rho_gas,
+        gas_particles_per_cell=settings.gas_particles_per_cell,
+        surface_tension=settings.surface_tension,
+        sparse=settings.sparse,
     )
 
 
@@ -2233,15 +2239,22 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 )
                 continue
             usable_inflow_cells += cell_count
+            emit_gas = bool(st.two_phase and obj.stflip.inflow_is_gas)
             solver.add_inflow(
                 mask,
                 velocity_field,
                 start_time=start_time,
                 end_time=end_time,
+                phase=0.0 if emit_gas else 1.0,
             )
             if _inflow_schedule_overlaps(
                     start_time, end_time, requested_duration):
                 active_inflow_cells += cell_count
+
+        # Two-phase: fill every remaining non-solid cell with gas particles so
+        # air can drive splashes and rising bubbles.
+        if st.two_phase and not is_resume:
+            solver.fill_gas()
 
         outflow_records = []
         for obj in outflows:
