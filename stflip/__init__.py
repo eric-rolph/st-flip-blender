@@ -11,11 +11,12 @@ from .backend import (
     cuda_diagnostics,
     get_backend,
 )
+from . import surface_tension
 from .solver import FrameStats, Params, STFLIPSolver
 from .surface import SurfaceReconstruction, reconstruct_surface
 from .velocity import SolidBodyRotation, UniformVelocity
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "Backend",
@@ -30,5 +31,6 @@ __all__ = [
     "cuda_diagnostics",
     "get_backend",
     "reconstruct_surface",
+    "surface_tension",
     "__version__",
 ]
