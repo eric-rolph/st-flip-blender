@@ -3777,6 +3777,106 @@ class STFLIP_OT_install_gpu(bpy.types.Operator):
         return {"CANCELLED"}
 
 
+class STFLIP_OT_export_cache(bpy.types.Operator):
+    """Export the baked liquid surface (and optionally the particle/whitewater
+    point clouds) as an animated Alembic or USD cache for render farms and
+    other applications"""
+    bl_idname = "stflip.export_cache"
+    bl_label = "Export Cache (Alembic/USD)"
+    bl_options = {"REGISTER"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    file_format: bpy.props.EnumProperty(
+        name="Format",
+        items=[
+            ("ALEMBIC", "Alembic (.abc)", "Animated mesh cache, widely "
+             "supported by render farms and DCCs"),
+            ("USD", "USD (.usdc)", "Universal Scene Description cache"),
+        ],
+        default="ALEMBIC",
+    )
+    include_particles: bpy.props.BoolProperty(
+        name="Include Particles", default=False)
+    include_whitewater: bpy.props.BoolProperty(
+        name="Include Whitewater", default=True)
+
+    def invoke(self, context, event):
+        if not self.filepath:
+            ext = ".abc" if self.file_format == "ALEMBIC" else ".usdc"
+            blend = bpy.data.filepath
+            base = os.path.splitext(os.path.basename(blend))[0] or "stflip"
+            self.filepath = base + "_liquid" + ext
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        scene = context.scene
+        st = scene.stflip
+        targets = []
+        if st.surface_object is not None:
+            targets.append(st.surface_object)
+        if self.include_particles and st.particle_object is not None:
+            targets.append(st.particle_object)
+        if self.include_whitewater and st.whitewater_object is not None:
+            targets.append(st.whitewater_object)
+        targets = [o for o in targets if o is not None
+                   and o.name in bpy.data.objects]
+        if not targets:
+            self.report({"ERROR"}, "No baked output objects to export; bake first")
+            return {"CANCELLED"}
+
+        meta = cache.read_meta(resolve_cache_dir(scene)) or {}
+        start = int(meta.get("frame_start", scene.frame_start))
+        end = int(meta.get("frame_end_baked", scene.frame_end))
+        if end < start:
+            end = start
+
+        # The frame-change handler drives the output meshes, so stepping the
+        # exporter across the range yields an animated cache. Temporarily
+        # reveal the targets and select only them.
+        prev_selected = [o for o in scene.objects if o.select_get()]
+        prev_active = context.view_layer.objects.active
+        prev_hidden = {}
+        for o in scene.objects:
+            o.select_set(False)
+        for o in targets:
+            prev_hidden[o.name] = o.hide_viewport
+            o.hide_viewport = False
+            o.select_set(True)
+        context.view_layer.objects.active = targets[0]
+
+        filepath = bpy.path.ensure_ext(
+            self.filepath, ".abc" if self.file_format == "ALEMBIC" else ".usdc")
+        try:
+            if self.file_format == "ALEMBIC":
+                bpy.ops.wm.alembic_export(
+                    filepath=filepath, start=start, end=end,
+                    selected=True, flatten=False,
+                    evaluation_mode="RENDER")
+            else:
+                bpy.ops.wm.usd_export(
+                    filepath=filepath, selected_objects_only=True,
+                    export_animation=True)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Export failed: {exc}")
+            return {"CANCELLED"}
+        finally:
+            for o in targets:
+                if o.name in prev_hidden:
+                    o.hide_viewport = prev_hidden[o.name]
+                o.select_set(False)
+            for o in prev_selected:
+                if o.name in bpy.data.objects:
+                    o.select_set(True)
+            context.view_layer.objects.active = prev_active
+
+        self.report(
+            {"INFO"},
+            f"Exported frames {start}-{end} of {len(targets)} object(s) to "
+            f"{os.path.basename(filepath)}")
+        return {"FINISHED"}
+
+
 CLASSES = (
     STFLIP_OT_quick_setup,
     STFLIP_OT_whirlpool_preview,
@@ -3789,6 +3889,7 @@ CLASSES = (
     STFLIP_OT_refresh_surface,
     STFLIP_OT_free_bake,
     STFLIP_OT_install_gpu,
+    STFLIP_OT_export_cache,
 )
 
 

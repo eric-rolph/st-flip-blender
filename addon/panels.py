@@ -278,6 +278,12 @@ class STFLIP_PT_export(bpy.types.Panel):
             text="Export Playback Handoff",
         )
         layout.label(text="Positions + velocity; no AI model.", icon="INFO")
+
+        layout.separator()
+        layout.label(text="Animated mesh cache for render farms/DCCs.",
+                     icon="MESH_DATA")
+        layout.operator("stflip.export_cache", icon="EXPORT",
+                        text="Export Alembic/USD")
         if st.bake_state == "IDLE":
             layout.label(text="Bake first to enable export.", icon="INFO")
 
