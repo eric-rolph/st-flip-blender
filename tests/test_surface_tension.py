@@ -68,3 +68,24 @@ def test_zero_sigma_is_a_noop():
             s.step_frame()
         return s.be.to_numpy(s.pos)
     assert np.array_equal(run(0.0), run(0.0))
+
+
+def test_capillary_time_step_clamp():
+    """With sigma > 0 the adaptive step must respect the Brackbill capillary
+    limit dt <= sqrt(rho dx^3 / (4 pi sigma)) even when the velocity CFL
+    would permit a far larger step (calm pool, large CFL target)."""
+    import math
+    n = 16
+    sigma = 100.0
+    p = Params(resolution=(n, n, n), dx=1.0 / n, gravity=(0, 0, -9.81),
+               frame_dt=1 / 24, cfl_target=8.0, seed=0,
+               surface_tension=sigma)
+    s = STFLIPSolver(p, "cpu")
+    m = np.zeros((n, n, n), bool)
+    m[:, :, :n // 2] = True
+    s.add_liquid_mask(m)
+    stats = s.step_frame()
+    dt_cap = math.sqrt(p.rho * p.dx ** 3 / (4.0 * math.pi * sigma))
+    assert stats.steps > 1  # the clamp forced substepping of the calm frame
+    assert max(stats.dt_values) <= dt_cap + 1e-9
+    assert np.all(np.isfinite(s.be.to_numpy(s.vel)))

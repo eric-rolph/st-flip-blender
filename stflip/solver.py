@@ -1807,6 +1807,15 @@ class STFLIPSolver:
                 t_rem = 0.0
                 break
             dt = min(p.cfl_target * p.dx / max(vmax, 1e-6), t_rem)
+            if p.surface_tension > 0.0:
+                # Capillary stability limit (Brackbill et al. 1992): surface
+                # tension caps dt at O(dx^{3/2}) independently of the velocity
+                # CFL (paper Sec 5), so large sigma and large CFL targets
+                # cannot be combined without this clamp blowing up the sim.
+                rho_sum = p.rho + (p.rho_gas if p.two_phase else 0.0)
+                dt = min(dt, math.sqrt(
+                    rho_sum * p.dx ** 3
+                    / (4.0 * math.pi * p.surface_tension)))
             # Subdivide the remaining frame time into even parts (Alg. 1 l.7).
             dt = t_rem / math.ceil(t_rem / dt)
             stats.particle_cfl_estimated_values.append(vmax * dt / p.dx)
