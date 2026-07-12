@@ -22,7 +22,15 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import apertures, forces, kernels, pressure, surface_tension, viscosity
+from . import (
+    apertures,
+    forces,
+    kernels,
+    multigrid,
+    pressure,
+    surface_tension,
+    viscosity,
+)
 from .backend import Backend, get_backend
 from .velocity import VelocityField, VelocityInput, as_velocity_field
 
@@ -96,6 +104,11 @@ class Params:
     eps_rho_rel: float = 1e-3         # eps_rho = eps_rho_rel * rho
     pcg_tol: float = 1e-4
     pcg_max_iter: int = 400
+    # PPE preconditioner: "jacobi" is the diagonal-preconditioned CG; "multigrid"
+    # wraps it in a geometric V-cycle that makes the iteration count nearly
+    # grid-independent (a large win at production resolutions, a wash on small
+    # grids, where it transparently falls back to the diagonal path).
+    pressure_solver: str = "jacobi"
     cfl_local: float = 1.0            # advection sub-step bound
     seed: int = 0
 
@@ -204,6 +217,8 @@ class Params:
         # --- Extension parameters (transfer / two-phase / ST / sparse) ----
         if self.transfer not in ("flip", "apic", "pic"):
             raise ValueError("transfer must be 'flip', 'apic', or 'pic'")
+        if self.pressure_solver not in ("jacobi", "multigrid"):
+            raise ValueError("pressure_solver must be 'jacobi' or 'multigrid'")
         for name in ("two_phase", "sparse"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
@@ -1909,7 +1924,10 @@ class STFLIPSolver:
         # Solve sum_f k_f (p_c - p_nb)/dx^2 = -(div u*)_c on active cells.
         rhs = -(div) * active
         kx2, ky2, kz2 = kx / p.dx**2, ky / p.dx**2, kz / p.dx**2
-        pr, iters, rel = pressure.solve(
+        ppe_solve = (
+            multigrid.solve if p.pressure_solver == "multigrid"
+            else pressure.solve)
+        pr, iters, rel = ppe_solve(
             xp, rhs, kx2, ky2, kz2, active, tol=p.pcg_tol,
             max_iter=p.pcg_max_iter)
         stats.pcg_iters.append(iters)

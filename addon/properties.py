@@ -255,6 +255,21 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         default="flip",
         description="Particle-grid velocity transfer scheme (paper Sec. 3.9)",
     )
+    pressure_solver: EnumProperty(
+        name="Pressure Solver",
+        items=[
+            ("jacobi", "Jacobi-PCG",
+             "Diagonal-preconditioned conjugate gradient (default)"),
+            ("multigrid", "Multigrid-PCG",
+             "Geometric multigrid V-cycle preconditioner: far fewer "
+             "iterations at high resolution, transparently falls back to "
+             "Jacobi on small grids"),
+        ],
+        default="jacobi",
+        description="Preconditioner for the pressure projection. Multigrid "
+                    "makes the iteration count nearly grid-independent, a large "
+                    "win at production resolutions",
+    )
     two_phase: BoolProperty(
         name="Two-Phase (Gas)", default=False,
         description="Couple a light gas phase to the liquid so air can drive "
