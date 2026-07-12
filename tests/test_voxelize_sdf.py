@@ -304,3 +304,40 @@ def test_fast_mask_and_sdf_wrappers_use_triangles(monkeypatch):
     assert cell_sdf[8, 8, 8] < 0 < cell_sdf[0, 0, 0]
     # Node exactly on the top face plane (z = 0.75 -> k = 12): |sdf| ~ 0.
     assert abs(node_sdf[8, 8, 12]) < 1e-4
+
+
+def test_solid_velocity_deforming_mesh(monkeypatch):
+    """Matrix unchanged but vertices moved (armature-style deformation):
+    band cells must take the nearest current vertex's displacement / dt."""
+    voxelize = _load_voxelize(monkeypatch)
+    dims = (8, 8, 8)
+    dx = 0.5
+    origin = np.zeros(3)
+    frame_dt = 0.1
+
+    inside = np.zeros(dims, dtype=bool)
+    inside[3:5, 3:5, 3:5] = True
+    monkeypatch.setattr(
+        voxelize, "mask_from_object",
+        lambda obj, deps, org, d, dm: inside.copy())
+
+    verts_prev = np.array([[2.0, 2.0, 2.0], [2.0, 2.0, 2.5]])
+    verts_cur = verts_prev + np.array([0.05, 0.0, 0.1])  # uniform deformation
+    monkeypatch.setattr(
+        voxelize, "_extract_vertices", lambda obj, deps: verts_cur.copy())
+
+    obj = types.SimpleNamespace(name="Flag", matrix_world=np.eye(4))
+    vel = voxelize.solid_velocity_from_objects(
+        [obj], {"Flag": np.eye(4)}, None, origin, dx, dims, frame_dt,
+        prev_vertices={"Flag": verts_prev})
+
+    assert vel is not None
+    expected = np.array([0.05, 0.0, 0.1]) / frame_dt
+    assert np.allclose(vel[4, 4, 4], expected, atol=1e-5)
+    assert np.allclose(vel[0, 0, 0], 0.0)
+
+    # Unchanged vertices and matrix -> nothing moved.
+    assert voxelize.solid_velocity_from_objects(
+        [obj], {"Flag": np.eye(4)}, None, origin, dx, dims, frame_dt,
+        prev_vertices={"Flag": verts_cur},
+    ) is None

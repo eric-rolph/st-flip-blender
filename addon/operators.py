@@ -972,6 +972,22 @@ def _scene_setup_provenance(scene):
     return None
 
 
+def _capture_obstacle_state(objects, depsgraph):
+    """Snapshot world matrices and evaluated vertices of animated obstacles
+    so both rigid motion and mesh deformation can be differenced next frame."""
+    matrices = {}
+    vertices = {}
+    for obj in objects:
+        matrices[obj.name] = np.array(obj.matrix_world, dtype=np.float64)
+        try:
+            verts = voxelize._extract_vertices(obj, depsgraph)
+        except Exception:
+            verts = None
+        if verts is not None:
+            vertices[obj.name] = verts
+    return matrices, vertices
+
+
 def _refresh_animated_obstacles(scene, b) -> None:
     """Advance the scene to the next output frame, re-voxelize the obstacles,
     and hand the solver the updated SDF plus a differenced rigid velocity."""
@@ -983,12 +999,11 @@ def _refresh_animated_obstacles(scene, b) -> None:
     vel = voxelize.solid_velocity_from_objects(
         b["animated_obstacles"], b["prev_solid_matrices"], deps,
         b["vox_origin"], b["vox_dx"], b["vox_dims"],
-        b["solver"].p.frame_dt)
+        b["solver"].p.frame_dt,
+        prev_vertices=b.get("prev_solid_vertices"))
     b["solver"].set_solid_sdf(sdf, node_sdf, solid_vel=vel)
-    b["prev_solid_matrices"] = {
-        obj.name: np.array(obj.matrix_world, dtype=np.float64)
-        for obj in b["animated_obstacles"]
-    }
+    b["prev_solid_matrices"], b["prev_solid_vertices"] = (
+        _capture_obstacle_state(b["animated_obstacles"], deps))
 
 
 def _fluid_objects(scene, role: str):
@@ -2737,6 +2752,8 @@ class STFLIP_OT_bake(bpy.types.Operator):
             # leaves the frame/checkpoint pair outside the committed range.
             cache.write_meta(cache_dir, meta)
 
+        _initial_obstacle_state = _capture_obstacle_state(
+            animated_obstacles, deps)
         whitewater_system = None
         if getattr(st, "whitewater", False):
             from ..stflip.whitewater import Whitewater, WhitewaterParams
@@ -2776,10 +2793,8 @@ class STFLIP_OT_bake(bpy.types.Operator):
             # Moving-wall bookkeeping (empty unless obstacles animate).
             animated_obstacles=animated_obstacles,
             obstacles_all=obstacles,
-            prev_solid_matrices={
-                obj.name: np.array(obj.matrix_world, dtype=np.float64)
-                for obj in animated_obstacles
-            },
+            prev_solid_matrices=_initial_obstacle_state[0],
+            prev_solid_vertices=_initial_obstacle_state[1],
             whitewater=whitewater_system,
             vox_origin=origin.copy(),
             vox_dx=dx,
