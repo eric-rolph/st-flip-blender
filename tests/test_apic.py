@@ -1,7 +1,6 @@
 """APIC affine transfer (paper Sec 3.9)."""
 
 import numpy as np
-import pytest
 
 from stflip import Params, STFLIPSolver
 from stflip.solver import _inv3x3
@@ -67,7 +66,8 @@ def test_apic_recovers_linear_velocity_gradient():
 def test_apic_runs_stable_and_carries_C():
     n = 20
     s = _solver(n=n, transfer="apic")
-    m = np.zeros((n, n, n), bool); m[:n // 3, :, :n // 2] = True
+    m = np.zeros((n, n, n), bool)
+    m[:n // 3, :, :n // 2] = True
     n0 = s.add_liquid_mask(m)
     for _ in range(4):
         s.step_frame()
@@ -84,9 +84,9 @@ def test_apic_less_dissipative_than_pic():
     def spin_energy(mode):
         n = 16
         s = _solver(n=n, gravity=(0, 0, 0), transfer=mode, seed=3)
-        m = np.zeros((n, n, n), bool); m[4:12, 4:12, 4:12] = True
+        m = np.zeros((n, n, n), bool)
+        m[4:12, 4:12, 4:12] = True
         s.add_liquid_mask(m)
-        xp = s.be.xp
         pos = s.be.to_numpy(s.pos)
         c = np.array([0.5, 0.5, 0.5])
         r = pos - c

@@ -10,7 +10,8 @@ def _run(sparse, n=48, frames=4, seed=0):
                frame_dt=1 / 24, cfl_target=6.0, seed=seed, sparse=sparse,
                block_size=8)
     s = STFLIPSolver(p, "cpu")
-    m = np.zeros((n, n, n), bool); m[2:14, 2:14, 20:40] = True
+    m = np.zeros((n, n, n), bool)
+    m[2:14, 2:14, 20:40] = True
     s.add_liquid_mask(m)
     coms = []
     for _ in range(frames):
@@ -40,7 +41,8 @@ def test_sparse_dam_break_stable():
     p = Params(resolution=(n, n, n), dx=1.0 / n, gravity=(0, 0, -9.81),
                frame_dt=1 / 24, cfl_target=8.0, seed=3, sparse=True)
     s = STFLIPSolver(p, "cpu")
-    m = np.zeros((n, n, n), bool); m[:13, :, :20] = True
+    m = np.zeros((n, n, n), bool)
+    m[:13, :, :20] = True
     s.add_liquid_mask(m)
     for _ in range(3):
         s.step_frame()
@@ -55,7 +57,8 @@ def test_sparse_apic_two_phase_combo_runs():
                frame_dt=1 / 24, cfl_target=4.0, seed=2, sparse=True,
                transfer="apic")
     s = STFLIPSolver(p, "cpu")
-    m = np.zeros((n, n, n), bool); m[4:12, 4:12, 12:20] = True
+    m = np.zeros((n, n, n), bool)
+    m[4:12, 4:12, 12:20] = True
     s.add_liquid_mask(m)
     for _ in range(3):
         s.step_frame()

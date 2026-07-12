@@ -24,7 +24,8 @@ def test_fill_gas_only_when_two_phase():
 def test_gas_fills_free_cells():
     n = 16
     s = _two_phase(n=n)
-    liq = np.zeros((n, n, n), bool); liq[:, :, n // 2:] = True
+    liq = np.zeros((n, n, n), bool)
+    liq[:, :, n // 2:] = True
     nl = s.add_liquid_mask(liq)
     ng = s.fill_gas()
     ph = s.be.to_numpy(s.phase)
@@ -36,7 +37,8 @@ def test_gas_fills_free_cells():
 def test_heavy_blob_sinks_through_gas():
     n = 24
     s = _two_phase(n=n)
-    blob = np.zeros((n, n, n), bool); blob[9:15, 9:15, 15:21] = True
+    blob = np.zeros((n, n, n), bool)
+    blob[9:15, 9:15, 15:21] = True
     s.add_liquid_mask(blob)
     s.fill_gas()
     ph = s.be.to_numpy(s.phase)
@@ -52,9 +54,11 @@ def test_heavy_blob_sinks_through_gas():
 def test_light_bubble_rises_through_liquid():
     n = 24
     s = _two_phase(n=n, seed=6)
-    liq = np.ones((n, n, n), bool); liq[9:15, 9:15, 4:10] = False
+    liq = np.ones((n, n, n), bool)
+    liq[9:15, 9:15, 4:10] = False
     s.add_liquid_mask(liq)
-    gas = np.zeros((n, n, n), bool); gas[9:15, 9:15, 4:10] = True
+    gas = np.zeros((n, n, n), bool)
+    gas[9:15, 9:15, 4:10] = True
     s.add_gas_mask(gas)
     ph = s.be.to_numpy(s.phase)
     zg0 = s.be.to_numpy(s.pos)[ph < 0.5][:, 2].mean()

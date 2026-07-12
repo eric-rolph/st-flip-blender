@@ -51,21 +51,27 @@ def _inv3x3(xp, M):
     a, b, c = M[:, 0, 0], M[:, 0, 1], M[:, 0, 2]
     d, e, f = M[:, 1, 0], M[:, 1, 1], M[:, 1, 2]
     g, h, i = M[:, 2, 0], M[:, 2, 1], M[:, 2, 2]
-    A = e * i - f * h
-    B = -(d * i - f * g)
-    C = d * h - e * g
-    D = -(b * i - c * h)
-    E = a * i - c * g
-    F = -(a * h - b * g)
-    G = b * f - c * e
-    H = -(a * f - c * d)
-    I = a * e - b * d
-    det = a * A + b * B + c * C
+    c00 = e * i - f * h
+    c01 = -(d * i - f * g)
+    c02 = d * h - e * g
+    c10 = -(b * i - c * h)
+    c11 = a * i - c * g
+    c12 = -(a * h - b * g)
+    c20 = b * f - c * e
+    c21 = -(a * f - c * d)
+    c22 = a * e - b * d
+    det = a * c00 + b * c01 + c * c02
     inv_det = 1.0 / xp.where(xp.abs(det) > 1e-30, det, 1e-30)
     out = xp.empty_like(M)
-    out[:, 0, 0] = A * inv_det; out[:, 0, 1] = D * inv_det; out[:, 0, 2] = G * inv_det
-    out[:, 1, 0] = B * inv_det; out[:, 1, 1] = E * inv_det; out[:, 1, 2] = H * inv_det
-    out[:, 2, 0] = C * inv_det; out[:, 2, 1] = F * inv_det; out[:, 2, 2] = I * inv_det
+    out[:, 0, 0] = c00 * inv_det
+    out[:, 0, 1] = c10 * inv_det
+    out[:, 0, 2] = c20 * inv_det
+    out[:, 1, 0] = c01 * inv_det
+    out[:, 1, 1] = c11 * inv_det
+    out[:, 1, 2] = c21 * inv_det
+    out[:, 2, 0] = c02 * inv_det
+    out[:, 2, 1] = c12 * inv_det
+    out[:, 2, 2] = c22 * inv_det
     return out
 
 

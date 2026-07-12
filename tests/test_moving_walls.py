@@ -10,7 +10,8 @@ def _piston_scene(n=24, vpiston=2.0, gravity=(0, 0, 0), seed=2):
     p = Params(resolution=(n, n, n), dx=dx, gravity=gravity, frame_dt=1 / 24,
                cfl_target=3.0, seed=seed)
     s = STFLIPSolver(p, "cpu")
-    m = np.zeros((n, n, n), bool); m[:, :, 6:14] = True
+    m = np.zeros((n, n, n), bool)
+    m[:, :, 6:14] = True
     s.add_liquid_mask(m)
     sdf = np.full((n, n, n), 1e9, np.float32)
     sv = np.zeros((n, n, n, 3), np.float32)
@@ -43,7 +44,8 @@ def test_static_solid_velocity_is_noop():
         p = Params(resolution=(n, n, n), dx=dx, gravity=(0, 0, -9.81),
                    frame_dt=1 / 24, cfl_target=4.0, seed=1)
         s = STFLIPSolver(p, "cpu")
-        m = np.zeros((n, n, n), bool); m[:n // 2, :, 6:16] = True
+        m = np.zeros((n, n, n), bool)
+        m[:n // 2, :, 6:16] = True
         s.add_liquid_mask(m)
         sdf = np.full((n, n, n), 1e9, np.float32)
         for k in range(6):
@@ -88,7 +90,6 @@ def test_moving_wall_no_tunneling():
     s = _piston_scene(vpiston=4.0)
     for _ in range(4):
         s.step_frame()
-    pos = s.be.to_numpy(s.pos)
     d = s.be.to_numpy(s._sample_cells(s.sdf, s.pos))
     # essentially no particles more than a cell inside the piston
     assert (d < -1.5 / 24).mean() < 0.02

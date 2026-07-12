@@ -44,7 +44,8 @@ def test_surface_tension_stays_finite():
                frame_dt=1 / 24, cfl_target=4.0, seed=1, surface_tension=0.02,
                transfer="apic")
     s = STFLIPSolver(p, "cpu")
-    m = np.zeros((n, n, n), bool); m[4:12, 4:12, 4:12] = True
+    m = np.zeros((n, n, n), bool)
+    m[4:12, 4:12, 4:12] = True
     s.add_liquid_mask(m)
     for _ in range(3):
         s.step_frame()
@@ -60,7 +61,8 @@ def test_zero_sigma_is_a_noop():
                    frame_dt=1 / 24, cfl_target=4.0, seed=2,
                    surface_tension=sigma)
         s = STFLIPSolver(p, "cpu")
-        m = np.zeros((n, n, n), bool); m[:n // 2, :, :n // 2] = True
+        m = np.zeros((n, n, n), bool)
+        m[:n // 2, :, :n // 2] = True
         s.add_liquid_mask(m)
         for _ in range(3):
             s.step_frame()

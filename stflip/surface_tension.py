@@ -47,16 +47,16 @@ def _shift(xp, a, axis, off):
         dst = slice(0, n + off)
         edge = slice(n - 1, n)
     # Interior copy.
-    idx_dst = list(sl); idx_dst[axis] = dst
-    idx_src = list(sl); idx_src[axis] = src
+    idx_dst = list(sl)
+    idx_dst[axis] = dst
+    idx_src = list(sl)
+    idx_src[axis] = src
     out[tuple(idx_dst)] = a[tuple(idx_src)]
     # Clamp the exposed border to the nearest edge value.
-    if off > 0:
-        idx_fill = list(sl); idx_fill[axis] = slice(0, off)
-        idx_edge = list(sl); idx_edge[axis] = edge
-    else:
-        idx_fill = list(sl); idx_fill[axis] = slice(n + off, n)
-        idx_edge = list(sl); idx_edge[axis] = edge
+    idx_fill = list(sl)
+    idx_edge = list(sl)
+    idx_edge[axis] = edge
+    idx_fill[axis] = slice(0, off) if off > 0 else slice(n + off, n)
     out[tuple(idx_fill)] = a[tuple(idx_edge)]
     return out
 
