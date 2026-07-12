@@ -16,7 +16,7 @@ from .solver import FrameStats, Params, STFLIPSolver
 from .surface import SurfaceReconstruction, reconstruct_surface
 from .velocity import SolidBodyRotation, UniformVelocity
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 __all__ = [
     "Backend",

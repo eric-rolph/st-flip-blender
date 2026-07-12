@@ -442,6 +442,9 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
   per-particle velocity onto the topology-changing surface (Geometry Nodes)
   so the surface and point clouds motion-blur; surface deformation blur
   needs Cycles
+- **Force fields / guides** (v0.16): a `Force Field` object role adds
+  directional (wind), vortex, or divergence-free curl-noise turbulence body
+  forces for art-directable flow (object +Z = axis, origin = centre)
 - NumPy CPU + CuPy CUDA backends sharing one code path
 - Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy

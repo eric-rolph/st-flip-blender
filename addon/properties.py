@@ -42,6 +42,8 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
                 "Removes liquid through a closed-mesh outlet volume",
             ),
             ("OBSTACLE", "Obstacle", "Solid obstacle (closed mesh)"),
+            ("FORCE", "Force Field",
+             "Art-directable body force (wind/vortex/turbulence)"),
         ],
         default="NONE",
     )
@@ -60,6 +62,30 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
     inflow_is_gas: BoolProperty(
         name="Emit Gas", default=False,
         description="Emit gas particles instead of liquid (two-phase only)",
+    )
+    force_type: EnumProperty(
+        name="Force Type",
+        items=[
+            ("DIRECTIONAL", "Directional (Wind)",
+             "Uniform push along the object's local +Z axis"),
+            ("VORTEX", "Vortex",
+             "Swirl about the object's local +Z axis through its origin"),
+            ("TURBULENCE", "Turbulence",
+             "Divergence-free curl noise for chaotic detail"),
+        ],
+        default="TURBULENCE",
+    )
+    force_strength: FloatProperty(
+        name="Force Strength", default=5.0, soft_min=-50.0, soft_max=50.0,
+        description="Acceleration magnitude of the force field",
+    )
+    force_scale: FloatProperty(
+        name="Turbulence Scale", default=0.5, min=0.01, soft_max=10.0,
+        description="Coarsest turbulence wavelength in Blender units",
+    )
+    force_radius: FloatProperty(
+        name="Vortex Radius", default=1.0, min=0.01, soft_max=50.0,
+        description="Radial falloff distance of the vortex swirl",
     )
     obstacle_animated: BoolProperty(
         name="Animated (Moving Wall)", default=False,

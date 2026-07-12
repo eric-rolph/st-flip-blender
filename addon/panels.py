@@ -136,6 +136,16 @@ class STFLIP_PT_object(bpy.types.Panel):
                          icon="INFO")
         elif obj.stflip.role == "OBSTACLE":
             layout.prop(obj.stflip, "obstacle_animated")
+        elif obj.stflip.role == "FORCE":
+            settings = obj.stflip
+            layout.prop(settings, "force_type")
+            layout.prop(settings, "force_strength")
+            if settings.force_type == "TURBULENCE":
+                layout.prop(settings, "force_scale")
+            elif settings.force_type == "VORTEX":
+                layout.prop(settings, "force_radius")
+            layout.label(text="Object +Z = direction/axis; origin = centre.",
+                         icon="INFO")
         elif obj.stflip.role == "OUTFLOW":
             layout.prop(obj.stflip, "outflow_mode")
             if obj.stflip.outflow_mode == "VOLUME":
