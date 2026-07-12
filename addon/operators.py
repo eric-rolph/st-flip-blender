@@ -362,6 +362,34 @@ def _runtime_root(create: bool = False) -> Path | None:
     return root
 
 
+def _short_runtime_root(create: bool = False) -> Path:
+    """Shallow per-user runtime root for deep Blender config trees.
+
+    CuPy's bundled CCCL headers nest ~95 characters below the install dir; on
+    MS-Store Blender the user modules directory alone is ~165 characters deep,
+    so header paths cross Windows' 260-char MAX_PATH and NVRTC fails to open
+    them at kernel-compile time ("catastrophic error: cannot open source
+    file").  Installing under the user profile root keeps every path short.
+    MSIX filesystem virtualization also does not redirect this location, so
+    the same directory is visible to every Blender build.
+    """
+    root = Path.home() / ".stflip_cuda"
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _install_target_root(create: bool = False) -> Path | None:
+    """Where new runtimes should be installed (marker stays in modules)."""
+    root = _runtime_root(create=create)
+    if root is None:
+        return None
+    # ~90 chars of headroom for the deepest CuPy header below the install dir.
+    if len(str(root)) > 130:
+        return _short_runtime_root(create=create)
+    return root
+
+
 def _configured_runtime_path() -> Path | None:
     root = _runtime_root(create=False)
     if root is None:
@@ -371,7 +399,10 @@ def _configured_runtime_path() -> Path | None:
         candidate = Path(marker.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
-    if candidate.is_dir() and _is_within(candidate, root):
+    if candidate.is_dir() and (
+        _is_within(candidate, root)
+        or _is_within(candidate, _short_runtime_root())
+    ):
         return candidate
     return None
 
@@ -3648,14 +3679,18 @@ class STFLIP_OT_install_gpu(bpy.types.Operator):
             self.report({"ERROR"}, "Blender user modules directory unavailable")
             return {"CANCELLED"}
 
+        # Deep Blender config trees (MS-Store) push CuPy's nested headers past
+        # Windows' 260-char MAX_PATH, so install into a shallow per-user root
+        # instead; the active.txt marker stays in the modules runtime root.
+        install_root = _install_target_root(create=True) or root
+
         attempts = []
         for candidate in GPU_INSTALL_CANDIDATES:
-            # Keep the directory name SHORT: on MS-Store Blender the modules
-            # root is already ~165 characters deep and CuPy's longest .pyd
-            # path breaks Windows' 260-char MAX_PATH with a verbose name
+            # Keep the directory name SHORT as well: even moderate roots plus
+            # a verbose name (slug-version-nanoseconds) broke .pyd loading
             # ("DLL load failed ... filename or extension is too long").
             nonce = format(time.time_ns() % 0xFFFFFF, "x")
-            install_dir = root / f"{candidate['slug']}-{nonce}"
+            install_dir = install_root / f"{candidate['slug']}-{nonce}"
             install_dir.mkdir(parents=True, exist_ok=False)
             installing_marker = install_dir / _INSTALLING_RUNTIME_FILE
             installing_marker.write_text(
