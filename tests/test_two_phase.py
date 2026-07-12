@@ -82,3 +82,20 @@ def test_particle_count_conserved_closed_box():
     # No inflow/culling: the fixed particle set is preserved.
     assert s.pos.shape[0] == n0
     assert np.all(s.be.to_numpy(s.phase) >= 0.0)
+
+
+def test_render_particles_exclude_gas():
+    """Gas is simulation state, not water: the render export must contain
+    only liquid particles or the surface mesher solidifies the air region."""
+    n = 16
+    s = _two_phase(n=n, seed=9)
+    liq = np.zeros((n, n, n), bool)
+    liq[:, :, : n // 2] = True
+    n_liquid = s.add_liquid_mask(liq)
+    s.fill_gas()
+    assert s.pos.shape[0] > n_liquid  # gas actually seeded
+    s.step_frame()
+    pos, vel = s.get_render_particles()
+    assert len(pos) == len(vel)
+    assert 0 < len(pos) <= n_liquid
+    assert len(pos) < s.pos.shape[0]
