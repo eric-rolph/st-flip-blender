@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -1227,6 +1229,107 @@ def test_checkpoint_restore_matches_uninterrupted_future_frames_exactly():
             "pressure_outflow_removed_total",
         ):
             assert actual[name] == expected[name]
+
+
+def _apic_two_phase_solver(*, seed_particles):
+    """An APIC + two-phase solver so the checkpoint carries a non-trivial phase
+    tag and affine matrix (the state a version-1 checkpoint dropped)."""
+    params = Params(
+        resolution=(6, 6, 6),
+        dx=1.0 / 6.0,
+        gravity=(0.0, 0.0, -0.2),
+        frame_dt=1.0 / 30.0,
+        cfl_target=2.0,
+        particles_per_cell=1,
+        transfer="apic",
+        two_phase=True,
+        seed=7,
+    )
+    solver = STFLIPSolver(params, "cpu")
+    if seed_particles:
+        liquid = np.zeros(params.resolution, dtype=bool)
+        liquid[1:4, 1:4, 0:2] = True
+        solver.add_liquid_mask(liquid, (0.05, 0.0, 0.0))
+        gas = np.zeros(params.resolution, dtype=bool)
+        gas[1:4, 1:4, 4:6] = True
+        solver.add_gas_mask(gas)
+    return solver
+
+
+def test_checkpoint_round_trips_phase_affine_and_shading():
+    source = _apic_two_phase_solver(seed_particles=True)
+    source.step_frame()
+    snapshot = source.checkpoint_state()
+
+    # The snapshot must carry the extras with their live shapes/dtypes.
+    n = snapshot["pos"].shape[0]
+    assert snapshot["phase"].shape == (n,)
+    assert snapshot["phase"].dtype == np.float32
+    assert snapshot["C"].shape == (n, 3, 3)          # APIC is on
+    assert snapshot["age"].shape == (n,)
+    assert snapshot["source_id"].dtype == np.int32
+    # Both phases and a non-zero affine field are actually present.
+    assert set(np.unique(snapshot["phase"])) <= {0.0, 1.0}
+    assert (snapshot["phase"] == 0.0).any() and (snapshot["phase"] == 1.0).any()
+    assert np.abs(snapshot["C"]).max() > 0.0
+    assert snapshot["age"].max() > 0.0
+
+    restored = _apic_two_phase_solver(seed_particles=False)
+    restored.restore_state(snapshot)
+    back = restored.checkpoint_state()
+    for name in ("phase", "C", "age", "source_id"):
+        np.testing.assert_array_equal(back[name], snapshot[name])
+
+    # Continuity: future frames match a run that was never interrupted, which
+    # only holds if the affine field and phase tag were restored exactly.
+    for _ in range(2):
+        expected = source.step_frame()
+        actual = restored.step_frame()
+        assert actual == expected
+        exp, act = source.checkpoint_state(), restored.checkpoint_state()
+        for name in ("pos", "vel", "phase", "C", "age", "source_id"):
+            np.testing.assert_array_equal(act[name], exp[name])
+
+
+def test_version_one_checkpoint_restores_with_default_particle_attrs(tmp_path):
+    """A version-1 archive (no phase/affine/shading) still resumes, falling
+    back to the historical defaults instead of raising."""
+    seeded = _apic_two_phase_solver(seed_particles=True)
+    seeded.step_frame()
+    state = seeded.checkpoint_state()
+
+    # Emulate a legacy on-disk archive: base members only, version=1.
+    path = Path(cache.checkpoint_path(str(tmp_path), 5))
+    _, rng_bytes = cache._checkpoint_rng_json(state["rng_state"])
+    with path.open("wb") as stream:
+        np.savez(
+            stream,
+            schema=np.asarray(cache.CHECKPOINT_SCHEMA),
+            version=np.asarray(1, dtype=np.int64),
+            frame=np.asarray(5, dtype=np.int64),
+            fingerprint=np.asarray(""),
+            pos=state["pos"], vel=state["vel"], dt_resid=state["dt_resid"],
+            time=np.asarray(state["time"], dtype=np.float64),
+            dt_prev=np.asarray(state["dt_prev"], dtype=np.float64),
+            rng_state_json=rng_bytes,
+            outflow_removed_total=np.asarray(0, dtype=np.int64),
+            volume_outflow_removed_total=np.asarray(0, dtype=np.int64),
+            pressure_outflow_removed_total=np.asarray(0, dtype=np.int64),
+        )
+
+    loaded = cache.read_checkpoint(str(tmp_path), 5)
+    assert loaded is not None
+    assert "phase" not in loaded and "C" not in loaded
+
+    restored = _apic_two_phase_solver(seed_particles=False)
+    restored.restore_state(loaded)
+    n = restored.pos.shape[0]
+    assert np.array_equal(
+        restored.be.to_numpy(restored.phase), np.ones(n, dtype=np.float32))
+    assert restored.be.to_numpy(restored.C).shape == (0, 3, 3)
+    assert np.array_equal(
+        restored.be.to_numpy(restored.age), np.zeros(n, dtype=np.float32))
+    restored.step_frame()          # a legacy resume must keep running
 
 
 def test_partial_cache_resume_extends_without_reseeding(tmp_path):
