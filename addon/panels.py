@@ -184,6 +184,12 @@ class STFLIP_PT_solver(bpy.types.Panel):
         layout.prop(st, "surface_tension")
         layout.prop(st, "sparse")
 
+        layout.prop(st, "whitewater")
+        ww = layout.column(align=True)
+        ww.enabled = st.whitewater
+        ww.prop(st, "whitewater_rate")
+        ww.prop(st, "whitewater_max")
+
         layout.separator()
         layout.prop(st, "backend")
         state = gpu_state()

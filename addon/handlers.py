@@ -220,6 +220,51 @@ def _frame_bounds(meta: dict, default_start: int):
     return int(lo), int(hi)
 
 
+
+def _apply_whitewater_frame(scene, cache_dir: str, frame: int) -> None:
+    """Stream the frame's whitewater cache (if any) into the display object.
+
+    Whitewater is a cosmetic secondary output: any failure here must never
+    turn authoritative particle playback into an error."""
+    try:
+        obj = scene.stflip.whitewater_object
+        if obj is None or obj.type != "MESH":
+            return
+        path = os.path.join(cache_dir, f"stflip_ww_{frame:06d}.npz")
+        if os.path.isfile(path):
+            with np.load(path) as data:
+                pos = np.asarray(data["pos"], dtype=np.float32)
+                vel = np.asarray(data["vel"], dtype=np.float32)
+                kind = np.asarray(data["kind"], dtype=np.int32)
+                life = np.asarray(data["life"], dtype=np.float32)
+        else:
+            pos = np.zeros((0, 3), dtype=np.float32)
+            vel = np.zeros((0, 3), dtype=np.float32)
+            kind = np.zeros((0,), dtype=np.int32)
+            life = np.zeros((0,), dtype=np.float32)
+        me = obj.data
+        n = len(pos)
+        if len(me.vertices) != n:
+            me.clear_geometry()
+            me.vertices.add(n)
+        me.vertices.foreach_set("co", np.ascontiguousarray(pos).ravel())
+        for name, dtype, values in (
+            ("velocity", "FLOAT_VECTOR", vel),
+            ("ww_kind", "INT", kind),
+            ("ww_life", "FLOAT", life),
+        ):
+            attr = me.attributes.get(name)
+            if attr is None or len(attr.data) != n:
+                if attr is not None:
+                    me.attributes.remove(attr)
+                attr = me.attributes.new(name, dtype, "POINT")
+            key = "vector" if dtype == "FLOAT_VECTOR" else "value"
+            attr.data.foreach_set(key, np.ascontiguousarray(values).ravel())
+        me.update()
+    except Exception:
+        pass
+
+
 def _apply_frame(scene, frame: int) -> bool:
     cache_dir = resolve_cache_dir(scene)
     meta = cache.read_meta(cache_dir)
@@ -267,6 +312,7 @@ def _apply_frame(scene, frame: int) -> bool:
     # loaded successfully, a missing or invalid paper mesh must never turn the
     # authoritative particle frame into a playback failure.
     _apply_paper_surface_frame(scene, cache_dir, meta, f, pos)
+    _apply_whitewater_frame(scene, cache_dir, f)
     return True
 
 
