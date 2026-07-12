@@ -307,6 +307,23 @@ def _apply_frame(scene, frame: int) -> bool:
         attr = me.attributes.new("velocity", "FLOAT_VECTOR", "POINT")
     attr.data.foreach_set(
         "vector", np.ascontiguousarray(vel, dtype=np.float32).ravel())
+    # Shading attributes (age, source, speed) for age-fade, per-source colour,
+    # and speed-driven effects; absent on caches that predate the format.
+    extra = cache.read_frame_attributes(cache_dir, f)
+    for name, dtype, key in (("age", "FLOAT", "value"),
+                             ("speed", "FLOAT", "value"),
+                             ("source", "INT", "value")):
+        values = extra.get(name)
+        if values is None or len(values) != n:
+            continue
+        a = me.attributes.get(name)
+        if a is None or len(a.data) != n or a.data_type != dtype:
+            if a is not None:
+                me.attributes.remove(a)
+            a = me.attributes.new(name, dtype, "POINT")
+        np_dtype = np.int32 if dtype == "INT" else np.float32
+        a.data.foreach_set(
+            key, np.ascontiguousarray(values, dtype=np_dtype).ravel())
     me.update()
     # Paper reconstruction is a derived display cache.  Once particles have
     # loaded successfully, a missing or invalid paper mesh must never turn the

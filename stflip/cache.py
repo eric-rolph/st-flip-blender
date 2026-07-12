@@ -372,16 +372,26 @@ def metrics_path(cache_dir: str) -> str:
 
 
 def write_frame(cache_dir: str, frame: int, positions: np.ndarray,
-                velocities: np.ndarray) -> str:
+                velocities: np.ndarray, attributes: dict | None = None) -> str:
     os.makedirs(cache_dir, exist_ok=True)
     path = frame_path(cache_dir, frame)
     fd, temporary = _atomic_path(cache_dir, ".npz")
+    # Optional per-particle shading attributes (age, source, speed, ...) are
+    # stored under attr_<name> keys.  read_frame ignores unknown keys, so this
+    # stays backward-compatible with caches and readers that predate them.
+    extra = {}
+    if attributes:
+        for name, values in attributes.items():
+            arr = np.asarray(values)
+            if arr.shape[0] == positions.shape[0]:
+                extra[f"attr_{name}"] = arr
     try:
         with os.fdopen(fd, "wb") as stream:
             np.savez_compressed(
                 stream,
                 positions=positions.astype(np.float32),
                 velocities=velocities.astype(np.float32),
+                **extra,
             )
             stream.flush()
             os.fsync(stream.fileno())
@@ -409,6 +419,27 @@ def read_frame(cache_dir: str, frame: int):
     except (OSError, TypeError, ValueError, KeyError,
             zipfile.BadZipFile, zipfile.LargeZipFile):
         return None
+
+
+def read_frame_attributes(cache_dir: str, frame: int) -> dict:
+    """Return the per-particle shading attributes stored for ``frame``.
+
+    Keys are the attribute names (``age``, ``source``, ``speed``, ...) without
+    the ``attr_`` prefix.  Empty dict when the frame is missing or predates the
+    attribute format."""
+    path = frame_path(cache_dir, frame)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        out = {}
+        with np.load(path) as data:
+            for key in data.files:
+                if key.startswith("attr_"):
+                    out[key[len("attr_"):]] = data[key]
+        return out
+    except (OSError, TypeError, ValueError, KeyError,
+            zipfile.BadZipFile, zipfile.LargeZipFile):
+        return {}
 
 
 class CheckpointError(ValueError):

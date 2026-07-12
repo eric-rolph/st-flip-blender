@@ -262,6 +262,12 @@ class STFLIPSolver:
         # APIC affine velocity matrix C (Jiang et al. 2015); one 3x3 per
         # particle, only advanced in "apic" transfer mode.
         self.C = xp.zeros((0, 3, 3), dtype=xp.float32)
+        # Shading attributes: seconds since a particle was seeded, and the
+        # 0-based id of the source (liquid/inflow) that seeded it.  Exported
+        # as point attributes for age-fade, speed, and per-source colouring.
+        self.age = xp.zeros((0,), dtype=xp.float32)
+        self.source_id = xp.zeros((0,), dtype=xp.int32)
+        self._next_source = 0
 
         # Device-resident constants (allocating these per call would force
         # host->device transfers inside the advection hot loop on GPU).
@@ -297,7 +303,7 @@ class STFLIPSolver:
         # only on ``self.time``, so exact checkpoints need no extra emitter
         # state beyond the simulation clock they already store.
         self._inflows: list[
-            tuple[object, VelocityField, float, float | None, float]
+            tuple[object, VelocityField, float, float | None, float, int]
         ] = []
         # Outflow masks are lazy: two dense 512^3 boolean allocations would
         # otherwise cost ~256 MiB on every no-outflow CUDA simulation.
@@ -337,6 +343,17 @@ class STFLIPSolver:
                     xp.concatenate(
                         [self.C, xp.zeros((n - cm, 3, 3), dtype=xp.float32)])
                     if cm < n else self.C[:n])
+        am = int(self.age.shape[0])
+        if am != n:
+            self.age = (
+                xp.concatenate([self.age, xp.zeros((n - am,), dtype=xp.float32)])
+                if am < n else self.age[:n])
+        sm = int(self.source_id.shape[0])
+        if sm != n:
+            self.source_id = (
+                xp.concatenate(
+                    [self.source_id, xp.zeros((n - sm,), dtype=xp.int32)])
+                if sm < n else self.source_id[:n])
 
     def checkpoint_state(self) -> dict:
         """Return an owned, backend-neutral snapshot sufficient to restart.
@@ -453,6 +470,11 @@ class STFLIPSolver:
         # as single-phase liquid with a fresh (zero) affine field.
         self.phase = self.be.xp.ones((pos.shape[0],), dtype=self.be.xp.float32)
         self.C = self.be.xp.zeros((0, 3, 3), dtype=self.be.xp.float32)
+        # Shading attributes are not persisted in the disk schema; a resumed
+        # bake restarts ages at zero and source ids at zero.
+        self.age = self.be.xp.zeros((pos.shape[0],), dtype=self.be.xp.float32)
+        self.source_id = self.be.xp.zeros((pos.shape[0],),
+                                          dtype=self.be.xp.int32)
         self.time = time_value
         self._dt_prev = dt_prev
         self._rng = restored_rng
@@ -549,7 +571,9 @@ class STFLIPSolver:
         field = as_velocity_field(velocity)
         mask = self._validate_cell_mask(cell_mask)
         cells = np.argwhere(mask)
-        return self._seed_cells(cells, field)
+        sid = self._next_source
+        self._next_source += 1
+        return self._seed_cells(cells, field, source_id=sid)
 
     def add_inflow(
         self,
@@ -585,8 +609,10 @@ class STFLIPSolver:
                     "inflow end_time must be finite and not precede start_time"
                 )
             end = float(end_time)
+        sid = self._next_source
+        self._next_source += 1
         self._inflows.append(
-            (self.be.from_numpy(mask), field, start, end, float(phase))
+            (self.be.from_numpy(mask), field, start, end, float(phase), sid)
         )
 
     def add_outflow(self, cell_mask: np.ndarray, mode: str = "VOLUME") -> None:
@@ -651,7 +677,8 @@ class STFLIPSolver:
         return np.array(mask, dtype=bool, order="C", copy=True)
 
     def _seed_cells(self, cells: np.ndarray, velocity: VelocityInput,
-                    phase: float = 1.0, ppc: int | None = None) -> int:
+                    phase: float = 1.0, ppc: int | None = None,
+                    source_id: int = 0) -> int:
         field = as_velocity_field(velocity)
         if len(cells) == 0:
             return 0
@@ -680,6 +707,10 @@ class STFLIPSolver:
         if self._use_apic:
             self.C = xp.concatenate(
                 [self.C, xp.zeros((n, 3, 3), dtype=xp.float32)])
+        self.age = xp.concatenate(
+            [self.age, xp.zeros((n,), dtype=xp.float32)])
+        self.source_id = xp.concatenate(
+            [self.source_id, xp.full((n,), int(source_id), dtype=xp.int32)])
         return n
 
     def add_gas_mask(
@@ -695,8 +726,11 @@ class STFLIPSolver:
             return 0
         mask = self._validate_cell_mask(cell_mask)
         cells = np.argwhere(mask)
+        sid = self._next_source
+        self._next_source += 1
         return self._seed_cells(cells, velocity, phase=0.0,
-                                ppc=self.p.gas_particles_per_cell)
+                                ppc=self.p.gas_particles_per_cell,
+                                source_id=sid)
 
     def fill_gas(self) -> int:
         """Fill every non-solid cell not already occupied by liquid with gas
@@ -1048,6 +1082,8 @@ class STFLIPSolver:
         self.phase = self.phase[keep]
         if self.C.shape[0]:
             self.C = self.C[keep]
+        self.age = self.age[keep]
+        self.source_id = self.source_id[keep]
         if stats is not None:
             stats.volume_outflow_removed += volume_count
             stats.pressure_outflow_removed += pressure_count
@@ -1787,6 +1823,8 @@ class STFLIPSolver:
         self._grids = grids
         self._dt_prev = dt
         self.time += dt
+        if self.age.shape[0] == self.pos.shape[0]:
+            self.age = self.age + np.float32(dt)
 
     def step_frame(self) -> FrameStats:
         """Advance one video frame (Algorithm 1 outer loop)."""
@@ -1841,7 +1879,7 @@ class STFLIPSolver:
         tolerance = max(1e-12, 1e-9 * self.p.frame_dt)
         active_inflows = []
         for inflow in self._inflows:
-            _, _, start_time, end_time, _phase = inflow
+            _, _, start_time, end_time, _phase, _sid = inflow
             if self.time + tolerance < start_time:
                 continue
             if (end_time is not None
@@ -1860,14 +1898,14 @@ class STFLIPSolver:
         if flat.shape[0]:
             self.be.scatter_add(counts, flat, xp.ones_like(flat, dtype=xp.float32))
         counts = counts.reshape(self.shape)
-        for mask, velocity_field, _start_time, _end_time, phase in active_inflows:
+        for mask, velocity_field, _start, _end, phase, sid in active_inflows:
             ppc = (self.p.gas_particles_per_cell if phase < 0.5
                    else self.p.particles_per_cell)
             refill_device = mask & (counts < 0.5 * ppc)
             refill = self.be.to_numpy(refill_device)
             cells = np.argwhere(refill)
             seeded = self._seed_cells(cells, velocity_field, phase=phase,
-                                      ppc=ppc)
+                                      ppc=ppc, source_id=sid)
             if seeded:
                 # Later sources in registration order observe particles just
                 # seeded by earlier sources, preventing overlapping masks from
@@ -1877,41 +1915,18 @@ class STFLIPSolver:
 
     # ----------------------------------------------------------------- export
 
-    def _liquid_render_filter(self, pos_h: np.ndarray, vel_h: np.ndarray,
-                              keep_h: np.ndarray | None = None):
-        """Restrict render output to liquid particles in two-phase mode.
-
-        Gas particles are simulation state, not renderable water: exporting
-        them lets the surface mesher solidify the entire air region.  ``keep_h``
-        is the host outflow-survivor mask when the caller already subset the
-        arrays with it."""
-        if not self.p.two_phase or self.phase.shape[0] != self.pos.shape[0]:
-            return pos_h, vel_h
-        liquid = self.be.to_numpy(self.phase) > 0.5
-        if keep_h is not None:
-            liquid = liquid[keep_h]
-        return pos_h[liquid], vel_h[liquid]
-
-    def get_render_particles(self) -> tuple[np.ndarray, np.ndarray]:
-        """Positions re-synchronised to the global time (Alg. 1 l.31-34) and
-        velocities, as host arrays.  Two-phase gas particles are excluded."""
+    def _resynced_positions_and_keep(self):
+        """Render positions (host) re-synchronised to the global time, plus the
+        outflow-survivor keep mask (host, or None).  Shared by all exporters."""
         if self.pos.shape[0] == 0 or not self._grids:
-            return self._liquid_render_filter(
-                self.be.to_numpy(self.pos), self.be.to_numpy(self.vel))
-        has_outflows = self._has_volume_outflow or self._has_pressure_outflow
-        if has_outflows:
-            pos, volume_removed, pressure_removed = self._advect(
-                self._grids,
-                self.pos.copy(),
-                self.dt_resid,
-                track_outflows=True,
-            )
-            keep = ~(volume_removed | pressure_removed)
-            return self._liquid_render_filter(
-                self.be.to_numpy(pos[keep]), self.be.to_numpy(self.vel[keep]),
-                keep_h=self.be.to_numpy(keep))
+            return self.be.to_numpy(self.pos), None
+        if self._has_volume_outflow or self._has_pressure_outflow:
+            pos, vr, pr = self._advect(
+                self._grids, self.pos.copy(), self.dt_resid,
+                track_outflows=True)
+            keep = ~(vr | pr)
+            return self.be.to_numpy(pos[keep]), self.be.to_numpy(keep)
         if self._grid_origin is not None:
-            # Grids from the last step live in a cropped window; resync there.
             xp = self.be.xp
             lo = self._grid_origin
             sub = tuple(self._grids["c_m"].shape)
@@ -1923,8 +1938,35 @@ class STFLIPSolver:
                                    self.dt_resid) + dxlo
             finally:
                 self._exit_window(saved)
-            return self._liquid_render_filter(
-                self.be.to_numpy(pos), self.be.to_numpy(self.vel))
-        pos = self._advect(self._grids, self.pos.copy(), self.dt_resid)
-        return self._liquid_render_filter(
-            self.be.to_numpy(pos), self.be.to_numpy(self.vel))
+            return self.be.to_numpy(pos), None
+        return self.be.to_numpy(
+            self._advect(self._grids, self.pos.copy(), self.dt_resid)), None
+
+    def get_render_particles(self) -> tuple[np.ndarray, np.ndarray]:
+        """Positions re-synchronised to the global time (Alg. 1 l.31-34) and
+        velocities, as host arrays.  Two-phase gas particles are excluded."""
+        pos, vel, _attrs = self.get_render_particles_ex()
+        return pos, vel
+
+    def get_render_particles_ex(self):
+        """Render positions, velocities, and a dict of shading attributes
+        ``{"age", "source", "speed"}`` (host arrays), all aligned and with
+        two-phase gas particles excluded.  ``speed`` is |velocity|; ``age`` is
+        seconds since seeding; ``source`` is the 0-based seeding-source id."""
+        self._reconcile_particle_attrs()
+        pos, keep = self._resynced_positions_and_keep()
+        vel = self.be.to_numpy(self.vel)
+        age = self.be.to_numpy(self.age)
+        src = self.be.to_numpy(self.source_id)
+        if keep is not None:
+            vel, age, src = vel[keep], age[keep], src[keep]
+        if self.p.two_phase and self.phase.shape[0] == self.pos.shape[0]:
+            liquid = self.be.to_numpy(self.phase) > 0.5
+            if keep is not None:
+                liquid = liquid[keep]
+            pos, vel, age, src = pos[liquid], vel[liquid], age[liquid], src[liquid]
+        speed = np.sqrt((vel * vel).sum(axis=1)) if len(vel) else \
+            np.zeros((0,), dtype=np.float32)
+        return pos, vel, {"age": age.astype(np.float32),
+                          "source": src.astype(np.int32),
+                          "speed": speed.astype(np.float32)}
