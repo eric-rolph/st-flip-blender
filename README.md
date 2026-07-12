@@ -127,7 +127,11 @@ custom build. A vendor-neutral wgpu backend is on the roadmap.
    Blend-file-relative caches (`//...`) are refused in an unsaved file so a
    later Save As cannot silently move the cache path.
 2. *3D Viewport → Sidebar (N) → ST-FLIP* and choose **Dam Break**,
-   **Whirlpool Preview**, or the approximate **High-CFL Jet Preview**, **or**:
+   **Whirlpool Preview**, or the approximate **High-CFL Jet Preview**;
+   open the **Presets** sub-panel for one-click feature demos
+   (**Viscous Pour**, **Stormy Pool**, **Two-Phase Glug**, **Fountain**),
+   each of which builds a ready-to-bake scene and configures the relevant
+   solver features; **or** build a scene by hand:
    - Create a box, set it as the **Domain** (defines the grid).
    - Select any closed mesh and set its role to **Liquid**, **Inflow**
      (with a velocity), **Outflow**, or **Obstacle**.
