@@ -239,27 +239,47 @@ def _dilate(mask: np.ndarray, cells: int) -> np.ndarray:
 
 def solid_velocity_from_objects(
     objects, prev_matrices, depsgraph, origin, dx, dims, frame_dt,
-    band_cells: int = 2,
+    band_cells: int = 2, prev_vertices=None,
 ):
-    """Cell-centred rigid solid velocity for animated moving-wall obstacles.
+    """Cell-centred solid velocity for animated moving-wall obstacles.
 
     ``prev_matrices`` maps object name to the 4x4 world matrix (as a NumPy
-    array) captured at the previous output frame.  For each animated obstacle
-    the rigid velocity v(x) = (x - M_prev M_cur^-1 x) / frame_dt is stamped
-    into the cells inside the obstacle plus a ``band_cells`` halo, so boundary
-    faces and the near-solid particle band see the full wall speed.  Returns
-    an ``dims + (3,)`` float32 field, or None when nothing moved.
+    array) captured at the previous output frame.  For rigidly moving
+    obstacles the velocity v(x) = (x - M_prev M_cur^-1 x) / frame_dt is
+    stamped into the cells inside the obstacle plus a ``band_cells`` halo, so
+    boundary faces and the near-solid particle band see the full wall speed.
+
+    ``prev_vertices`` optionally maps object name to the previous frame's
+    evaluated world-space vertex array; when the matrix is unchanged but the
+    vertices moved (armature, shape keys, cloth), each band cell takes the
+    displacement of its nearest current vertex instead (issue #13).  Returns
+    a ``dims + (3,)`` float32 field, or None when nothing moved.
     """
     if not objects or frame_dt <= 0.0:
         return None
+    prev_vertices = prev_vertices or {}
     vel = None
     for obj in objects:
         m_prev = prev_matrices.get(obj.name)
         if m_prev is None:
             continue
         m_cur = np.array(obj.matrix_world, dtype=np.float64).reshape(4, 4)
-        if np.allclose(m_cur, m_prev, atol=1e-12):
-            continue
+        rigid_motion = not np.allclose(m_cur, m_prev, atol=1e-12)
+        deform = None
+        if not rigid_motion:
+            # Armature/shape-key deformation moves vertices while the object
+            # matrix stays fixed; difference the evaluated vertices instead.
+            v_prev = prev_vertices.get(obj.name)
+            v_cur = None
+            if v_prev is not None:
+                try:
+                    v_cur = _extract_vertices(obj, depsgraph)
+                except Exception:
+                    v_cur = None
+            if (v_cur is None or v_cur.shape != v_prev.shape
+                    or np.allclose(v_cur, v_prev, atol=1e-12)):
+                continue
+            deform = (v_cur, (v_cur - v_prev) / frame_dt)
         mask = mask_from_object(obj, depsgraph, origin, dx, dims)
         if not mask.any():
             continue
@@ -267,10 +287,18 @@ def solid_velocity_from_objects(
         idx = np.argwhere(mask)
         world = np.asarray(origin, dtype=np.float64)[None, :] \
             + (idx.astype(np.float64) + 0.5) * dx
-        # Same material point at the previous frame: x_prev = M_prev M_cur^-1 x.
-        transform = m_prev @ np.linalg.inv(m_cur)
-        prev_pts = world @ transform[:3, :3].T + transform[:3, 3][None, :]
-        v = ((world - prev_pts) / frame_dt).astype(np.float32)
+        if rigid_motion:
+            # Same material point one frame back: x_prev = M_prev M_cur^-1 x.
+            transform = m_prev @ np.linalg.inv(m_cur)
+            prev_pts = world @ transform[:3, :3].T + transform[:3, 3][None, :]
+            v = ((world - prev_pts) / frame_dt).astype(np.float32)
+        else:
+            v_cur, disp = deform
+            v = np.empty((len(world), 3), dtype=np.float32)
+            for cs in range(0, len(world), 2048):
+                chunk = world[cs:cs + 2048]
+                d2 = ((chunk[:, None, :] - v_cur[None, :, :]) ** 2).sum(-1)
+                v[cs:cs + 2048] = disp[np.argmin(d2, axis=1)]
         if vel is None:
             vel = np.zeros(tuple(dims) + (3,), dtype=np.float32)
         vel[mask] = v
@@ -306,6 +334,22 @@ def _extract_triangles(obj, depsgraph):
         matrix = np.array(evaluated.matrix_world, dtype=np.float64)
         world = co.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
         return world[idx.reshape(-1, 3)]
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def _extract_vertices(obj, depsgraph):
+    """World-space (V, 3) float64 vertex array of the evaluated mesh."""
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        n_v = len(mesh.vertices)
+        if n_v == 0:
+            return None
+        co = np.empty(n_v * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", co)
+        matrix = np.array(evaluated.matrix_world, dtype=np.float64)
+        return co.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
     finally:
         evaluated.to_mesh_clear()
 
