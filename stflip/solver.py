@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import apertures, kernels, pressure
+from . import apertures, kernels, pressure, surface_tension
 from .backend import Backend, get_backend
 from .velocity import VelocityField, VelocityInput, as_velocity_field
 
@@ -40,6 +40,39 @@ _TAPS = [(di, dj, dk) for di in (0, 1) for dj in (0, 1) for dk in (0, 1)]
 def _norm_rows(xp, a):
     """Row-wise euclidean norm without cupy.linalg (avoids cuBLAS)."""
     return xp.sqrt((a * a).sum(axis=1))
+
+
+def _inv3x3(xp, M):
+    """Batched analytic inverse of (N,3,3) matrices via the adjugate.
+
+    Avoids cupy.linalg (Windows CuPy wheels ship no cuBLAS); the matrices are
+    small and SPD-with-regularisation, so a closed-form cofactor inverse is
+    both fast and numerically adequate for the APIC affine reconstruction."""
+    a, b, c = M[:, 0, 0], M[:, 0, 1], M[:, 0, 2]
+    d, e, f = M[:, 1, 0], M[:, 1, 1], M[:, 1, 2]
+    g, h, i = M[:, 2, 0], M[:, 2, 1], M[:, 2, 2]
+    c00 = e * i - f * h
+    c01 = -(d * i - f * g)
+    c02 = d * h - e * g
+    c10 = -(b * i - c * h)
+    c11 = a * i - c * g
+    c12 = -(a * h - b * g)
+    c20 = b * f - c * e
+    c21 = -(a * f - c * d)
+    c22 = a * e - b * d
+    det = a * c00 + b * c01 + c * c02
+    inv_det = 1.0 / xp.where(xp.abs(det) > 1e-30, det, 1e-30)
+    out = xp.empty_like(M)
+    out[:, 0, 0] = c00 * inv_det
+    out[:, 0, 1] = c10 * inv_det
+    out[:, 0, 2] = c20 * inv_det
+    out[:, 1, 0] = c01 * inv_det
+    out[:, 1, 1] = c11 * inv_det
+    out[:, 1, 2] = c21 * inv_det
+    out[:, 2, 0] = c02 * inv_det
+    out[:, 2, 1] = c12 * inv_det
+    out[:, 2, 2] = c22 * inv_det
+    return out
 
 
 @dataclass
@@ -65,6 +98,24 @@ class Params:
     pcg_max_iter: int = 400
     cfl_local: float = 1.0            # advection sub-step bound
     seed: int = 0
+
+    # --- Velocity transfer (Sec 3.9) -------------------------------------
+    transfer: str = "flip"            # "flip" | "apic" | "pic"
+    apic_reg: float = 1e-2            # Tikhonov reg (in dx^2) for the APIC D^-1
+
+    # --- Two-phase gas coupling (Sec 3.1, 3.6-3.7) -----------------------
+    two_phase: bool = False           # couple a light gas phase to the liquid
+    rho_gas: float = 1.2              # gas density rho_g (air ~= 1.2 kg/m^3)
+    gas_particles_per_cell: int = 8   # ppc used to fill the gas region
+
+    # --- Surface tension (Sec 3.9, CSF model) ----------------------------
+    surface_tension: float = 0.0      # sigma (N/m); 0 disables the CSF force
+    st_smooth_iters: int = 2          # B-spline smoothing passes for curvature
+
+    # --- Sparse production grid (active-block domain cropping) -----------
+    sparse: bool = False              # crop grids to the active particle region
+    block_size: int = 8               # active-block granularity (cells)
+    sparse_pad: int = 0               # extra halo blocks beyond the fluid band
 
     def __post_init__(self) -> None:
         """Validate and normalize all public solver parameters eagerly.
@@ -142,6 +193,36 @@ class Params:
         if self.seed < 0:
             raise ValueError("seed must not be negative")
 
+        # --- Extension parameters (transfer / two-phase / ST / sparse) ----
+        if self.transfer not in ("flip", "apic", "pic"):
+            raise ValueError("transfer must be 'flip', 'apic', or 'pic'")
+        for name in ("two_phase", "sparse"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a boolean")
+        for name in ("apic_reg", "rho_gas"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        st = float(self.surface_tension)
+        if not math.isfinite(st) or st < 0.0:
+            raise ValueError("surface_tension must be non-negative")
+        self.surface_tension = st
+        for name in ("gas_particles_per_cell", "block_size"):
+            value = getattr(self, name)
+            if (isinstance(value, bool)
+                    or not isinstance(value, numbers.Integral)
+                    or int(value) <= 0):
+                raise ValueError(f"{name} must be a positive integer")
+            setattr(self, name, int(value))
+        for name in ("st_smooth_iters", "sparse_pad"):
+            value = getattr(self, name)
+            if (isinstance(value, bool)
+                    or not isinstance(value, numbers.Integral)
+                    or int(value) < 0):
+                raise ValueError(f"{name} must be a non-negative integer")
+            setattr(self, name, int(value))
+
 
 @dataclass
 class FrameStats:
@@ -175,6 +256,12 @@ class STFLIPSolver:
         self.pos = xp.zeros((0, 3), dtype=xp.float32)
         self.vel = xp.zeros((0, 3), dtype=xp.float32)
         self.dt_resid = xp.zeros((0,), dtype=xp.float32)
+        # Phase indicator chi_l in {0, 1}: 1 = liquid, 0 = gas.  Only the gas
+        # column is populated when two_phase is enabled.
+        self.phase = xp.zeros((0,), dtype=xp.float32)
+        # APIC affine velocity matrix C (Jiang et al. 2015); one 3x3 per
+        # particle, only advanced in "apic" transfer mode.
+        self.C = xp.zeros((0, 3, 3), dtype=xp.float32)
 
         # Device-resident constants (allocating these per call would force
         # host->device transfers inside the advection hot loop on GPU).
@@ -195,6 +282,12 @@ class STFLIPSolver:
         self._sdf_grad = None
         self._solid_faces = None  # apertures + fully-solid cells, built lazily
         self._solid_exterior_apertures = None
+        # Cell-centred solid velocity for animated (moving-wall) obstacles;
+        # None means every solid is static (u_solid = 0).
+        self.solid_vel = None
+        # Cell offset of the last stored (windowed) grids for sparse resync.
+        self._full_shape = (nx, ny, nz)
+        self._grid_origin = None
 
         # Masks stay on-device for occupancy checks; immutable velocity fields
         # stay on the host so each refill is sampled deterministically at its
@@ -204,7 +297,7 @@ class STFLIPSolver:
         # only on ``self.time``, so exact checkpoints need no extra emitter
         # state beyond the simulation clock they already store.
         self._inflows: list[
-            tuple[object, VelocityField, float, float | None]
+            tuple[object, VelocityField, float, float | None, float]
         ] = []
         # Outflow masks are lazy: two dense 512^3 boolean allocations would
         # otherwise cost ~256 MiB on every no-outflow CUDA simulation.
@@ -224,6 +317,27 @@ class STFLIPSolver:
         self._grids: dict = {}
         self.m0 = self._calibrate_m0()
 
+    def _reconcile_particle_attrs(self) -> None:
+        """Keep phase (and, in APIC mode, C) length-consistent with pos.
+
+        Most mutations go through _seed_cells / _apply_outflow_filter which
+        already maintain them, but callers may assign self.pos directly; this
+        pads new particles as liquid with zero affine and drops stragglers."""
+        xp = self.be.xp
+        n = self.pos.shape[0]
+        m = int(self.phase.shape[0])
+        if m != n:
+            self.phase = (
+                xp.concatenate([self.phase, xp.ones((n - m,), dtype=xp.float32)])
+                if m < n else self.phase[:n])
+        if self._use_apic:
+            cm = int(self.C.shape[0])
+            if cm != n:
+                self.C = (
+                    xp.concatenate(
+                        [self.C, xp.zeros((n - cm, 3, 3), dtype=xp.float32)])
+                    if cm < n else self.C[:n])
+
     def checkpoint_state(self) -> dict:
         """Return an owned, backend-neutral snapshot sufficient to restart.
 
@@ -231,6 +345,11 @@ class STFLIPSolver:
         configured scene plus particle state and are rebuilt on the next step.
         The NumPy RNG state and previous adaptive timestep are trajectory state
         and therefore must be captured alongside particle arrays.
+
+        The disk checkpoint schema is intentionally unchanged from the base
+        solver: the two-phase gas tag and APIC affine matrix are not persisted,
+        so a resumed two-phase bake restarts as single-phase liquid.  This is a
+        deliberate, documented limitation to keep the on-disk format stable.
         """
         return {
             "pos": np.array(
@@ -330,6 +449,10 @@ class STFLIPSolver:
         self.pos = self.be.from_numpy(pos)
         self.vel = self.be.from_numpy(vel)
         self.dt_resid = self.be.from_numpy(dt_resid)
+        # phase/C are not persisted in the disk schema: a resumed bake restarts
+        # as single-phase liquid with a fresh (zero) affine field.
+        self.phase = self.be.xp.ones((pos.shape[0],), dtype=self.be.xp.float32)
+        self.C = self.be.xp.zeros((0, 3, 3), dtype=self.be.xp.float32)
         self.time = time_value
         self._dt_prev = dt_prev
         self._rng = restored_rng
@@ -342,10 +465,15 @@ class STFLIPSolver:
 
     # ------------------------------------------------------------------ setup
 
+    @property
+    def _use_apic(self) -> bool:
+        return self.p.transfer == "apic"
+
     def set_solid_sdf(
         self,
         sdf_cells: np.ndarray,
         node_sdf: np.ndarray | None = None,
+        solid_vel: np.ndarray | None = None,
     ) -> None:
         """Set the collision SDF and, optionally, fractional solid geometry.
 
@@ -354,7 +482,10 @@ class STFLIPSolver:
         ``node_sdf`` with shape ``(nx + 1, ny + 1, nz + 1)`` enables
         cut-cell face apertures for pressure projection.  Omitting it keeps
         the previous binary rule: a face is blocked when either adjacent
-        cell is solid.
+        cell is solid.  ``solid_vel`` is an optional ``(nx, ny, nz, 3)``
+        cell-centred solid velocity for animated moving-wall obstacles; call
+        this once per frame with the current obstacle pose to drive kinematic
+        boundaries.
         """
         cells = self._validate_sdf_array(sdf_cells, self.shape, "sdf_cells")
         nodes = None
@@ -368,6 +499,12 @@ class STFLIPSolver:
             self._solid_node_sdf = None
         else:
             self._solid_node_sdf = self.be.from_numpy(nodes)
+        if solid_vel is None:
+            self.solid_vel = None
+        else:
+            vel = self._validate_sdf_array(
+                np.asarray(solid_vel), self.shape + (3,), "solid_vel")
+            self.solid_vel = self.be.from_numpy(vel)
         self._sdf_grad = tuple(
             xp.gradient(self.sdf, self.p.dx, axis=axis)
             if extent > 1
@@ -421,6 +558,7 @@ class STFLIPSolver:
         *,
         start_time: float = 0.0,
         end_time: float | None = None,
+        phase: float = 1.0,
     ) -> None:
         """Register a refill source, optionally limited to a time interval.
 
@@ -448,7 +586,7 @@ class STFLIPSolver:
                 )
             end = float(end_time)
         self._inflows.append(
-            (self.be.from_numpy(mask), field, start, end)
+            (self.be.from_numpy(mask), field, start, end, float(phase))
         )
 
     def add_outflow(self, cell_mask: np.ndarray, mode: str = "VOLUME") -> None:
@@ -512,12 +650,14 @@ class STFLIPSolver:
         # would let later mutations change CPU inflows only.
         return np.array(mask, dtype=bool, order="C", copy=True)
 
-    def _seed_cells(self, cells: np.ndarray, velocity: VelocityInput) -> int:
+    def _seed_cells(self, cells: np.ndarray, velocity: VelocityInput,
+                    phase: float = 1.0, ppc: int | None = None) -> int:
         field = as_velocity_field(velocity)
         if len(cells) == 0:
             return 0
         xp = self.be.xp
-        ppc = self.p.particles_per_cell
+        if ppc is None:
+            ppc = self.p.particles_per_cell
         n = len(cells) * ppc
         jitter = self._rng.random((n, 3), dtype=np.float32)
         base = np.repeat(cells.astype(np.float32), ppc, axis=0)
@@ -535,7 +675,50 @@ class STFLIPSolver:
         self.vel = xp.concatenate([self.vel, self.be.from_numpy(vel)])
         self.dt_resid = xp.concatenate(
             [self.dt_resid, xp.zeros((n,), dtype=xp.float32)])
+        self.phase = xp.concatenate(
+            [self.phase, xp.full((n,), float(phase), dtype=xp.float32)])
+        if self._use_apic:
+            self.C = xp.concatenate(
+                [self.C, xp.zeros((n, 3, 3), dtype=xp.float32)])
         return n
+
+    def add_gas_mask(
+        self,
+        cell_mask: np.ndarray,
+        velocity: VelocityInput = (0.0, 0.0, 0.0),
+    ) -> int:
+        """Seed gas particles (phase = 0) into every masked cell.
+
+        A no-op unless ``two_phase`` is enabled, so callers may seed gas
+        unconditionally."""
+        if not self.p.two_phase:
+            return 0
+        mask = self._validate_cell_mask(cell_mask)
+        cells = np.argwhere(mask)
+        return self._seed_cells(cells, velocity, phase=0.0,
+                                ppc=self.p.gas_particles_per_cell)
+
+    def fill_gas(self) -> int:
+        """Fill every non-solid cell not already occupied by liquid with gas
+        particles (two-phase only).  Call after all liquid/inflow seeding."""
+        if not self.p.two_phase:
+            return 0
+        occupied = self._cell_counts() > 0.5
+        solid = self.sdf < 0.0
+        free = self.be.to_numpy(~occupied & ~solid)
+        return self.add_gas_mask(free)
+
+    def _cell_counts(self):
+        """Per-cell particle occupancy count (device grid)."""
+        xp = self.be.xp
+        nx, ny, nz = self.shape
+        counts = xp.zeros((nx * ny * nz,), dtype=xp.float32)
+        if self.pos.shape[0]:
+            idx = xp.clip((self.pos / self.p.dx).astype(xp.int32), 0,
+                          xp.asarray([nx - 1, ny - 1, nz - 1]))
+            flat = (idx[:, 0] * ny + idx[:, 1]) * nz + idx[:, 2]
+            self.be.scatter_add(counts, flat, xp.ones_like(flat, dtype=xp.float32))
+        return counts.reshape(self.shape)
 
     # ------------------------------------------------------------- deposition
 
@@ -571,13 +754,18 @@ class STFLIPSolver:
         shapes = {"u": (nx + 1, ny, nz), "v": (nx, ny + 1, nz),
                   "w": (nx, ny, nz + 1), "c": (nx, ny, nz)}
         vel_axis = {"u": 0, "v": 1, "w": 2}
+        apic = self._use_apic
+        two = p.two_phase
+        phase = self.phase
 
         grids = {}
         for g, off in _OFFSETS.items():
             sh = shapes[g]
             mass = xp.zeros(sh, dtype=xp.float32).ravel()
+            mass_l = (xp.zeros(sh, dtype=xp.float32).ravel() if two else None)
             mom = (xp.zeros(sh, dtype=xp.float32).ravel()
                    if g != "c" else None)
+            axis = vel_axis.get(g)
             xi = gp - self._offsets_dev[g]
             base = xp.floor(xi).astype(xp.int32)
             frac = xi - base
@@ -595,10 +783,23 @@ class STFLIPSolver:
                          + xp.clip(jj, 0, sh[1] - 1)) * sh[2]
                         + xp.clip(kk, 0, sh[2] - 1))
                 self.be.scatter_add(mass, flat, w)
+                if mass_l is not None:
+                    self.be.scatter_add(mass_l, flat, w * phase)
                 if mom is not None:
-                    self.be.scatter_add(
-                        mom, flat, w * self.vel[:, vel_axis[g]])
+                    vel_a = self.vel[:, axis]
+                    if apic:
+                        # C.(x_f - x_p): displacement (node - particle) in grid
+                        # units is (d - frac) per axis, scaled to world by dx.
+                        rx = (di - frac[:, 0])
+                        ry = (dj - frac[:, 1])
+                        rz = (dk - frac[:, 2])
+                        vel_a = vel_a + p.dx * (self.C[:, axis, 0] * rx
+                                                + self.C[:, axis, 1] * ry
+                                                + self.C[:, axis, 2] * rz)
+                    self.be.scatter_add(mom, flat, w * vel_a)
             grids[g + "_m"] = mass.reshape(sh)
+            if mass_l is not None:
+                grids[g + "_ml"] = mass_l.reshape(sh)
             if mom is not None:
                 grids[g + "_p"] = mom.reshape(sh)
 
@@ -607,12 +808,22 @@ class STFLIPSolver:
             valid = m > p.eps_m
             grids[g] = xp.where(valid, grids[g + "_p"] / xp.maximum(m, p.eps_m), 0.0)
             grids[g + "_valid"] = valid
-            # Space-time phase field from the weight accumulators (Eq. 13):
-            # phi = C(m / (eta_phi * m0)), C(x) = min(sqrt(x), 1).
-            grids[g + "_phi"] = xp.minimum(
-                xp.sqrt(m / (p.eta_phi * self.m0)), 1.0)
-        grids["c_phi"] = xp.minimum(
-            xp.sqrt(grids["c_m"] / (p.eta_phi * self.m0)), 1.0)
+            if two:
+                # Liquid volume fraction (Braun et al. 2025, Eq. 7): m_l over
+                # total sampled mass.  m0 cancels, so no calibration is needed.
+                grids[g + "_phi"] = xp.clip(
+                    grids[g + "_ml"] / xp.maximum(m, p.eps_m), 0.0, 1.0)
+            else:
+                # Space-time phase field from the weight accumulators (Eq. 13):
+                # phi = C(m / (eta_phi * m0)), C(x) = min(sqrt(x), 1).
+                grids[g + "_phi"] = xp.minimum(
+                    xp.sqrt(m / (p.eta_phi * self.m0)), 1.0)
+        if two:
+            grids["c_phi"] = xp.clip(
+                grids["c_ml"] / xp.maximum(grids["c_m"], p.eps_m), 0.0, 1.0)
+        else:
+            grids["c_phi"] = xp.minimum(
+                xp.sqrt(grids["c_m"] / (p.eta_phi * self.m0)), 1.0)
         return grids
 
     # ------------------------------------------------------------- grid utils
@@ -686,6 +897,25 @@ class STFLIPSolver:
         """Compatibility view of the fully blocked solid faces."""
         alpha_u, alpha_v, alpha_w, solid_c = self._solid_face_apertures()
         return alpha_u <= 0.0, alpha_v <= 0.0, alpha_w <= 0.0, solid_c
+
+    def _solid_face_vel(self):
+        """(u,v,w) face grids of the prescribed solid velocity, or 0-scalars.
+
+        Interior faces take the average of the two adjacent cell solid
+        velocities; the static container walls stay at zero."""
+        xp = self.be.xp
+        nx, ny, nz = self.shape
+        if self.solid_vel is None:
+            z = xp.float32(0.0)
+            return z, z, z
+        sv_c = self.solid_vel  # (nx, ny, nz, 3)
+        us = xp.zeros((nx + 1, ny, nz), dtype=xp.float32)
+        us[1:-1] = 0.5 * (sv_c[1:, :, :, 0] + sv_c[:-1, :, :, 0])
+        vs = xp.zeros((nx, ny + 1, nz), dtype=xp.float32)
+        vs[:, 1:-1] = 0.5 * (sv_c[:, 1:, :, 1] + sv_c[:, :-1, :, 1])
+        ws = xp.zeros((nx, ny, nz + 1), dtype=xp.float32)
+        ws[:, :, 1:-1] = 0.5 * (sv_c[:, :, 1:, 2] + sv_c[:, :, :-1, 2])
+        return us, vs, ws
 
     def _pressure_face_masks(self):
         """Full MAC masks for exterior faces opened by PRESSURE outflows."""
@@ -805,6 +1035,7 @@ class STFLIPSolver:
     ) -> dict[str, int]:
         """Apply one shared keep mask to every particle-state array."""
         xp = self.be.xp
+        self._reconcile_particle_attrs()
         keep = ~(volume_removed | pressure_removed)
         counts = self.be.to_numpy(xp.stack((
             volume_removed.sum(), pressure_removed.sum()
@@ -814,6 +1045,9 @@ class STFLIPSolver:
         self.pos = positions[keep]
         self.vel = self.vel[keep]
         self.dt_resid = self.dt_resid[keep]
+        self.phase = self.phase[keep]
+        if self.C.shape[0]:
+            self.C = self.C[keep]
         if stats is not None:
             stats.volume_outflow_removed += volume_count
             stats.pressure_outflow_removed += pressure_count
@@ -947,6 +1181,88 @@ class STFLIPSolver:
                 val += wx * wy * wz * arr[ii, jj, kk]
             out[:, ax] = val
         return out
+
+    def _g2p_apic(self, grids, pos, u_new):
+        """APIC grid-to-particle (Jiang et al. 2015) on the MAC grid.
+
+        Returns interpolated velocities (== ``u_new``) and the reconstructed
+        affine matrices C.  Per axis a we form B_a = sum_i w_i u_i (x_i - x_p)
+        and D_a = sum_i w_i (x_i - x_p)(x_i - x_p)^T with the same trilinear
+        weights used for interpolation, then set the a-th row of C to
+        D_a^{-1} B_a.  D_a is Tikhonov-regularised so isolated or node-aligned
+        particles stay well-conditioned (no cupy.linalg)."""
+        xp = self.be.xp
+        n = pos.shape[0]
+        gp = pos / self.p.dx
+        reg = self.p.apic_reg * self.p.dx * self.p.dx
+        C = xp.zeros((n, 3, 3), dtype=xp.float32)
+        for axis, gname in enumerate(("u", "v", "w")):
+            arr = grids[gname]
+            sh = arr.shape
+            xi = gp - self._offsets_dev[gname]
+            base = xp.floor(xi).astype(xp.int32)
+            frac = (xi - base).astype(xp.float32)
+            b = xp.zeros((n, 3), dtype=xp.float32)
+            D = xp.zeros((n, 3, 3), dtype=xp.float32)
+            for (di, dj, dk) in _TAPS:
+                wx = frac[:, 0] * di + (1 - frac[:, 0]) * (1 - di)
+                wy = frac[:, 1] * dj + (1 - frac[:, 1]) * (1 - dj)
+                wz = frac[:, 2] * dk + (1 - frac[:, 2]) * (1 - dk)
+                w = wx * wy * wz
+                ii = xp.clip(base[:, 0] + di, 0, sh[0] - 1)
+                jj = xp.clip(base[:, 1] + dj, 0, sh[1] - 1)
+                kk = xp.clip(base[:, 2] + dk, 0, sh[2] - 1)
+                uval = arr[ii, jj, kk]
+                rx = (di - frac[:, 0]) * self.p.dx
+                ry = (dj - frac[:, 1]) * self.p.dx
+                rz = (dk - frac[:, 2]) * self.p.dx
+                wu = w * uval
+                b[:, 0] += wu * rx
+                b[:, 1] += wu * ry
+                b[:, 2] += wu * rz
+                D[:, 0, 0] += w * rx * rx
+                D[:, 0, 1] += w * rx * ry
+                D[:, 0, 2] += w * rx * rz
+                D[:, 1, 1] += w * ry * ry
+                D[:, 1, 2] += w * ry * rz
+                D[:, 2, 2] += w * rz * rz
+            D[:, 1, 0] = D[:, 0, 1]
+            D[:, 2, 0] = D[:, 0, 2]
+            D[:, 2, 1] = D[:, 1, 2]
+            for d in range(3):
+                D[:, d, d] += reg
+            Dinv = _inv3x3(xp, D)
+            C[:, axis, 0] = (Dinv[:, 0, 0] * b[:, 0] + Dinv[:, 0, 1] * b[:, 1]
+                             + Dinv[:, 0, 2] * b[:, 2])
+            C[:, axis, 1] = (Dinv[:, 1, 0] * b[:, 0] + Dinv[:, 1, 1] * b[:, 1]
+                             + Dinv[:, 1, 2] * b[:, 2])
+            C[:, axis, 2] = (Dinv[:, 2, 0] * b[:, 0] + Dinv[:, 2, 1] * b[:, 1]
+                             + Dinv[:, 2, 2] * b[:, 2])
+        return u_new, C
+
+    def _enforce_solid_velocity(self) -> None:
+        """Remove the penetrating (inward) relative normal velocity of
+        particles inside the solid band so animated obstacles push (rather than
+        trap) the fluid, while still allowing free separation."""
+        xp = self.be.xp
+        if self.solid_vel is None or self._sdf_grad is None:
+            return
+        d = self._sample_cells(self.sdf, self.pos)
+        near = d < (1.0 * self.p.dx)
+        if not self.be.is_gpu and not bool(xp.any(near)):
+            return
+        gx = self._sample_cells(self._sdf_grad[0], self.pos)
+        gy = self._sample_cells(self._sdf_grad[1], self.pos)
+        gz = self._sample_cells(self._sdf_grad[2], self.pos)
+        nrm = xp.stack([gx, gy, gz], axis=1)
+        nrm = nrm / xp.maximum(_norm_rows(xp, nrm)[:, None], 1e-9)
+        us = xp.stack([self._sample_cells(self.solid_vel[..., i], self.pos)
+                       for i in range(3)], axis=1)
+        vrel = self.vel - us
+        vn_s = (vrel * nrm).sum(axis=1)
+        penetrating = vn_s < 0.0
+        vn = xp.where(penetrating[:, None], vn_s[:, None] * nrm, 0.0)
+        self.vel = xp.where(near[:, None], self.vel - vn, self.vel)
 
     def _sample_cells(self, arr, pos):
         """Trilinear sample of a cell-centred grid at positions."""
@@ -1172,21 +1488,107 @@ class STFLIPSolver:
             pos = xp.where(alive[:, None], constrained, collision_adjusted)
         return pos, volume_removed, pressure_removed
 
+    # -------------------------------------------------- sparse active window
+
+    def _band(self) -> int:
+        """Halo, in cells, the fluid may reach in one step: the same velocity-
+        extrapolation band advection is guaranteed to stay inside."""
+        return int(math.ceil(2.0 * self.p.cfl_target)) + 2
+
+    def _sparse_engaged(self) -> bool:
+        # The window crops the solid/collision fields; the cut-cell node-SDF
+        # apertures and outflow machinery are not windowed, so fall back to the
+        # dense solve when any of them is active.
+        return (self.p.sparse and not self._has_volume_outflow
+                and not self._has_pressure_outflow
+                and self._solid_node_sdf is None)
+
+    def _active_window(self):
+        """Block-aligned (lo, sub_shape) covering every particle plus a one-
+        step halo, clamped to the domain (sparse production grid)."""
+        xp = self.be.xp
+        nx, ny, nz = self._full_shape
+        gp = self.pos / self.p.dx
+        lo_p = self.be.to_numpy(xp.floor(gp.min(axis=0))).astype(np.int64)
+        hi_p = self.be.to_numpy(xp.ceil(gp.max(axis=0))).astype(np.int64)
+        band = self._band()
+        bs = max(int(self.p.block_size), 1)
+        pad = int(self.p.sparse_pad) * bs
+        full = np.array([nx, ny, nz], dtype=np.int64)
+        lo = np.maximum(lo_p - band - pad, 0)
+        hi = np.minimum(hi_p + band + pad, full)
+        lo = (lo // bs) * bs
+        hi = np.minimum(((hi + bs - 1) // bs) * bs, full)
+        hi = np.maximum(hi, lo + 1)
+        return lo, tuple(int(v) for v in (hi - lo))
+
+    def _enter_window(self, lo, sub_shape):
+        """Swap grid state to the cropped window frame (does not touch pos)."""
+        xp = self.be.xp
+        sl = (slice(lo[0], lo[0] + sub_shape[0]),
+              slice(lo[1], lo[1] + sub_shape[1]),
+              slice(lo[2], lo[2] + sub_shape[2]))
+        saved = (self.shape, self.size, self.sdf, self._sdf_grad,
+                 self.solid_vel, self._solid_faces,
+                 self._solid_exterior_apertures, self._clamp_lo,
+                 self._clamp_hi, self._domain_size_dev)
+        self.shape = sub_shape
+        self.size = tuple(n * self.p.dx for n in sub_shape)
+        self.sdf = self.sdf[sl]
+        self._sdf_grad = (None if self._sdf_grad is None
+                          else tuple(g[sl] for g in self._sdf_grad))
+        self.solid_vel = (None if self.solid_vel is None
+                          else self.solid_vel[sl[0], sl[1], sl[2], :])
+        self._solid_faces = None
+        self._solid_exterior_apertures = None
+        eps = 1e-3 * self.p.dx
+        self._clamp_lo = xp.asarray([eps] * 3, dtype=xp.float32)
+        self._clamp_hi = xp.asarray([n - eps for n in self.size],
+                                    dtype=xp.float32)
+        self._domain_size_dev = xp.asarray(self.size, dtype=xp.float32)
+        return saved
+
+    def _exit_window(self, saved):
+        (self.shape, self.size, self.sdf, self._sdf_grad, self.solid_vel,
+         self._solid_faces, self._solid_exterior_apertures, self._clamp_lo,
+         self._clamp_hi, self._domain_size_dev) = saved
+
     # ------------------------------------------------------------------- step
 
     def _step(self, dt: float, stats: FrameStats) -> None:
+        if self._sparse_engaged() and self.pos.shape[0]:
+            xp = self.be.xp
+            lo, sub = self._active_window()
+            dxlo = xp.asarray(lo.astype(np.float32) * self.p.dx,
+                              dtype=xp.float32)
+            saved = self._enter_window(lo, sub)
+            self.pos = self.pos - dxlo
+            try:
+                self._step_core(dt, stats)
+            finally:
+                self.pos = self.pos + dxlo
+                self._exit_window(saved)
+            self._grid_origin = lo
+        else:
+            self._grid_origin = None
+            self._step_core(dt, stats)
+
+    def _step_core(self, dt: float, stats: FrameStats) -> None:
         xp = self.be.xp
         p = self.p
         dt_prev = self._dt_prev
+        flip = (p.transfer == "flip")
+        self._reconcile_particle_attrs()
 
         grids = self._p2g(dt_prev)
         alpha_u, alpha_v, alpha_w, solid_c = self._active_face_apertures()
         open_u = alpha_u > 0.0
         open_v = alpha_v > 0.0
         open_w = alpha_w > 0.0
+        us_sol, vs_sol, ws_sol = self._solid_face_vel()
 
-        # Save post-P2G velocities for the FLIP delta.
-        old = {g: grids[g].copy() for g in ("u", "v", "w")}
+        # Save post-P2G velocities for the FLIP delta (FLIP transfer only).
+        old = ({g: grids[g].copy() for g in ("u", "v", "w")} if flip else None)
 
         # External forces (grid-based, Sec 3.3).
         g = p.gravity
@@ -1194,24 +1596,50 @@ class STFLIPSolver:
         grids["v"] = grids["v"] + g[1] * dt
         grids["w"] = grids["w"] + g[2] * dt
 
-        # No-through on fully blocked faces before computing the aperture-
-        # weighted flux divergence.  A partially open face stores the fluid
-        # velocity over its open area and remains active.
-        grids["u"] = xp.where(open_u, grids["u"], 0.0)
-        grids["v"] = xp.where(open_v, grids["v"], 0.0)
-        grids["w"] = xp.where(open_w, grids["w"], 0.0)
+        # Face densities rho(phi_f) = rho_l phi_f + rho_g (1 - phi_f).
+        # Free-surface: phi_u is the space-time accumulator so rho collapses to
+        # rho_l phi_f and air is a Dirichlet p = 0 boundary.  Two-phase: phi_u
+        # is a liquid volume fraction and both phases are solved together.
+        eps_rho = p.eps_rho_rel * p.rho
+        if p.two_phase:
+            rho_u = p.rho * grids["u_phi"] + p.rho_gas * (1.0 - grids["u_phi"])
+            rho_v = p.rho * grids["v_phi"] + p.rho_gas * (1.0 - grids["v_phi"])
+            rho_w = p.rho * grids["w_phi"] + p.rho_gas * (1.0 - grids["w_phi"])
+            active = (grids["c_m"] > p.eps_m) & (~solid_c)
+        else:
+            rho_u = p.rho * grids["u_phi"]
+            rho_v = p.rho * grids["v_phi"]
+            rho_w = p.rho * grids["w_phi"]
+            active = (grids["c_phi"] >= 0.5) & (~solid_c)
+        inv_rho_u = 1.0 / xp.maximum(rho_u, eps_rho)
+        inv_rho_v = 1.0 / xp.maximum(rho_v, eps_rho)
+        inv_rho_w = 1.0 / xp.maximum(rho_w, eps_rho)
 
-        liquid = (grids["c_phi"] >= 0.5) & (~solid_c)
+        # Surface tension (CSF, Sec 3.9): sigma * kappa * grad(phi) as a face
+        # acceleration before projection.
+        if p.surface_tension > 0.0:
+            F = surface_tension.cell_force(
+                xp, grids["c_phi"], p.dx, p.surface_tension, p.st_smooth_iters)
+            fu = xp.zeros_like(grids["u"])
+            fu[1:-1] = 0.5 * (F[1:, :, :, 0] + F[:-1, :, :, 0])
+            fv = xp.zeros_like(grids["v"])
+            fv[:, 1:-1] = 0.5 * (F[:, 1:, :, 1] + F[:, :-1, :, 1])
+            fw = xp.zeros_like(grids["w"])
+            fw[:, :, 1:-1] = 0.5 * (F[:, :, 1:, 2] + F[:, :, :-1, 2])
+            grids["u"] = grids["u"] + dt * fu * inv_rho_u
+            grids["v"] = grids["v"] + dt * fv * inv_rho_v
+            grids["w"] = grids["w"] + dt * fw * inv_rho_w
+
+        # No-through on fully blocked faces (u . n = u_solid . n) before the
+        # aperture-weighted flux divergence.  A partially open face stores the
+        # fluid velocity over its open area and remains active.
+        grids["u"] = xp.where(open_u, grids["u"], us_sol)
+        grids["v"] = xp.where(open_v, grids["v"], vs_sol)
+        grids["w"] = xp.where(open_w, grids["w"], ws_sol)
 
         # PPE coefficients are aperture-weighted, while the velocity update
         # itself is not: k_f = dt * alpha_f / rho_f, followed by
         # u_f <- u_f - dt/rho_f * grad(p) on every alpha_f > 0 face.
-        # This distinction is essential for fractional faces: alpha belongs
-        # in the flux constraint, not in the physical pressure acceleration.
-        eps_rho = p.eps_rho_rel * p.rho
-        inv_rho_u = 1.0 / xp.maximum(p.rho * grids["u_phi"], eps_rho)
-        inv_rho_v = 1.0 / xp.maximum(p.rho * grids["v_phi"], eps_rho)
-        inv_rho_w = 1.0 / xp.maximum(p.rho * grids["w_phi"], eps_rho)
         kx = dt * alpha_u * inv_rho_u
         ky = dt * alpha_v * inv_rho_v
         kz = dt * alpha_w * inv_rho_w
@@ -1220,17 +1648,25 @@ class STFLIPSolver:
             grids["u"], grids["v"], grids["w"],
             alpha_u, alpha_v, alpha_w, p.dx, array_module=xp,
         )
+        if self.solid_vel is not None:
+            # Moving-wall flux: the blocked fraction (1 - alpha) of each face
+            # carries the solid velocity, so its divergence enters the RHS.
+            div = div + apertures.weighted_divergence(
+                us_sol, vs_sol, ws_sol,
+                1.0 - alpha_u, 1.0 - alpha_v, 1.0 - alpha_w, p.dx,
+                array_module=xp,
+            )
 
-        # Solve sum_f k_f (p_c - p_nb)/dx^2 = -(div u*)_c on liquid cells.
-        rhs = -(div) * liquid
+        # Solve sum_f k_f (p_c - p_nb)/dx^2 = -(div u*)_c on active cells.
+        rhs = -(div) * active
         kx2, ky2, kz2 = kx / p.dx**2, ky / p.dx**2, kz / p.dx**2
         pr, iters, rel = pressure.solve(
-            xp, rhs, kx2, ky2, kz2, liquid, tol=p.pcg_tol,
+            xp, rhs, kx2, ky2, kz2, active, tol=p.pcg_tol,
             max_iter=p.pcg_max_iter)
         stats.pcg_iters.append(iters)
         stats.pcg_rel_residuals.append(rel)
 
-        pm = pr * liquid
+        pm = pr * active
         gradx = (pm[1:, :, :] - pm[:-1, :, :]) / p.dx
         correction = dt * inv_rho_u[1:-1, :, :] * gradx
         grids["u"][1:-1, :, :] -= xp.where(
@@ -1280,9 +1716,9 @@ class STFLIPSolver:
                 0.0,
             )
 
-        grids["u"] = xp.where(open_u, grids["u"], 0.0)
-        grids["v"] = xp.where(open_v, grids["v"], 0.0)
-        grids["w"] = xp.where(open_w, grids["w"], 0.0)
+        grids["u"] = xp.where(open_u, grids["u"], us_sol)
+        grids["v"] = xp.where(open_v, grids["v"], vs_sol)
+        grids["w"] = xp.where(open_w, grids["w"], ws_sol)
 
         # Extrapolate into under-sampled faces so advection sees a full
         # field.  Jittered advection can move a particle up to 2*dt, i.e.
@@ -1293,23 +1729,35 @@ class STFLIPSolver:
         # a spurious energy kick (temporal weights can invalidate all of a
         # particle's own faces when theta lands in the kernel's zero tail).
         layers = int(math.ceil(2.0 * p.cfl_target)) + 2
-        for gname, face_open in (
-            ("u", open_u), ("v", open_v), ("w", open_w),
+        for gname, face_open, sfv in (
+            ("u", open_u, us_sol), ("v", open_v, vs_sol),
+            ("w", open_w, ws_sol),
         ):
             valid = grids[gname + "_valid"] & face_open
             grids[gname], _ = self._extrapolate(
                 grids[gname], valid, layers, allowed=face_open)
-            old[gname], _ = self._extrapolate(
-                old[gname], valid, layers, allowed=face_open)
             # Re-enforce no-through defensively after extrapolation.
-            grids[gname] = xp.where(face_open, grids[gname], 0.0)
-            old[gname] = xp.where(face_open, old[gname], 0.0)
+            grids[gname] = xp.where(face_open, grids[gname], sfv)
+            if flip:
+                old[gname], _ = self._extrapolate(
+                    old[gname], valid, layers, allowed=face_open)
+                old[gname] = xp.where(face_open, old[gname], sfv)
 
-        # G2P: FLIP/PIC blend (Sec 3.9, standard operator).
+        # G2P (Sec 3.9): FLIP/PIC blend, pure PIC, or APIC affine transfer.
         u_new = self._sample_faces(grids, self.pos)
-        u_old = self._sample_faces(old, self.pos)
-        a = p.flip_blend
-        self.vel = (a * (self.vel + (u_new - u_old)) + (1.0 - a) * u_new)
+        if p.transfer == "apic":
+            self.vel, self.C = self._g2p_apic(grids, self.pos, u_new)
+        elif p.transfer == "pic":
+            self.vel = u_new
+        else:
+            u_old = self._sample_faces(old, self.pos)
+            a = p.flip_blend
+            self.vel = (a * (self.vel + (u_new - u_old)) + (1.0 - a) * u_new)
+
+        # Impart moving-wall velocity: kill the penetrating relative normal
+        # velocity for particles inside the solid band.
+        if self.solid_vel is not None:
+            self._enforce_solid_velocity()
 
         # Temporal jitter with residual carryover (Eq. 10-11, Alg. 1 l.23-28).
         n = self.pos.shape[0]
@@ -1384,7 +1832,7 @@ class STFLIPSolver:
         tolerance = max(1e-12, 1e-9 * self.p.frame_dt)
         active_inflows = []
         for inflow in self._inflows:
-            _, _, start_time, end_time = inflow
+            _, _, start_time, end_time, _phase = inflow
             if self.time + tolerance < start_time:
                 continue
             if (end_time is not None
@@ -1403,21 +1851,20 @@ class STFLIPSolver:
         if flat.shape[0]:
             self.be.scatter_add(counts, flat, xp.ones_like(flat, dtype=xp.float32))
         counts = counts.reshape(self.shape)
-        for mask, velocity_field, _start_time, _end_time in active_inflows:
-            refill_device = mask & (
-                counts < 0.5 * self.p.particles_per_cell
-            )
+        for mask, velocity_field, _start_time, _end_time, phase in active_inflows:
+            ppc = (self.p.gas_particles_per_cell if phase < 0.5
+                   else self.p.particles_per_cell)
+            refill_device = mask & (counts < 0.5 * ppc)
             refill = self.be.to_numpy(refill_device)
             cells = np.argwhere(refill)
-            seeded = self._seed_cells(cells, velocity_field)
+            seeded = self._seed_cells(cells, velocity_field, phase=phase,
+                                      ppc=ppc)
             if seeded:
                 # Later sources in registration order observe particles just
                 # seeded by earlier sources, preventing overlapping masks from
                 # filling the same cell twice. Each selected cell receives ppc
                 # particles, exactly matching _seed_cells.
-                counts = counts + refill_device.astype(
-                    xp.float32
-                ) * self.p.particles_per_cell
+                counts = counts + refill_device.astype(xp.float32) * ppc
 
     # ----------------------------------------------------------------- export
 
@@ -1436,5 +1883,19 @@ class STFLIPSolver:
             )
             keep = ~(volume_removed | pressure_removed)
             return self.be.to_numpy(pos[keep]), self.be.to_numpy(self.vel[keep])
+        if self._grid_origin is not None:
+            # Grids from the last step live in a cropped window; resync there.
+            xp = self.be.xp
+            lo = self._grid_origin
+            sub = tuple(self._grids["c_m"].shape)
+            dxlo = xp.asarray(lo.astype(np.float32) * self.p.dx,
+                              dtype=xp.float32)
+            saved = self._enter_window(lo, sub)
+            try:
+                pos = self._advect(self._grids, self.pos.copy() - dxlo,
+                                   self.dt_resid) + dxlo
+            finally:
+                self._exit_window(saved)
+            return self.be.to_numpy(pos), self.be.to_numpy(self.vel)
         pos = self._advect(self._grids, self.pos.copy(), self.dt_resid)
         return self.be.to_numpy(pos), self.be.to_numpy(self.vel)
