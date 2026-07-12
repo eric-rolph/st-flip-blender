@@ -434,6 +434,10 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
 - **Shading attributes** on the particle point cloud: `velocity`, `speed`,
   `age` (seconds since seeding), and `source` (per-source id) for age-fade,
   speed-driven effects, and per-source colouring in shaders/Geometry Nodes
+- **Alembic / USD export** of the baked liquid surface (and optionally the
+  particle/whitewater clouds) as an animated cache for render farms and
+  other DCCs, from the ST-FLIP > Downstream Export panel or
+  `bpy.ops.stflip.export_cache(filepath=...)` headless
 - NumPy CPU + CuPy CUDA backends sharing one code path
 - Paper-inspired parameter profiles plus strict JSONL frame diagnostics and
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy
