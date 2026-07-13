@@ -32,6 +32,13 @@ vs. ~8 with multigrid). On grids too small to coarsen it falls back to Jacobi
 automatically, so it is safe to leave enabled. It changes only convergence
 speed, never the solution.
 
+This holds for **two-phase** bakes too, even though the variable-density
+pressure system is severely ill-conditioned at the water/air density ratio
+(~800:1). Measured on a real two-phase step, Jacobi-PCG needs ~150 iterations
+per solve while multigrid needs ~20, and the multigrid count stays
+grid-independent up to 800:1 and 10000:1 ratios — so multigrid is the
+recommended solver precisely when two-phase meets production resolution.
+
 ## The sparse grid
 
 Enable **Sparse Grid** when the fluid occupies a small fraction of a large
