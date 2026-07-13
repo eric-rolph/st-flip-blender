@@ -199,6 +199,18 @@ def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400, check_every=8,
     diagonal.  Falls back to the diagonal preconditioner when the grid is too
     small to coarsen at all, so tiny domains behave exactly like Jacobi-PCG.
     """
+    # Skip empty regions first: crop to the active bounding box (same active
+    # cells and residual contract) so the hierarchy is built over live cells
+    # only.  Differences vs. the full grid are at the float32 rounding level.
+    cropped = pressure.crop_to_active(xp, rhs, kx, ky, kz, liquid)
+    if cropped is not None:
+        (r2, kx2, ky2, kz2, l2), scatter = cropped
+        p2, iters, rel = solve(
+            xp, r2, kx2, ky2, kz2, l2, tol=tol, max_iter=max_iter,
+            check_every=check_every, min_size=min_size, max_levels=max_levels,
+            nu_pre=nu_pre, nu_post=nu_post, nu_coarse=nu_coarse, omega=omega)
+        return scatter(p2), iters, rel
+
     diag = pressure.diagonal(xp, kx, ky, kz, liquid)
     solvable = liquid & (diag > 0.0)
     rhs = rhs * solvable
