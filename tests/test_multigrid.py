@@ -263,7 +263,7 @@ def test_active_crop_matches_full_grid_within_tolerance(monkeypatch, solver,
     p_crop, _, rel_crop = solve(np, rhs, kx, ky, kz, liquid, tol=1e-6,
                                 max_iter=800)
 
-    monkeypatch.setattr(pressure, "crop_to_active", lambda *a, **k: None)
+    monkeypatch.setattr(pressure, "crop_boxes", lambda *a, **k: None)
     p_full, _, _ = solve(np, rhs, kx, ky, kz, liquid, tol=1e-6, max_iter=800)
 
     solvable = liquid & (pressure.diagonal(np, kx, ky, kz, liquid) > 0.0)
@@ -282,6 +282,69 @@ def test_active_crop_is_deterministic():
     assert np.array_equal(a, b)
 
 
+def _two_blob_problem(n=48, seed=5):
+    rng = np.random.default_rng(seed)
+    kx = rng.uniform(0.5, 2.0, (n + 1, n, n)).astype(np.float32)
+    ky = rng.uniform(0.5, 2.0, (n, n + 1, n)).astype(np.float32)
+    kz = rng.uniform(0.5, 2.0, (n, n, n + 1)).astype(np.float32)
+    liquid = np.zeros((n, n, n), bool)
+    r = n // 5
+    liquid[:r, :r, :r] = True           # blob at one corner
+    liquid[-r:, -r:, -r:] = True         # blob at the opposite corner
+    rhs = (rng.standard_normal((n, n, n)).astype(np.float32)) * liquid
+    return rhs, kx, ky, kz, liquid
+
+
+def test_component_boxes_splits_disconnected_but_not_connected():
+    from stflip import pressure
+    n = 48
+    r = n // 5
+    two = np.zeros((n, n, n), bool)
+    two[:r, :r, :r] = True
+    two[-r:, -r:, -r:] = True
+    assert len(pressure._component_boxes(np, two)) == 2
+
+    # A contiguous slab is one component.
+    slab = np.zeros((n, n, n), bool)
+    slab[5:40, 5:40, 5:20] = True
+    assert len(pressure._component_boxes(np, slab)) == 1
+
+    # An L-shape is connected and has no complete empty plane -> must not split.
+    ell = np.zeros((n, n, n), bool)
+    ell[5:40, 5:10, 5:10] = True
+    ell[5:10, 5:40, 5:10] = True
+    assert len(pressure._component_boxes(np, ell)) == 1
+
+
+def test_crop_boxes_returns_one_box_per_disconnected_region():
+    from stflip import pressure
+    rhs, kx, ky, kz, liquid = _two_blob_problem()
+    boxes = pressure.crop_boxes(np, rhs, kx, ky, kz, liquid)
+    assert boxes is not None and len(boxes) == 2
+    # Each returned box is much smaller than the domain-spanning single bbox.
+    for _parts, _scatter in boxes:
+        assert _parts[4].size < liquid.size // 4        # sub-liquid mask size
+
+
+@pytest.mark.parametrize("solver", ["jacobi", "multigrid"])
+def test_disconnected_component_solve_matches_full_grid(monkeypatch, solver):
+    """Solving two disconnected blobs on their own tight boxes must match a
+    single full-grid solve of the same (block-diagonal) system."""
+    from stflip import pressure
+    solve = multigrid.solve if solver == "multigrid" else pressure.solve
+    rhs, kx, ky, kz, liquid = _two_blob_problem(seed=7)
+
+    p_split, _, rel = solve(np, rhs, kx, ky, kz, liquid, tol=1e-6, max_iter=800)
+    monkeypatch.setattr(pressure, "crop_boxes", lambda *a, **k: None)
+    p_full, _, _ = solve(np, rhs, kx, ky, kz, liquid, tol=1e-6, max_iter=800)
+
+    solvable = liquid & (pressure.diagonal(np, kx, ky, kz, liquid) > 0.0)
+    scale = float(np.abs(p_full[solvable]).max())
+    assert np.abs((p_split - p_full) * solvable).max() <= 1e-4 * scale
+    assert rel <= 1e-4
+    assert not np.any(p_split[~solvable])
+
+
 @pytest.mark.gpu
 def test_multigrid_cpu_gpu_parity():
     from stflip.backend import get_backend
@@ -296,4 +359,22 @@ def test_multigrid_cpu_gpu_parity():
         xp, xp.asarray(rhs), xp.asarray(kx), xp.asarray(ky), xp.asarray(kz),
         xp.asarray(liquid), tol=1e-5)
     assert itc == itg
+    np.testing.assert_allclose(gpu.to_numpy(pg), pc, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.gpu
+def test_disconnected_components_cpu_gpu_parity():
+    """The per-component split (host projections via .get(), multiple box
+    slices) must produce the same pressure on GPU as on CPU."""
+    from stflip.backend import get_backend
+    try:
+        gpu = get_backend("cuda")
+    except Exception:                       # pragma: no cover - no CUDA present
+        pytest.skip("CUDA backend unavailable")
+    rhs, kx, ky, kz, liquid = _two_blob_problem(n=64, seed=9)
+    pc, _, _ = multigrid.solve(np, rhs, kx, ky, kz, liquid, tol=1e-5)
+    xp = gpu.xp
+    pg, _, _ = multigrid.solve(
+        xp, xp.asarray(rhs), xp.asarray(kx), xp.asarray(ky), xp.asarray(kz),
+        xp.asarray(liquid), tol=1e-5)
     np.testing.assert_allclose(gpu.to_numpy(pg), pc, atol=1e-4, rtol=1e-4)
