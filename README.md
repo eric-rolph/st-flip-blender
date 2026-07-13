@@ -260,6 +260,7 @@ solid support.
 | Outflow Mode | §4.8 | Interior particle-removal volume or exterior half-cell `p=0` pressure outlet |
 | Advanced Solver | §3.3, §3.7 | Liquid density, local advection CFL, PCG tolerance/limit, and relative density floor |
 | Pressure Solver | §3.6–3.7 | PPE preconditioner: Jacobi-PCG (default) or a geometric multigrid V-cycle whose iteration count is nearly resolution-independent; multigrid falls back to Jacobi on grids too small to coarsen |
+| Materials & Look | — | One-click fluid materials (water, clear, honey, juice, milk, lava) plus a Studio Look setup (EEVEE Next raytracing + sky world + sun) so a bake renders with real refraction immediately |
 | Paper MCF Surface | Appendix B | Fixed radius/voxel `0.5Δx`, Gaussian `σ=2Δx`, feature mask `θ=2, ζ=5`, and `0.5` isovalue; `kψ` defaults to 30 |
 
 ### Source velocity fields

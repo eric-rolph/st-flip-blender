@@ -1843,6 +1843,7 @@ def _preset_viscous_pour(context, st, tag):
     st.transfer = "apic"
     st.cfl_target = 6.0
     st.whitewater = False
+    st.fluid_material = "HONEY"
     return "Viscous pour (honey) — high viscosity + APIC"
 
 
@@ -1910,6 +1911,7 @@ def _reset_preset_params(st):
     st.transfer = "flip"
     st.whitewater = False
     st.whitewater_rate = 1.0
+    st.fluid_material = "WATER"
 
 
 _PRESET_BUILDERS = {
@@ -4125,9 +4127,166 @@ class STFLIP_OT_setup_motion_blur(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _try_set(target, attr, value) -> bool:
+    """Set an attribute only if it exists, swallowing enum/type mismatches.
+
+    EEVEE Next reorganizes scene.eevee.* attributes across 5.x point releases,
+    so the studio operator must never abort mid-run because one attribute was
+    renamed or dropped in the running build.
+    """
+    if target is None or not hasattr(target, attr):
+        return False
+    try:
+        setattr(target, attr, value)
+        return True
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+class STFLIP_OT_apply_material(bpy.types.Operator):
+    """Build the selected fluid material and assign it to the baked surface"""
+    bl_idname = "stflip.apply_material"
+    bl_label = "Apply Fluid Material"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        st = context.scene.stflip
+        material = mesher.build_fluid_material(st.fluid_material)
+        applied = mesher.apply_material_to_surface(st.surface_object, material)
+        refractive = st.fluid_material in {"WATER", "CLEAR", "HONEY", "JUICE"}
+        hint = ("" if not refractive
+                else " Refractive — enable raytracing (Setup Studio Look).")
+        if applied:
+            self.report({"INFO"}, f"Applied {material.name}.{hint}")
+        else:
+            self.report(
+                {"INFO"},
+                f"Built {material.name}; bake to create a surface.{hint}")
+        return {"FINISHED"}
+
+
+class STFLIP_OT_setup_studio(bpy.types.Operator):
+    """Configure EEVEE Next raytracing, a sky world, and a sun light so a
+    baked fluid renders well immediately. Safe to run more than once"""
+    bl_idname = "stflip.setup_studio"
+    bl_label = "Setup Studio Look"
+    bl_options = {"REGISTER", "UNDO"}
+
+    add_ground: bpy.props.BoolProperty(
+        name="Add Ground Plane", default=False,
+        description="Also add a large neutral floor under the scene",
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        _try_set(scene.render, "engine", "BLENDER_EEVEE")
+        ee = getattr(scene, "eevee", None)
+        # EEVEE Next raytracing pipeline (raytraced refraction needs this on).
+        _try_set(ee, "use_raytracing", True)
+        rt = getattr(ee, "ray_tracing_options", None)
+        _try_set(rt, "resolution_scale", "1")        # string enum, not int
+        _try_set(rt, "trace_max_roughness", 0.5)
+        _try_set(rt, "screen_trace_quality", 0.25)
+        _try_set(rt, "screen_trace_thickness", 0.2)
+        _try_set(rt, "use_denoise", True)
+        _try_set(rt, "denoise_spatial", True)
+        _try_set(rt, "denoise_bilateral", True)
+        _try_set(ee, "taa_render_samples", 64)
+        _try_set(ee, "use_shadows", True)
+        _try_set(ee, "shadow_ray_count", 2)
+        _try_set(ee, "shadow_step_count", 6)
+        _try_set(ee, "clamp_surface_indirect", 10.0)   # tame sky-reflection fireflies
+
+        self._setup_world(scene)
+        self._ensure_sun(scene)
+        if self.add_ground:
+            self._ensure_ground(scene)
+        self.report(
+            {"INFO"},
+            "Studio look configured: EEVEE raytracing, sky world, and sun.")
+        return {"FINISHED"}
+
+    def _setup_world(self, scene):
+        world = (bpy.data.worlds.get("STFLIP Studio Sky")
+                 or bpy.data.worlds.new("STFLIP Studio Sky"))
+        world.use_nodes = True
+        tree = world.node_tree
+        tree.nodes.clear()
+        sky = tree.nodes.new("ShaderNodeTexSky")
+        sky.location = (-300.0, 0.0)
+        _try_set(sky, "sky_type", "MULTIPLE_SCATTERING")   # NISHITA removed in 5.1
+        _try_set(sky, "sun_elevation", math.radians(18.0))
+        _try_set(sky, "sun_rotation", math.radians(-45.0))
+        bg = tree.nodes.new("ShaderNodeBackground")
+        bg.location = (0.0, 0.0)
+        _try_set(bg.inputs["Strength"], "default_value", 1.0)
+        out = tree.nodes.new("ShaderNodeOutputWorld")
+        out.location = (300.0, 0.0)
+        tree.links.new(sky.outputs["Color"], bg.inputs["Color"])
+        tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+        scene.world = world
+
+    def _ensure_sun(self, scene):
+        name = "STFLIP Sun"
+        obj = bpy.data.objects.get(name)
+        if obj is None or getattr(obj, "type", None) != "LIGHT":
+            # The exact name may be held by a non-light object; reuse a sun we
+            # created earlier (possibly auto-suffixed) rather than adding another.
+            obj = next((o for o in bpy.data.objects
+                        if getattr(o, "type", None) == "LIGHT"
+                        and o.name.startswith(name)), None)
+        if obj is None:
+            light = bpy.data.lights.new(name, "SUN")
+            obj = bpy.data.objects.new(name, light)
+        # Link into the active scene whether the object is new or a pre-existing
+        # sun that lives only in another scene/collection; ignore if already in.
+        try:
+            scene.collection.objects.link(obj)
+        except RuntimeError:
+            pass
+        light = obj.data
+        _try_set(light, "energy", 3.0)
+        _try_set(light, "angle", math.radians(2.0))     # soft key shadow
+        obj.rotation_euler = (math.radians(58.0), 0.0, math.radians(-45.0))
+        return obj
+
+    def _ensure_ground(self, scene):
+        name = "STFLIP Ground"
+        obj = bpy.data.objects.get(name)
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            # Build the plane from data rather than bpy.ops: a mesh operator run
+            # in Edit Mode would inject geometry into the user's edited mesh and
+            # then rename it, corrupting their object.
+            s = 20.0
+            mesh = bpy.data.meshes.new(name)
+            mesh.from_pydata(
+                [(-s, -s, 0.0), (s, -s, 0.0), (s, s, 0.0), (-s, s, 0.0)],
+                [], [(0, 1, 2, 3)])
+            mesh.update()
+            obj = bpy.data.objects.new(name, mesh)
+        try:
+            scene.collection.objects.link(obj)
+        except RuntimeError:
+            pass
+        mat = (bpy.data.materials.get("STFLIP Ground")
+               or bpy.data.materials.new("STFLIP Ground"))
+        mat.use_nodes = True
+        bsdf = mesher._ensure_principled_bsdf(mat.node_tree)
+        if bsdf is not None:
+            mesher._set_bsdf_input(bsdf, "Base Color", (0.25, 0.25, 0.27, 1.0))
+            mesher._set_bsdf_input(bsdf, "Roughness", 0.7)
+        if obj.data.materials:
+            obj.data.materials[0] = mat
+        else:
+            obj.data.materials.append(mat)
+        return obj
+
+
 CLASSES = (
     STFLIP_OT_quick_setup,
     STFLIP_OT_add_preset,
+    STFLIP_OT_apply_material,
+    STFLIP_OT_setup_studio,
     STFLIP_OT_whirlpool_preview,
     STFLIP_OT_high_cfl_jet_leak,
     STFLIP_OT_bake,

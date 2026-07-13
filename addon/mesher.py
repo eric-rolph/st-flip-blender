@@ -156,21 +156,245 @@ def build_node_group():
         raise
 
 
-def ensure_water_material():
-    mat = bpy.data.materials.get("STFLIP Water")
-    if mat is not None:
-        return mat
-    mat = bpy.data.materials.new("STFLIP Water")
+# Data-driven fluid material library.  Each entry is a self-contained recipe the
+# builder translates into a single Principled BSDF (plus a Blackbody node for the
+# emissive lava).  Design decisions validated against Blender 5.1 EEVEE Next:
+#   * Tint is carried by Base Color with a high Transmission Weight (colored
+#     glass), NOT by a Volume Absorption node: raytraced refraction in EEVEE Next
+#     traces screen buffers and does not integrate volume absorption along the
+#     refracted ray, and the per-frame-rebuilt thin surface makes a volumetric
+#     pass flicker.  Base-Color tint is reliable and cheap.
+#   * Refractive fluids need the material flag ``use_raytrace_refraction`` (the
+#     real EEVEE Next property; ``use_raytraced_transmission`` does not exist) AND
+#     the scene flag ``scene.eevee.use_raytracing`` (set by the studio operator).
+#   * Milk uses real Principled subsurface (supported in EEVEE Next); lava emits
+#     via a Blackbody node into Emission Color with a non-zero Emission Strength
+#     (the v2 default strength is 0, which would render black).
+FLUID_MATERIAL_ITEMS = (
+    ("WATER", "Water", "Clear blue-tinted refractive water"),
+    ("CLEAR", "Clear", "Colorless refractive liquid / glass"),
+    ("HONEY", "Honey", "Thick amber translucent honey"),
+    ("JUICE", "Juice", "Orange translucent fruit juice"),
+    ("MILK", "Milk", "Opaque white milk (subsurface)"),
+    ("LAVA", "Lava", "Molten rock: dark body, glowing emission"),
+    ("FOAM", "Foam", "Bright whitewater foam (for instanced spray)"),
+)
+
+_FLUID_MATERIAL_SPECS = {
+    "WATER": {
+        "name": "STFLIP Water", "base_color": (0.55, 0.78, 0.85, 1.0),
+        "roughness": 0.02, "ior": 1.333, "transmission": 1.0,
+        "refractive": True,
+    },
+    "CLEAR": {
+        "name": "STFLIP Clear", "base_color": (1.0, 1.0, 1.0, 1.0),
+        "roughness": 0.01, "ior": 1.45, "transmission": 1.0,
+        "refractive": True,
+    },
+    "HONEY": {
+        "name": "STFLIP Honey", "base_color": (0.60, 0.28, 0.05, 1.0),
+        "roughness": 0.12, "ior": 1.49, "transmission": 0.9,
+        "refractive": True,
+    },
+    "JUICE": {
+        "name": "STFLIP Juice", "base_color": (0.85, 0.30, 0.05, 1.0),
+        "roughness": 0.05, "ior": 1.34, "transmission": 0.85,
+        "refractive": True,
+    },
+    "MILK": {
+        "name": "STFLIP Milk", "base_color": (0.92, 0.92, 0.94, 1.0),
+        "roughness": 0.3, "ior": 1.35, "transmission": 0.0,
+        "refractive": False,
+        "subsurface": {"weight": 0.5, "radius": (1.0, 0.55, 0.35),
+                       "scale": 0.02},
+    },
+    "LAVA": {
+        "name": "STFLIP Lava", "base_color": (0.015, 0.006, 0.004, 1.0),
+        "roughness": 0.85, "ior": 1.45, "transmission": 0.0,
+        "refractive": False,
+        "emission": {"blackbody_k": 1200.0, "strength": 8.0},
+    },
+    "FOAM": {
+        "name": "STFLIP Foam", "base_color": (0.95, 0.96, 0.98, 1.0),
+        "roughness": 0.85, "ior": 1.33, "transmission": 0.0,
+        "refractive": False,
+        "emission": {"color": (0.9, 0.95, 1.0, 1.0), "strength": 0.2},
+    },
+}
+
+DEFAULT_FLUID_MATERIAL = "WATER"
+
+
+def _set_bsdf_input(bsdf, name, value):
+    """Set a Principled BSDF input if that socket exists in this Blender build."""
+    socket = bsdf.inputs.get(name) if hasattr(bsdf.inputs, "get") else None
+    if socket is None and name in getattr(bsdf, "inputs", {}):
+        socket = bsdf.inputs[name]
+    if socket is not None:
+        socket.default_value = value
+
+
+def _set_refraction_flag(mat, enabled):
+    """Enable EEVEE Next raytraced refraction defensively across builds.
+
+    ``use_raytrace_refraction`` is the canonical property; ``use_screen_refraction``
+    is a still-registered alias for the same bit.  Both are set when present so
+    the material refracts once ``scene.eevee.use_raytracing`` is on.
+    """
+    for attr in ("use_raytrace_refraction", "use_screen_refraction"):
+        if hasattr(mat, attr):
+            try:
+                setattr(mat, attr, bool(enabled))
+            except (AttributeError, TypeError):
+                pass
+
+
+def _ensure_principled_bsdf(tree):
+    """Return the material's Principled BSDF, rebuilding it if a same-named
+    datablock was appended/edited without one so the recipe always applies."""
+    bsdf = tree.nodes.get("Principled BSDF")
+    if bsdf is None:
+        for node in tree.nodes:
+            if getattr(node, "type", None) == "BSDF_PRINCIPLED":
+                bsdf = node
+                break
+    if bsdf is None:
+        bsdf = tree.nodes.new("ShaderNodeBsdfPrincipled")
+        bsdf.name = "Principled BSDF"
+        bsdf.location = (0.0, 0.0)
+    output = None
+    for node in tree.nodes:
+        if getattr(node, "type", None) == "OUTPUT_MATERIAL":
+            output = node
+            break
+    if output is None:
+        output = tree.nodes.new("ShaderNodeOutputMaterial")
+        output.location = (300.0, 0.0)
+    surface = output.inputs.get("Surface") \
+        if hasattr(output.inputs, "get") else None
+    if surface is not None and not surface.is_linked:
+        try:
+            tree.links.new(bsdf.outputs["BSDF"], surface)
+        except (RuntimeError, TypeError, KeyError):
+            pass
+    return bsdf
+
+
+def build_fluid_material(kind):
+    """Get-or-create the named fluid material and (re)apply its recipe.
+
+    The material is a single persistent datablock reused across the per-frame
+    surface rebuild; calling this again refreshes its parameters in place rather
+    than allocating a new datablock.
+    """
+    spec = _FLUID_MATERIAL_SPECS.get(kind, _FLUID_MATERIAL_SPECS[DEFAULT_FLUID_MATERIAL])
+    mat = bpy.data.materials.get(spec["name"])
+    if mat is None:
+        mat = bpy.data.materials.new(spec["name"])
     mat.use_nodes = True
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    tree = mat.node_tree
+    bsdf = _ensure_principled_bsdf(tree)
     if bsdf is not None:
-        bsdf.inputs["Base Color"].default_value = (0.02, 0.3, 0.75, 1.0)
-        bsdf.inputs["Roughness"].default_value = 0.08
-        if "Transmission Weight" in bsdf.inputs:
-            bsdf.inputs["Transmission Weight"].default_value = 0.5
-        if "IOR" in bsdf.inputs:
-            bsdf.inputs["IOR"].default_value = 1.33
+        _set_bsdf_input(bsdf, "Base Color", spec["base_color"])
+        _set_bsdf_input(bsdf, "Roughness", spec["roughness"])
+        _set_bsdf_input(bsdf, "IOR", spec["ior"])
+        _set_bsdf_input(bsdf, "Transmission Weight", spec["transmission"])
+        subsurface = spec.get("subsurface")
+        _set_bsdf_input(bsdf, "Subsurface Weight",
+                        subsurface["weight"] if subsurface else 0.0)
+        if subsurface:
+            _set_bsdf_input(bsdf, "Subsurface Radius", subsurface["radius"])
+            _set_bsdf_input(bsdf, "Subsurface Scale", subsurface["scale"])
+        emission = spec.get("emission")
+        if emission and "color" in emission:
+            _set_bsdf_input(bsdf, "Emission Color", emission["color"])
+        _set_bsdf_input(bsdf, "Emission Strength",
+                        emission["strength"] if emission else 0.0)
+        if emission and "blackbody_k" in emission:
+            _link_blackbody_emission(tree, bsdf, emission["blackbody_k"])
+    _set_refraction_flag(mat, spec.get("refractive", False))
     return mat
+
+
+def _link_blackbody_emission(tree, bsdf, temperature_k):
+    """Feed a Blackbody colour into the BSDF Emission Color (molten look)."""
+    node = tree.nodes.get("STFLIP Blackbody")
+    if node is None:
+        node = tree.nodes.new("ShaderNodeBlackbody")
+        node.name = "STFLIP Blackbody"
+        node.location = (-320.0, -220.0)
+    node.inputs["Temperature"].default_value = float(temperature_k)
+    emission_socket = bsdf.inputs.get("Emission Color") \
+        if hasattr(bsdf.inputs, "get") else None
+    if emission_socket is not None and not emission_socket.is_linked:
+        try:
+            tree.links.new(node.outputs["Color"], emission_socket)
+        except (RuntimeError, TypeError):
+            pass
+
+
+def _selected_fluid_kind(scene):
+    """The scene's chosen fluid material key, or None when unavailable."""
+    settings = getattr(scene, "stflip", None) if scene is not None else None
+    kind = getattr(settings, "fluid_material", None) if settings else None
+    return kind if kind in _FLUID_MATERIAL_SPECS else None
+
+
+def resolve_fluid_material(scene=None):
+    """Return the material for the scene's selected fluid, defaulting to water.
+
+    Water (and the no-selection fallback) delegates to :func:`ensure_water_material`
+    so existing callers and tests that stub that factory keep working.
+    """
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    kind = _selected_fluid_kind(scene)
+    if kind is None or kind == "WATER":
+        return ensure_water_material()
+    return build_fluid_material(kind)
+
+
+def ensure_water_material():
+    return build_fluid_material("WATER")
+
+
+def apply_material_to_surface(obj, material) -> bool:
+    """Assign ``material`` to a surface object via both delivery paths.
+
+    Fast-preview surfaces receive it through the Geometry-Nodes group's
+    "Material" input socket; paper-MCF surfaces are plain meshes, so it is also
+    written to the mesh material slot.  Returns True if either path applied.
+    """
+    if obj is None or material is None:
+        return False
+    applied = False
+    mod = None
+    modifiers = getattr(obj, "modifiers", None)
+    if modifiers is not None and hasattr(modifiers, "get"):
+        mod = modifiers.get(SURFACE_MODIFIER)
+    node_group = getattr(mod, "node_group", None) if mod is not None else None
+    if node_group is not None:
+        ident = _socket_identifier(node_group, "Material")
+        if ident is not None:
+            try:
+                mod[ident] = material
+                applied = True
+            except (KeyError, TypeError):
+                pass
+    mesh = getattr(obj, "data", None)
+    materials = getattr(mesh, "materials", None) if mesh is not None else None
+    if materials is not None:
+        try:
+            if len(materials):
+                materials[0] = material
+            else:
+                materials.append(material)
+            applied = True
+        except (AttributeError, IndexError, RuntimeError, TypeError):
+            pass
+    if hasattr(obj, "update_tag"):
+        obj.update_tag()
+    return applied
 
 
 def _socket_identifier(ng, name):
@@ -449,7 +673,7 @@ def ensure_surface_object(particle_obj, dx: float, radius_factor: float,
     for name, value in (("Points Object", particle_obj),
                         ("Radius", dx * radius_factor),
                         ("Voxel Size", dx * voxel_factor),
-                        ("Material", ensure_water_material())):
+                        ("Material", resolve_fluid_material())):
         ident = _socket_identifier(ng, name)
         if ident is not None:
             mod[ident] = value
@@ -590,7 +814,7 @@ def density_field_to_polygons(
 
 
 def _assign_water_material(mesh) -> None:
-    material = ensure_water_material()
+    material = resolve_fluid_material()
     materials = getattr(mesh, "materials", None)
     if materials is None:
         return
