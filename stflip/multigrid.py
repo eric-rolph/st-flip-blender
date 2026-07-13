@@ -209,18 +209,35 @@ def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400, check_every=8,
     diagonal.  Falls back to the diagonal preconditioner when the grid is too
     small to coarsen at all, so tiny domains behave exactly like Jacobi-PCG.
     """
-    # Skip empty regions first: crop to the active bounding box (same active
-    # cells and residual contract) so the hierarchy is built over live cells
-    # only.  Differences vs. the full grid are at the float32 rounding level.
-    cropped = pressure.crop_to_active(xp, rhs, kx, ky, kz, liquid)
-    if cropped is not None:
-        (r2, kx2, ky2, kz2, l2), scatter = cropped
-        p2, iters, rel = solve(
-            xp, r2, kx2, ky2, kz2, l2, tol=tol, max_iter=max_iter,
-            check_every=check_every, min_size=min_size, max_levels=max_levels,
-            nu_pre=nu_pre, nu_post=nu_post, nu_coarse=nu_coarse, omega=omega)
-        return scatter(p2), iters, rel
+    # Skip empty regions first: solve each axis-separable component on its own
+    # tight support (Phase 1.5) so the hierarchy is built over live cells only.
+    # Disconnected regions are independent systems; a single connected region is
+    # just the bounding-box crop. Differences vs. the full grid are at the
+    # float32 rounding level.
+    boxes = pressure.crop_boxes(xp, rhs, kx, ky, kz, liquid)
+    if boxes is not None:
+        p = xp.zeros_like(rhs)
+        it_max = 0
+        rel_max = 0.0
+        for parts, scatter in boxes:
+            sub_p, iters, rel = _solve_core(
+                xp, *parts, tol=tol, max_iter=max_iter, check_every=check_every,
+                min_size=min_size, max_levels=max_levels, nu_pre=nu_pre,
+                nu_post=nu_post, nu_coarse=nu_coarse, omega=omega)
+            p = p + scatter(sub_p)
+            it_max = max(it_max, iters)
+            rel_max = max(rel_max, rel)
+        return p, it_max, rel_max
+    return _solve_core(
+        xp, rhs, kx, ky, kz, liquid, tol=tol, max_iter=max_iter,
+        check_every=check_every, min_size=min_size, max_levels=max_levels,
+        nu_pre=nu_pre, nu_post=nu_post, nu_coarse=nu_coarse, omega=omega)
 
+
+def _solve_core(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400,
+                check_every=8, *, min_size=4, max_levels=8, nu_pre=2,
+                nu_post=2, nu_coarse=20, omega=0.8):
+    """Multigrid-preconditioned CG on the full given arrays (no cropping)."""
     diag = pressure.diagonal(xp, kx, ky, kz, liquid)
     solvable = liquid & (diag > 0.0)
     rhs = rhs * solvable
@@ -235,8 +252,9 @@ def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400, check_every=8,
         xp, kx, ky, kz, solvable, min_size=min_size, max_levels=max_levels)
     if len(levels) == 1:
         # Nothing to coarsen: defer to the diagonal-preconditioned CG so small
-        # grids keep their existing (already fast) behaviour.
-        return pressure.solve(
+        # grids keep their existing (already fast) behaviour. Use the un-cropped
+        # core since these arrays are already the cropped component.
+        return pressure._solve_core(
             xp, rhs, kx, ky, kz, liquid, tol=tol, max_iter=max_iter,
             check_every=check_every)
 

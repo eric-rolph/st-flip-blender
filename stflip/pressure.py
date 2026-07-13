@@ -18,6 +18,8 @@ at half-cell distance, and therefore contribute twice their face coefficient.
 
 from __future__ import annotations
 
+import numpy as np
+
 
 def apply_laplacian(xp, p, kx, ky, kz, liquid):
     """A p = sum_f k_f (p_c - p_nb), restricted to liquid rows.
@@ -73,6 +75,149 @@ def diagonal(xp, kx, ky, kz, liquid):
     diag[:, :, 0] += kz[:, :, 0]
     diag[:, :, -1] += kz[:, :, -1]
     return diag * liquid
+
+
+def _axis_occupancy(xp, liquid, box, axis):
+    """Host bool projection of ``liquid[box]`` onto ``axis`` (any over others)."""
+    x0, x1, y0, y1, z0, z1 = box
+    sub = liquid[x0:x1, y0:y1, z0:z1]
+    other = tuple(a for a in (0, 1, 2) if a != axis)
+    present = sub.any(axis=other)
+    return np.asarray(present.get() if hasattr(present, "get") else present,
+                      dtype=bool)
+
+
+def _tighten_box(xp, liquid, box):
+    """Shrink ``box`` to the bounding box of the liquid inside it, or None."""
+    lo = [box[0], box[2], box[4]]
+    hi = [box[1], box[3], box[5]]
+    for axis in range(3):
+        occ = _axis_occupancy(xp, liquid, (lo[0], hi[0], lo[1], hi[1],
+                                           lo[2], hi[2]), axis)
+        idx = np.nonzero(occ)[0]
+        if idx.size == 0:
+            return None
+        base = lo[axis]
+        lo[axis] = base + int(idx[0])
+        hi[axis] = base + int(idx[-1]) + 1
+    return (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2])
+
+
+def _component_boxes(xp, liquid):
+    """Bounding boxes of the axis-separable active components.
+
+    Recursively splits the active bounding box wherever a *complete empty plane*
+    (a lattice plane with no liquid) lies between two occupied planes on some
+    axis.  A connected region can have no such plane — any path across the plane
+    would need a liquid cell on it — so a split never separates coupled cells;
+    the pressure systems on the two sides are genuinely independent.  Regions
+    that only separate along a non-axis direction stay in one box (conservative).
+    Returns a list of tight boxes, or None if nothing is active.
+    """
+    nx, ny, nz = liquid.shape
+    root = _tighten_box(xp, liquid, (0, nx, 0, ny, 0, nz))
+    if root is None:
+        return None
+    leaves = []
+    stack = [root]
+    while stack:
+        box = stack.pop()
+        split = None
+        for axis in range(3):
+            occ = _axis_occupancy(xp, liquid, box, axis)
+            idx = np.nonzero(occ)[0]
+            gaps = np.nonzero(np.diff(idx) > 1)[0]
+            if gaps.size:
+                cut = box[2 * axis] + int(idx[gaps[0]]) + 1   # first empty plane
+                left = list(box)
+                left[2 * axis + 1] = cut
+                right = list(box)
+                right[2 * axis] = cut
+                split = (tuple(left), tuple(right))
+                break
+        if split is None:
+            leaves.append(box)
+            continue
+        for half in split:
+            tightened = _tighten_box(xp, liquid, half)
+            if tightened is not None:
+                stack.append(tightened)
+    return leaves
+
+
+def _box_volume(box):
+    return (box[1] - box[0]) * (box[3] - box[2]) * (box[5] - box[4])
+
+
+def _box_union(boxes):
+    x0 = min(b[0] for b in boxes)
+    x1 = max(b[1] for b in boxes)
+    y0 = min(b[2] for b in boxes)
+    y1 = max(b[3] for b in boxes)
+    z0 = min(b[4] for b in boxes)
+    z1 = max(b[5] for b in boxes)
+    return (x0, x1, y0, y1, z0, z1)
+
+
+def _crop_component(xp, rhs, kx, ky, kz, liquid, tight):
+    """Slice the system to one component's box plus a forced-inactive halo.
+
+    The one-cell halo gives boundary cells their true inactive neighbours, and
+    forcing every cell outside the tight box inactive keeps a nearby component
+    (which cannot be face-adjacent to this one) from being solved twice.  The
+    returned scatter writes only the tight region, so component boxes never
+    overlap on write.
+    """
+    x0, x1, y0, y1, z0, z1 = tight
+    nx, ny, nz = liquid.shape
+    hx0, hx1 = max(0, x0 - 1), min(nx, x1 + 1)
+    hy0, hy1 = max(0, y0 - 1), min(ny, y1 + 1)
+    hz0, hz1 = max(0, z0 - 1), min(nz, z1 + 1)
+    tx0, tx1 = x0 - hx0, x1 - hx0
+    ty0, ty1 = y0 - hy0, y1 - hy0
+    tz0, tz1 = z0 - hz0, z1 - hz0
+    sub_liquid = liquid[hx0:hx1, hy0:hy1, hz0:hz1].copy()
+    keep = xp.zeros_like(sub_liquid)
+    keep[tx0:tx1, ty0:ty1, tz0:tz1] = True
+    sub_liquid = sub_liquid & keep
+    parts = (
+        rhs[hx0:hx1, hy0:hy1, hz0:hz1],
+        kx[hx0:hx1 + 1, hy0:hy1, hz0:hz1],
+        ky[hx0:hx1, hy0:hy1 + 1, hz0:hz1],
+        kz[hx0:hx1, hy0:hy1, hz0:hz1 + 1],
+        sub_liquid,
+    )
+
+    def scatter(sub_p):
+        full = xp.zeros((nx, ny, nz), dtype=sub_p.dtype)
+        full[x0:x1, y0:y1, z0:z1] = sub_p[tx0:tx1, ty0:ty1, tz0:tz1]
+        return full
+
+    return parts, scatter
+
+
+def crop_boxes(xp, rhs, kx, ky, kz, liquid, *, min_gain=0.7):
+    """Sub-problems to solve, one per axis-separable component, or None.
+
+    A single connected region yields one bounding-box crop (Phase 0).  Multiple
+    disconnected regions are returned as separate boxes so each is solved on its
+    own tight support instead of one box spanning the empty gaps between them —
+    exact, because disconnected regions are independent pressure systems.  Falls
+    back to None (solve the full grid) when neither splitting nor a single crop
+    saves enough work.
+    """
+    boxes = _component_boxes(xp, liquid)
+    if boxes is None:
+        return None
+    grid = liquid.shape[0] * liquid.shape[1] * liquid.shape[2]
+    union = _box_union(boxes)
+    union_vol = _box_volume(union)
+    total = sum(_box_volume(b) for b in boxes)
+    if len(boxes) > 1 and total <= min_gain * union_vol:
+        return [_crop_component(xp, rhs, kx, ky, kz, liquid, b) for b in boxes]
+    if union_vol <= min_gain * grid:
+        return [_crop_component(xp, rhs, kx, ky, kz, liquid, union)]
+    return None
 
 
 def crop_to_active(xp, rhs, kx, ky, kz, liquid, *, min_gain=0.7):
@@ -144,15 +289,28 @@ def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400,
     Plain reductions are used throughout (no cupy.linalg/cuBLAS, which the
     CuPy Windows wheels do not bundle).
     """
-    import math
+    boxes = crop_boxes(xp, rhs, kx, ky, kz, liquid)
+    if boxes is not None:
+        # Each axis-separable component is an independent system, solved on its
+        # own tight support; the scatters write disjoint tight regions.
+        p = xp.zeros_like(rhs)
+        it_max = 0
+        rel_max = 0.0
+        for parts, scatter in boxes:
+            sub_p, iters, rel = _solve_core(
+                xp, *parts, tol=tol, max_iter=max_iter, check_every=check_every)
+            p = p + scatter(sub_p)
+            it_max = max(it_max, iters)
+            rel_max = max(rel_max, rel)
+        return p, it_max, rel_max
+    return _solve_core(xp, rhs, kx, ky, kz, liquid, tol=tol, max_iter=max_iter,
+                       check_every=check_every)
 
-    cropped = crop_to_active(xp, rhs, kx, ky, kz, liquid)
-    if cropped is not None:
-        (r2, kx2, ky2, kz2, l2), scatter = cropped
-        p2, iters, rel = solve(
-            xp, r2, kx2, ky2, kz2, l2, tol=tol, max_iter=max_iter,
-            check_every=check_every)
-        return scatter(p2), iters, rel
+
+def _solve_core(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400,
+                check_every=8):
+    """Diagonal-preconditioned CG on the full given arrays (no cropping)."""
+    import math
 
     diag = diagonal(xp, kx, ky, kz, liquid)
     # Cells with an empty row (isolated by solids) cannot be solved for.

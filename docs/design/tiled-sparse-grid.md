@@ -106,11 +106,14 @@ rewrite wrong — a billion-cell shell/sheet is exactly the disconnected-footpri
 case — but it *deprioritizes* it: pursue it when a concrete production scene is
 bottlenecked on the dense grid in the disconnected regime, not speculatively.
 
-A cheaper, data-supported middle step also exists: disconnected fluid regions
-are *independent* pressure systems (the Poisson operator has no cross-region
-coupling), so a **per-connected-component crop** — solve each region's own tight
-box — would capture the 3–5× two-blob/drop win without any tiling rewrite. That
-is the recommended next increment if this band matters in practice.
+A cheaper, data-supported middle step also exists and is now **shipped**
+(`pressure.crop_boxes`, Phase 1.5 below): disconnected fluid regions are
+*independent* pressure systems (the Poisson operator has no cross-region
+coupling), so solving each region on its own tight box captures the
+disconnected-flow win without any tiling rewrite. Measured on two tiny blobs at
+opposite corners of a 96³ domain (0.4% active, bounding box spanning the whole
+grid), the pressure solve drops ~60× (Jacobi) and ~150× (multigrid) versus the
+single-box crop — bit-for-bit the same solution.
 
 ## Full tiled sparse grid (proposed)
 
@@ -199,11 +202,17 @@ parity.
   online). No solver change. Tests: pack/unpack round-trip, neighbour and
   boundary-tile correctness. *Deliverable on its own:* per-bake sparsity
   telemetry to decide when tiling would pay.
-- **Phase 1.5 — per-connected-component crop (optional, cheap).** Label
-  disconnected active regions and solve each in its own tight box. Captures the
-  measured 3–5× disconnected win with no packed representation; bitwise-parity
-  tested against the single-box crop. A pragmatic off-ramp if only this regime
-  matters.
+- **Phase 1.5 — per-connected-component crop (shipped).** `pressure.crop_boxes`
+  recursively splits the active box at *complete empty planes* (a lattice plane
+  with no liquid) into axis-separable components, and `pressure.solve` /
+  `multigrid.solve` solve each component on its own tight box. A connected region
+  can have no such plane, so a split never separates coupled cells — the systems
+  are genuinely independent and the combined result matches a single full-grid
+  solve to the float rounding level (tested on CPU and GPU). It is conservative:
+  regions that only separate along a non-axis direction stay in one box. This is
+  the pragmatic off-ramp — it captures the disconnected-flow win (~60–150× on the
+  two-blob case) with no packed representation, so Phases 2+ are only needed for
+  the thin-full-span-sheet regime the crop cannot help.
 - **Phase 2 — tiled Poisson operator + smoother.** Packed
   `apply_laplacian`/`diagonal`/damped-Jacobi over active tiles with halo
   exchange, proven equal to the dense operator on active cells (the
@@ -232,10 +241,11 @@ transient for typical flows, so a speculative full rewrite is not justified —
 shipping it half-done would risk the reliability of the dense-plus-crop path for
 a benefit most shots do not see.
 
-The bounding-box crop already delivered captures the bulk of the available
-sparsity for the common case at negligible risk, and it establishes the
-inactive-neighbour semantics the full tiling would reuse per tile. It is the
-correct first increment; the phased plan above is the route to take *when a
-concrete production scene demands it*, ideally starting with the cheap
-per-component crop (Phase 1.5) that captures the measured disconnected-flow win
-without the full rewrite.
+The bounding-box crop and the per-component crop (Phase 1.5) already delivered
+capture the bulk of the available sparsity — compact/contiguous flows via the
+bounding box, disconnected flows via the component split — at negligible risk,
+and they establish the inactive-neighbour semantics the full tiling would reuse
+per tile. Together they are the correct first increments; the remaining phases
+above are the route to take *when a concrete production scene demands it*,
+specifically a thin sheet or shell that spans the domain (large bounding box,
+few cells, no axis-separating empty plane) — the one regime neither crop helps.
