@@ -485,9 +485,12 @@ liquid with a fresh affine field. Obstacles marked
 "Animated (Moving Wall)" are re-voxelized every output frame with a differenced
 rigid velocity (slower; resume re-samples their motion from the current frame);
 source/outlet and static-obstacle geometry is still voxelized once at the
-first frame. Scene voxelization (mesh → grid masks/SDF) is a pure
-Python BVH loop and gets slow above resolution ~128 — vectorizing it is on
-the roadmap. Temporal jitter randoms are drawn on the host for cross-backend
+first frame. Scene voxelization (mesh → grid masks/SDF) is vectorized in NumPy
+(ray-parity masks; a Morton-ordered banded signed-distance field whose per-chunk
+triangle prefilter prunes to nearby triangles), with the Blender BVH loop kept
+only as an automatic fallback; the residual per-frame cost for animated
+obstacles is the O(res³) parity scan. Temporal jitter randoms are drawn on the
+host for cross-backend
 determinism, costing a small per-step transfer on GPU. Exact resume checkpoints
 are intentionally uncompressed and can be substantially larger than playback
 frames. Paper surfacing uses a dense cropped grid with `O(kψ V)` work and can

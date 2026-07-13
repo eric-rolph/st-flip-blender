@@ -472,6 +472,29 @@ def _point_triangle_distance(points, tris, bound, chunk=512):
     return out
 
 
+def _morton_order(idx):
+    """Sort order that walks a Z-order (Morton) curve over lattice cells.
+
+    ``_point_triangle_distance`` prunes triangles per 512-point chunk by the
+    chunk's bounding box. Raster (argwhere) order makes a chunk a narrow column
+    spanning the whole mesh in one axis, so its bbox overlaps most triangles and
+    the prefilter barely prunes. Walking a Morton curve keeps each chunk a
+    compact 3-D cluster whose tight bbox selects only nearby triangles.
+    """
+    def _part1by2(x):
+        x = x.astype(np.int64) & 0x3ff              # up to 1024 cells per axis
+        x = (x | (x << 16)) & 0x30000ff
+        x = (x | (x << 8)) & 0x300f00f
+        x = (x | (x << 4)) & 0x30c30c3
+        x = (x | (x << 2)) & 0x9249249
+        return x
+
+    code = (_part1by2(idx[:, 0])
+            | (_part1by2(idx[:, 1]) << 1)
+            | (_part1by2(idx[:, 2]) << 2))
+    return np.argsort(code, kind="stable")
+
+
 def _signed_band_sdf(tris, origin, dx, counts, offset, band=3):
     """Signed distance on a lattice: exact within ``band`` cells of the
     surface, sign-correct but saturated to +/-(band+1)*dx beyond it."""
@@ -488,11 +511,15 @@ def _signed_band_sdf(tris, origin, dx, counts, offset, band=3):
     sdf = np.where(inside, -sat, sat).astype(np.float32)
     idx = np.argwhere(band_mask)
     if len(idx):
+        # Distance is order-independent, so compute along a Morton curve to make
+        # the per-chunk triangle prefilter effective, then scatter back by cell.
+        idx = idx[_morton_order(idx)]
+        i0, i1, i2 = idx[:, 0], idx[:, 1], idx[:, 2]
         pts = (np.asarray(origin, dtype=np.float64)[None, :]
                + (idx.astype(np.float64) + np.asarray(offset)) * dx)
         dist = _point_triangle_distance(pts, tris, bound=sat)
-        signs = np.where(inside[band_mask], -1.0, 1.0)
-        sdf[band_mask] = (signs * dist).astype(np.float32)
+        signs = np.where(inside[i0, i1, i2], -1.0, 1.0)
+        sdf[i0, i1, i2] = (signs * dist).astype(np.float32)
     return sdf
 
 
