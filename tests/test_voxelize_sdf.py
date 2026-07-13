@@ -223,6 +223,30 @@ def test_point_triangle_distance_analytic(monkeypatch):
     assert abs(d[2] - np.sqrt(3 * 0.15 ** 2)) < 1e-9
 
 
+def test_morton_order_is_a_permutation(monkeypatch):
+    voxelize = _load_voxelize(monkeypatch)
+    idx = np.array([[0, 0, 0], [3, 1, 2], [1, 7, 4], [7, 7, 7], [2, 2, 2]])
+    order = voxelize._morton_order(idx)
+    assert sorted(order.tolist()) == list(range(len(idx)))
+
+
+def test_morton_reordering_does_not_change_distances(monkeypatch):
+    """The Morton curve only reorders which cells are batched together for the
+    per-chunk triangle prefilter; it must not change any computed distance."""
+    voxelize = _load_voxelize(monkeypatch)
+    tris = _cube_triangles()
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-0.2, 1.2, size=(4000, 3))
+    raster = voxelize._point_triangle_distance(pts, tris, bound=10.0, chunk=512)
+    order = voxelize._morton_order(
+        np.floor(pts * 16).astype(np.int64))
+    reordered = voxelize._point_triangle_distance(
+        pts[order], tris, bound=10.0, chunk=512)
+    restored = np.empty_like(reordered)
+    restored[order] = reordered
+    np.testing.assert_array_equal(restored, raster)
+
+
 def test_signed_band_sdf_cube(monkeypatch):
     voxelize = _load_voxelize(monkeypatch)
     tris = _cube_triangles()
