@@ -382,6 +382,22 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         ],
         default="FAST_PREVIEW",
     )
+    # Keys must stay in sync with mesher._FLUID_MATERIAL_SPECS.
+    fluid_material: EnumProperty(
+        name="Fluid Material",
+        items=[
+            ("WATER", "Water", "Clear blue-tinted refractive water"),
+            ("CLEAR", "Clear", "Colorless refractive liquid / glass"),
+            ("HONEY", "Honey", "Thick amber translucent honey"),
+            ("JUICE", "Juice", "Orange translucent fruit juice"),
+            ("MILK", "Milk", "Opaque white milk (subsurface)"),
+            ("LAVA", "Lava", "Molten rock: dark body, glowing emission"),
+        ],
+        default="WATER",
+        description="Shading of the reconstructed fluid surface. Refractive "
+                    "types need raytracing — use Setup Studio Look, or enable "
+                    "scene EEVEE raytracing yourself",
+    )
     particle_radius: FloatProperty(
         name="Particle Radius", default=0.5, min=0.1, max=2.0,
         description="Surfacing sphere radius in cell widths",

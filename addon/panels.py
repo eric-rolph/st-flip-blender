@@ -386,6 +386,32 @@ class STFLIP_PT_display(bpy.types.Panel):
             )
 
 
+class STFLIP_PT_look(bpy.types.Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ST-FLIP"
+    bl_label = "Materials & Look"
+    bl_parent_id = "STFLIP_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.stflip
+        col = layout.column(align=True)
+        col.label(text="Fluid material:")
+        col.prop(st, "fluid_material", text="")
+        col.operator("stflip.apply_material", icon="MATERIAL",
+                     text="Apply Fluid Material")
+        if st.fluid_material in {"WATER", "CLEAR", "HONEY", "JUICE"}:
+            col.label(text="Refractive — needs raytracing.", icon="INFO")
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="One-click render look:")
+        col.operator("stflip.setup_studio", icon="WORLD",
+                     text="Setup Studio Look")
+        col.label(text="EEVEE raytracing + sky + sun.", icon="INFO")
+
+
 CLASSES = (
     STFLIP_PT_main,
     STFLIP_PT_presets,
@@ -395,6 +421,7 @@ CLASSES = (
     STFLIP_PT_experiment,
     STFLIP_PT_export,
     STFLIP_PT_display,
+    STFLIP_PT_look,
 )
 
 
