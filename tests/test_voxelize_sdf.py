@@ -298,6 +298,19 @@ def test_morton_reordering_does_not_change_distances(monkeypatch):
     np.testing.assert_array_equal(restored, raster)
 
 
+def test_point_triangle_distance_is_chunk_independent(monkeypatch):
+    """The per-chunk bbox prefilter only drops triangles provably beyond the
+    bound, so the distance is identical for any chunk size."""
+    voxelize = _load_voxelize(monkeypatch)
+    tris = _cube_triangles()
+    rng = np.random.default_rng(1)
+    pts = rng.uniform(-0.3, 1.3, size=(3000, 3))
+    ref = voxelize._point_triangle_distance(pts, tris, bound=0.2, chunk=512)
+    for chunk in (1, 64, 257):
+        got = voxelize._point_triangle_distance(pts, tris, bound=0.2, chunk=chunk)
+        np.testing.assert_array_equal(got, ref)
+
+
 def test_signed_band_sdf_cube(monkeypatch):
     voxelize = _load_voxelize(monkeypatch)
     tris = _cube_triangles()
