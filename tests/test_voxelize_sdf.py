@@ -223,6 +223,57 @@ def test_point_triangle_distance_analytic(monkeypatch):
     assert abs(d[2] - np.sqrt(3 * 0.15 ** 2)) < 1e-9
 
 
+def _brute_parity(voxelize, tris, origin, dx, counts, offset):
+    """Reference parity: every ray tested against every triangle, no prefilter."""
+    nx, ny, nz = counts
+    jy, jz = 2.718281e-5 * dx, 3.141592e-5 * dx
+    ys = origin[1] + (np.arange(ny) + offset[1]) * dx + jy
+    zs = origin[2] + (np.arange(nz) + offset[2]) * dx + jz
+    ry, rz = np.meshgrid(ys, zs, indexing="ij")
+    ry, rz = ry.ravel(), rz.ravel()
+    a = tris[:, 0]
+    by_a, cy_a = tris[:, 1, 1] - a[:, 1], tris[:, 2, 1] - a[:, 1]
+    bz_a, cz_a = tris[:, 1, 2] - a[:, 2], tris[:, 2, 2] - a[:, 2]
+    det = by_a * cz_a - bz_a * cy_a
+    ok = np.abs(det) > 1e-30
+    inv = np.where(ok, det, 1.0)
+    bx_a, cx_a = tris[:, 1, 0] - a[:, 0], tris[:, 2, 0] - a[:, 0]
+    py = ry[:, None] - a[None, :, 1]
+    pz = rz[:, None] - a[None, :, 2]
+    u = (py * cz_a[None] - pz * cy_a[None]) / inv[None]
+    v = (by_a[None] * pz - bz_a[None] * py) / inv[None]
+    hit = ok[None] & (u >= 0.0) & (v >= 0.0) & (u + v <= 1.0)
+    hist = np.zeros((nx + 1, len(ry)), dtype=np.int32)
+    r, t = np.nonzero(hit)
+    x_hit = a[t, 0] + u[r, t] * bx_a[t] + v[r, t] * cx_a[t]
+    i0 = np.clip(np.floor((x_hit - origin[0]) / dx - offset[0]).astype(np.int64)
+                 + 1, 0, nx)
+    np.add.at(hist, (i0, r), 1)
+    return (np.cumsum(hist[:nx], axis=0) % 2).astype(bool).reshape(nx, ny, nz)
+
+
+def test_parity_prefilter_matches_bruteforce(monkeypatch):
+    """The Morton ray ordering + yz-bbox triangle prefilter must give exactly
+    the same inside mask as testing every ray against every triangle."""
+    voxelize = _load_voxelize(monkeypatch)
+    # A rotated octahedron: closed, non-axis-aligned, triangles with varied
+    # yz footprints so the prefilter is genuinely exercised.
+    c = np.array([0.5, 0.5, 0.5])
+    axes = np.array([[0.35, 0.05, 0.02], [0.03, 0.32, 0.06], [0.04, 0.02, 0.3]])
+    v = [c + axes[0], c - axes[0], c + axes[1], c - axes[1],
+         c + axes[2], c - axes[2]]
+    faces = [(0, 2, 4), (2, 1, 4), (1, 3, 4), (3, 0, 4),
+             (2, 0, 5), (1, 2, 5), (3, 1, 5), (0, 3, 5)]
+    tris = np.asarray([[v[a], v[b], v[c_]] for a, b, c_ in faces],
+                      dtype=np.float64)
+    n = 24
+    args = (tris, (0.0, 0.0, 0.0), 1.0 / n, (n, n, n), (0.5, 0.5, 0.5))
+    fast = voxelize._parity_inside(*args)
+    ref = _brute_parity(voxelize, *args)
+    assert np.array_equal(fast, ref)
+    assert fast.any()          # the shape is actually inside somewhere
+
+
 def test_morton_order_is_a_permutation(monkeypatch):
     voxelize = _load_voxelize(monkeypatch)
     idx = np.array([[0, 0, 0], [3, 1, 2], [1, 7, 4], [7, 7, 7], [2, 2, 2]])

@@ -354,15 +354,38 @@ def _extract_vertices(obj, depsgraph):
         evaluated.to_mesh_clear()
 
 
-def _parity_inside(tris, origin, dx, counts, offset,
-                   ray_chunk=4096, tri_chunk=16384):
+def _part1by1(x):
+    """Interleave one zero bit after each of the low 16 bits (2-D Morton)."""
+    x = x.astype(np.int64) & 0xFFFF
+    x = (x | (x << 8)) & 0x00FF00FF
+    x = (x | (x << 4)) & 0x0F0F0F0F
+    x = (x | (x << 2)) & 0x33333333
+    x = (x | (x << 1)) & 0x55555555
+    return x
+
+
+def _ray_morton_order(ny, nz):
+    """Z-order permutation of the ``ny*nz`` rays indexed ``j*nz + k``."""
+    j = np.repeat(np.arange(ny), nz)
+    k = np.tile(np.arange(nz), ny)
+    return np.argsort(_part1by1(j) | (_part1by1(k) << 1), kind="stable")
+
+
+def _parity_inside(tris, origin, dx, counts, offset, ray_chunk=2048):
     """Inside mask on the sample lattice origin + (index + offset) * dx.
 
-    Casts one +x ray per (j, k) lattice column, intersects it with every
-    triangle via 2D barycentrics in the yz-plane, histograms the crossing
+    Casts one +x ray per (j, k) lattice column, intersects it with the
+    triangles via 2D barycentrics in the yz-plane, histograms the crossing
     x-positions into lattice bins, and takes the running-parity cumsum.
     Ray origins carry a fixed sub-cell jitter so edge/vertex grazing hits
     (which would double-count) have measure zero.
+
+    Rays are processed along a 2-D Z-order (Morton) curve so each chunk is a
+    compact yz region; triangles whose yz bounding box misses that region are
+    prefiltered out. A ray outside a triangle's yz box cannot lie inside its
+    yz projection, so the crossing histogram — and therefore the parity — is
+    identical to testing every ray against every triangle, at a fraction of the
+    cost (each ray really only meets a handful of triangles).
     """
     nx, ny, nz = counts
     inside = np.zeros(counts, dtype=bool)
@@ -376,36 +399,50 @@ def _parity_inside(tris, origin, dx, counts, offset,
     ray_y = ray_y.ravel()
     ray_z = ray_z.ravel()
     n_rays = ray_y.shape[0]
+    order = _ray_morton_order(ny, nz)
+
+    # Per-triangle constants and yz bounding boxes, computed once.
+    ax, ay, az = tris[:, 0, 0], tris[:, 0, 1], tris[:, 0, 2]
+    by_a = tris[:, 1, 1] - ay
+    bz_a = tris[:, 1, 2] - az
+    cy_a = tris[:, 2, 1] - ay
+    cz_a = tris[:, 2, 2] - az
+    det = by_a * cz_a - bz_a * cy_a
+    ok_t = np.abs(det) > 1e-30
+    inv_det = np.where(ok_t, det, 1.0)
+    bx_a = tris[:, 1, 0] - ax
+    cx_a = tris[:, 2, 0] - ax
+    ty_min = tris[:, :, 1].min(axis=1)
+    ty_max = tris[:, :, 1].max(axis=1)
+    tz_min = tris[:, :, 2].min(axis=1)
+    tz_max = tris[:, :, 2].max(axis=1)
+
     hist = np.zeros((nx + 1, n_rays), dtype=np.int32)
-    for ts in range(0, len(tris), tri_chunk):
-        tri = tris[ts:ts + tri_chunk]
-        ax, ay, az = tri[:, 0, 0], tri[:, 0, 1], tri[:, 0, 2]
-        by_a = tri[:, 1, 1] - ay
-        bz_a = tri[:, 1, 2] - az
-        cy_a = tri[:, 2, 1] - ay
-        cz_a = tri[:, 2, 2] - az
-        det = by_a * cz_a - bz_a * cy_a
-        ok_t = np.abs(det) > 1e-30
-        inv_det = np.where(ok_t, det, 1.0)
-        bx_a = tri[:, 1, 0] - ax
-        cx_a = tri[:, 2, 0] - ax
-        for rs in range(0, n_rays, ray_chunk):
-            py = ray_y[rs:rs + ray_chunk, None] - ay[None, :]
-            pz = ray_z[rs:rs + ray_chunk, None] - az[None, :]
-            u = (py * cz_a[None, :] - pz * cy_a[None, :]) / inv_det[None, :]
-            v = (by_a[None, :] * pz - bz_a[None, :] * py) / inv_det[None, :]
-            hit = (ok_t[None, :] & (u >= 0.0) & (v >= 0.0)
-                   & (u + v <= 1.0))
-            if not hit.any():
-                continue
-            rid, tid = np.nonzero(hit)
-            x_hit = (ax[tid] + u[rid, tid] * bx_a[tid]
-                     + v[rid, tid] * cx_a[tid])
-            # First lattice sample strictly past the crossing.
-            i0 = np.floor((x_hit - origin[0]) / dx - offset[0]).astype(
-                np.int64) + 1
-            i0 = np.clip(i0, 0, nx)
-            np.add.at(hist, (i0, rid + rs), 1)
+    for rs in range(0, n_rays, ray_chunk):
+        rid = order[rs:rs + ray_chunk]
+        ry = ray_y[rid]
+        rz = ray_z[rid]
+        sel = ((ty_max >= ry.min()) & (ty_min <= ry.max())
+               & (tz_max >= rz.min()) & (tz_min <= rz.max()))
+        if not sel.any():
+            continue
+        stri = np.nonzero(sel)[0]
+        py = ry[:, None] - ay[None, sel]
+        pz = rz[:, None] - az[None, sel]
+        u = (py * cz_a[None, sel] - pz * cy_a[None, sel]) / inv_det[None, sel]
+        v = (by_a[None, sel] * pz - bz_a[None, sel] * py) / inv_det[None, sel]
+        hit = ok_t[None, sel] & (u >= 0.0) & (v >= 0.0) & (u + v <= 1.0)
+        if not hit.any():
+            continue
+        r_loc, t_loc = np.nonzero(hit)
+        tid = stri[t_loc]
+        x_hit = (ax[tid] + u[r_loc, t_loc] * bx_a[tid]
+                 + v[r_loc, t_loc] * cx_a[tid])
+        # First lattice sample strictly past the crossing.
+        i0 = np.floor((x_hit - origin[0]) / dx - offset[0]).astype(
+            np.int64) + 1
+        i0 = np.clip(i0, 0, nx)
+        np.add.at(hist, (i0, rid[r_loc]), 1)
     parity = (np.cumsum(hist[:nx], axis=0) % 2).astype(bool)
     return parity.reshape(nx, ny, nz)
 
