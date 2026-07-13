@@ -75,6 +75,64 @@ def diagonal(xp, kx, ky, kz, liquid):
     return diag * liquid
 
 
+def crop_to_active(xp, rhs, kx, ky, kz, liquid, *, min_gain=0.7):
+    """Restrict the linear system to the tight box around the active cells.
+
+    Returns ``((rhs, kx, ky, kz, liquid), scatter)`` cropped to the active
+    bounding box padded by a one-cell inactive halo, or ``None`` when nothing is
+    active or the box is not enough smaller than the full grid to be worth it.
+
+    The cropped system is *the same discretization* as the full grid: the halo
+    cells are inactive (``liquid`` False), so ``apply_laplacian``'s exterior
+    Dirichlet terms multiply by a zero pressure there and every active cell sees
+    its true neighbours through the sliced (unchanged) face coefficients.  Where
+    the box meets a real domain boundary the halo is clamped away, preserving the
+    genuine ``p = 0`` open-boundary faces.  The set of active cells and their
+    residual are therefore unchanged, so the outer CG's ``rel <= tol`` contract
+    still holds for the scattered pressure; the only difference from the
+    full-grid solve is the floating-point summation order of the reductions,
+    which perturbs the result at the float32 rounding level (far below ``tol``).
+
+    This is the safe first step toward a fully tiled sparse grid (see
+    docs/design/tiled-sparse-grid.md): it skips work on empty regions without
+    changing the discretization or the accuracy contract.
+    """
+    nx, ny, nz = liquid.shape
+
+    def span(axis):
+        other = tuple(a for a in (0, 1, 2) if a != axis)
+        present = liquid.any(axis=other)
+        if not bool(present.any()):
+            return None
+        lo = int(xp.argmax(present))
+        hi = present.shape[0] - int(xp.argmax(present[::-1]))   # exclusive
+        n = liquid.shape[axis]
+        return max(0, lo - 1), min(n, hi + 1)
+
+    sx, sy, sz = span(0), span(1), span(2)
+    if sx is None or sy is None or sz is None:
+        return None
+    (ax0, ax1), (ay0, ay1), (az0, az1) = sx, sy, sz
+    cropped_cells = (ax1 - ax0) * (ay1 - ay0) * (az1 - az0)
+    if cropped_cells > min_gain * (nx * ny * nz):
+        return None
+
+    parts = (
+        rhs[ax0:ax1, ay0:ay1, az0:az1],
+        kx[ax0:ax1 + 1, ay0:ay1, az0:az1],
+        ky[ax0:ax1, ay0:ay1 + 1, az0:az1],
+        kz[ax0:ax1, ay0:ay1, az0:az1 + 1],
+        liquid[ax0:ax1, ay0:ay1, az0:az1],
+    )
+
+    def scatter(sub_p):
+        full = xp.zeros((nx, ny, nz), dtype=sub_p.dtype)
+        full[ax0:ax1, ay0:ay1, az0:az1] = sub_p
+        return full
+
+    return parts, scatter
+
+
 def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400,
           check_every=8):
     """Jacobi-preconditioned CG.  Returns (p, iterations, rel_residual).
@@ -87,6 +145,14 @@ def solve(xp, rhs, kx, ky, kz, liquid, tol=1e-4, max_iter=400,
     CuPy Windows wheels do not bundle).
     """
     import math
+
+    cropped = crop_to_active(xp, rhs, kx, ky, kz, liquid)
+    if cropped is not None:
+        (r2, kx2, ky2, kz2, l2), scatter = cropped
+        p2, iters, rel = solve(
+            xp, r2, kx2, ky2, kz2, l2, tol=tol, max_iter=max_iter,
+            check_every=check_every)
+        return scatter(p2), iters, rel
 
     diag = diagonal(xp, kx, ky, kz, liquid)
     # Cells with an empty row (isolated by solids) cannot be solved for.

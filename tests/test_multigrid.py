@@ -158,6 +158,66 @@ def test_params_reject_unknown_pressure_solver():
         Params(resolution=(8, 8, 8), dx=0.1, pressure_solver="banana")
 
 
+def _localized_problem(n=48, *, touch_boundary=False, seed=0):
+    rng = np.random.default_rng(seed)
+    kx = rng.uniform(0.5, 2.0, (n + 1, n, n)).astype(np.float32)
+    ky = rng.uniform(0.5, 2.0, (n, n + 1, n)).astype(np.float32)
+    kz = rng.uniform(0.5, 2.0, (n, n, n + 1)).astype(np.float32)
+    liquid = np.zeros((n, n, n), bool)
+    if touch_boundary:
+        liquid[0:10, 0:10, 0:10] = True           # active at a real domain corner
+    else:
+        liquid[20:30, 18:34, 22:33] = True         # interior blob, no boundary
+    rhs = (rng.standard_normal((n, n, n)).astype(np.float32)) * liquid
+    return rhs, kx, ky, kz, liquid
+
+
+def test_crop_returns_none_when_not_worthwhile():
+    from stflip import pressure
+    # Whole grid active -> cropping saves nothing.
+    _, kx, ky, kz, _ = _localized_problem(16)
+    full = np.ones((16, 16, 16), bool)
+    rhs = np.ones((16, 16, 16), np.float32)
+    assert pressure.crop_to_active(np, rhs, kx, ky, kz, full) is None
+    # Nothing active -> nothing to crop.
+    dead = np.zeros((16, 16, 16), bool)
+    assert pressure.crop_to_active(np, rhs, kx, ky, kz, dead) is None
+
+
+@pytest.mark.parametrize("touch_boundary", [False, True])
+@pytest.mark.parametrize("solver", ["jacobi", "multigrid"])
+def test_active_crop_matches_full_grid_within_tolerance(monkeypatch, solver,
+                                                        touch_boundary):
+    """Cropping to the active box must not change the discretization: the
+    cropped solve agrees with the full-grid solve to the float32 rounding
+    level, both for interior and domain-boundary-touching regions."""
+    from stflip import pressure
+    solve = multigrid.solve if solver == "multigrid" else pressure.solve
+    rhs, kx, ky, kz, liquid = _localized_problem(
+        48, touch_boundary=touch_boundary, seed=1)
+
+    p_crop, _, rel_crop = solve(np, rhs, kx, ky, kz, liquid, tol=1e-6,
+                                max_iter=800)
+
+    monkeypatch.setattr(pressure, "crop_to_active", lambda *a, **k: None)
+    p_full, _, _ = solve(np, rhs, kx, ky, kz, liquid, tol=1e-6, max_iter=800)
+
+    solvable = liquid & (pressure.diagonal(np, kx, ky, kz, liquid) > 0.0)
+    scale = float(np.abs(p_full[solvable]).max())
+    # Agreement far below the solve tolerance, and the cropped solve honours the
+    # residual contract on exactly the same active cells.
+    assert np.abs((p_crop - p_full) * solvable).max() <= 1e-4 * scale
+    assert rel_crop <= 1e-4
+    assert not np.any(p_crop[~solvable])            # inactive cells stay zero
+
+
+def test_active_crop_is_deterministic():
+    rhs, kx, ky, kz, liquid = _localized_problem(48, seed=2)
+    a = multigrid.solve(np, rhs, kx, ky, kz, liquid, tol=1e-6)[0]
+    b = multigrid.solve(np, rhs, kx, ky, kz, liquid, tol=1e-6)[0]
+    assert np.array_equal(a, b)
+
+
 @pytest.mark.gpu
 def test_multigrid_cpu_gpu_parity():
     from stflip.backend import get_backend

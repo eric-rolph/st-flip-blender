@@ -27,6 +27,12 @@ full settings table); the pages here walk you through *doing* things.
 7. **[Troubleshooting](troubleshooting.md)** — the failures you are most likely
    to hit, and how to fix each one.
 
+## Design notes
+
+- **[Tiled sparse grid](design/tiled-sparse-grid.md)** — the architecture for
+  true (billion-cell) sparsity, and the shipped bounding-box crop that is its
+  safe first increment.
+
 ## One-paragraph mental model
 
 ST-FLIP is a FLIP fluid solver built to take **large time steps** (high CFL).
