@@ -76,6 +76,70 @@ def test_multigrid_iteration_count_is_grid_independent():
     assert counts[64][1] < counts[64][0] / 3
 
 
+def _two_phase_jump_problem(n, *, ratio=800.0, config="bubble", seed=1):
+    """A PPE with a rho_l/rho_g coefficient jump like a two-phase solve.
+
+    Face coefficients are k_f = 1/rho_face with a HARMONIC face density, which
+    gives a sharp low-conductance barrier at the interface (the classic
+    high-contrast case that degrades a naive geometric multigrid). The top
+    (gas) boundary is opened to atmospheric p = 0 to make the system SPD.
+    """
+    gx, gy, gz = np.mgrid[0:n, 0:n, 0:n]
+    c = n / 2.0
+    if config == "flat":
+        liquid_cell = gz < n / 2
+    elif config == "film":                 # thin liquid sheet spanning the domain
+        liquid_cell = np.abs(gz - c) < 1.5
+    else:                                  # gas bubble inside liquid
+        liquid_cell = (gx - c) ** 2 + (gy - c) ** 2 + (gz - c) ** 2 > (n * 0.28) ** 2
+    k = 1.0 / np.where(liquid_cell, ratio, 1.0).astype(np.float64)
+
+    def face(axis):
+        if axis == 0:
+            a, b = k[1:, :, :], k[:-1, :, :]
+        elif axis == 1:
+            a, b = k[:, 1:, :], k[:, :-1, :]
+        else:
+            a, b = k[:, :, 1:], k[:, :, :-1]
+        return (2.0 * a * b / (a + b)).astype(np.float32)
+
+    kx = np.zeros((n + 1, n, n), np.float32)
+    ky = np.zeros((n, n + 1, n), np.float32)
+    kz = np.zeros((n, n, n + 1), np.float32)
+    kx[1:-1] = face(0)
+    ky[:, 1:-1] = face(1)
+    kz[:, :, 1:-1] = face(2)
+    kz[:, :, -1] = k[:, :, -1].astype(np.float32)          # open gas boundary
+    rhs = np.random.default_rng(seed).standard_normal((n, n, n)).astype(np.float32)
+    return rhs, kx, ky, kz, np.ones((n, n, n), bool)
+
+
+@pytest.mark.parametrize("ratio", [800.0, 1e4])
+@pytest.mark.parametrize("config", ["flat", "bubble", "film"])
+def test_multigrid_stays_grid_independent_at_two_phase_density_ratios(config, ratio):
+    """Issue #14: the variable-density PPE is severely ill-conditioned at
+    production density ratios (rho_l/rho_g ~ 800). Jacobi-PCG iterations balloon
+    with resolution; the multigrid-preconditioned count must stay flat and low.
+    This guards the coarsening against a future change that silently regresses
+    high-contrast robustness.
+    """
+    counts = {}
+    for n in (32, 64):
+        rhs, kx, ky, kz, liquid = _two_phase_jump_problem(
+            n, ratio=ratio, config=config)
+        _, jac, _ = pressure.solve(
+            np, rhs, kx, ky, kz, liquid, tol=1e-5, max_iter=3000)
+        _, mg, rel = multigrid.solve(
+            np, rhs, kx, ky, kz, liquid, tol=1e-5, max_iter=3000)
+        assert rel <= 1e-4, (config, ratio, n)          # actually converges
+        counts[n] = (jac, mg)
+    # Jacobi grows sharply with resolution; multigrid barely moves...
+    assert counts[64][0] > 1.5 * counts[32][0]
+    assert counts[64][1] <= counts[32][1] + 8
+    # ...and is an order of magnitude cheaper at the finer grid.
+    assert counts[64][1] < counts[64][0] / 4
+
+
 def test_small_grid_falls_back_to_jacobi_identically():
     # Below 2*min_size no coarsening is possible; the result must be bit-for-bit
     # the diagonal-preconditioned CG so tiny domains are never disadvantaged.

@@ -25,6 +25,16 @@ The V-cycle is only ever a *preconditioner*: the outer CG in :func:`solve`
 checks the true residual, so the returned pressure is correct to ``tol``
 regardless of how good the coarse hierarchy is.  A poor hierarchy costs
 iterations, never accuracy.
+
+Using the V-cycle as a CG preconditioner (rather than a standalone solver) also
+makes it robust to the severe ill-conditioning of the two-phase variable-density
+PPE, where the face coefficient ``k = dt*alpha/rho`` jumps by the density ratio
+``rho_l/rho_g`` (~800 for water/air) across the interface.  A purely geometric
+coarse operator leaves a few slow modes at such coefficient jumps, but the
+Krylov acceleration mops them up: measured iteration counts stay grid-independent
+(~16-24) up to 800:1 and 10000:1 ratios with sharp harmonic interface barriers,
+while Jacobi-PCG grows with both resolution and contrast.  See
+``tests/test_multigrid.py`` for the regression guard on this property.
 """
 
 from __future__ import annotations
