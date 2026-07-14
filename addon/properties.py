@@ -72,6 +72,9 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
              "Swirl about the object's local +Z axis through its origin"),
             ("TURBULENCE", "Turbulence",
              "Divergence-free curl noise for chaotic detail"),
+            ("CONFINEMENT", "Vorticity Confinement",
+             "Re-energize the flow's own swirls (liveliness look control; "
+             "injects energy, so keep it off when judging physics)"),
         ],
         default="TURBULENCE",
     )

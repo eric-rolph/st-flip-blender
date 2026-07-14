@@ -1186,13 +1186,24 @@ def resolve_force_field(settings, matrix_world, domain_origin, scene_seed,
     source_name = str(source_name)
     units = unit_boundary or SceneUnitBoundary()
     force_type = str(settings.force_type).strip().upper()
-    if force_type not in {"DIRECTIONAL", "VORTEX", "TURBULENCE"}:
+    if force_type not in {
+            "DIRECTIONAL", "VORTEX", "TURBULENCE", "CONFINEMENT"}:
         raise ValueError(
-            f"{source_name}: Force Type must be DIRECTIONAL, VORTEX, or "
-            "TURBULENCE"
+            f"{source_name}: Force Type must be DIRECTIONAL, VORTEX, "
+            "TURBULENCE, or CONFINEMENT"
         )
     strength = float(units.rna_acceleration_to_solver(_force_scalar(
         settings.force_strength, "Force Strength", source_name)).item())
+
+    if force_type == "CONFINEMENT":
+        # Confinement reads the flow's own vorticity; the force object's
+        # transform is irrelevant, only the strength matters.
+        force = {"force_type": force_type, "strength": strength}
+        return force, {
+            "name": source_name,
+            "force_type": force_type,
+            "strength": strength,
+        }
 
     try:
         matrix = np.asarray(matrix_world, dtype=np.float64)
