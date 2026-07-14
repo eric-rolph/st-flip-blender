@@ -376,6 +376,7 @@ class STFLIP_PT_display(bpy.types.Panel):
         else:
             paper = col.column(align=True)
             paper.prop(st, "paper_mcf_iterations")
+            paper.prop(st, "paper_calm_smoothing_iterations")
             paper.prop(st, "paper_mesh_adaptivity")
             paper.prop(st, "paper_max_reconstruction_voxels")
             paper.separator()
