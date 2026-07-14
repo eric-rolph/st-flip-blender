@@ -127,6 +127,14 @@ class Params:
     # (opt-in until the SAMP-M5 A/B passes); "cp_rot" is an experimental
     # Cranley-Patterson comparison arm, never a production choice.
     temporal_sampling: str = "pseudo"
+    # Jitter attenuation gate (roadmap CALM-M3).  "speed" is the paper's
+    # Sec 3.10 local-CFL gate, bit-exact with earlier releases.  "surface"
+    # ADDS an interiorness term (never subtracts) so deep-liquid and
+    # deep-gas particles keep full jitter; where local CFL ~ 0 the field
+    # is temporally constant and restored jitter has no aliasing to fight,
+    # so this tier is hygiene and uniform-stratification groundwork, not a
+    # quality claim -- a null visual result is expected and fine.
+    gamma_mode: str = "speed"
     cfl_local: float = 1.0            # advection sub-step bound
     seed: int = 0
 
@@ -253,6 +261,8 @@ class Params:
             raise ValueError(
                 "temporal_sampling must be 'pseudo', 'sobol_owen', "
                 "or 'cp_rot'")
+        if self.gamma_mode not in ("speed", "surface"):
+            raise ValueError("gamma_mode must be 'speed' or 'surface'")
         for name in ("two_phase", "sparse"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
@@ -364,6 +374,7 @@ class STFLIPSolver:
         # id-keyed sampling scheme.  Physics never reads them.
         self.particle_id = xp.zeros((0,), dtype=xp.int64)
         self._next_particle_id = 0
+        self._gamma_prev = None
         # Global substep counter, committed once per completed substep.
         self._substep_index = 0
 
@@ -486,7 +497,7 @@ class STFLIPSolver:
         without a discontinuity at the resume frame. ``C`` keeps its live shape:
         (N, 3, 3) under APIC, or (0, 3, 3) otherwise.
         """
-        return {
+        state = {
             "pos": np.array(
                 self.be.to_numpy(self.pos), dtype=np.float32, order="C",
                 copy=True),
@@ -522,6 +533,17 @@ class STFLIPSolver:
             "next_particle_id": int(self._next_particle_id),
             "substep_index": int(self._substep_index),
         }
+        if (self.p.gamma_mode == "surface" and self.p.exact_temporal_norm
+                and self._gamma_prev is not None
+                and self._gamma_prev.shape[0] == self.pos.shape[0]):
+            # Surface-mode exact normalization keys on the draw-time gamma,
+            # whose interiorness input no longer exists after the substep;
+            # persist it via the mode-gated optional checkpoint member
+            # reserved in the SAMP-M1 schema bump.
+            state["gamma_prev"] = np.array(
+                self.be.to_numpy(self._gamma_prev), dtype=np.float32,
+                order="C", copy=True)
+        return state
 
     def restore_state(self, state: dict) -> None:
         """Strictly restore a snapshot into this configured solver instance.
@@ -538,6 +560,7 @@ class STFLIPSolver:
         optional = {
             "phase", "C", "age", "source_id",
             "particle_id", "next_particle_id", "substep_index",
+            "gamma_prev",
         }
         if (not isinstance(state, dict)
                 or not required <= set(state)
@@ -642,6 +665,14 @@ class STFLIPSolver:
                 raise ValueError("checkpoint source_id must be non-negative")
             source_restore = self.be.from_numpy(
                 np.array(source_np, dtype=np.int32, order="C", copy=True))
+        gamma_prev_restore = None
+        if "gamma_prev" in state:
+            gamma_np = particle_array("gamma_prev", (count,))
+            if gamma_np.size and (
+                    float(gamma_np.min()) < 0.0
+                    or float(gamma_np.max()) > 1.0):
+                raise ValueError("checkpoint gamma_prev must lie in [0, 1]")
+            gamma_prev_restore = self.be.from_numpy(gamma_np)
         particle_id_restore = None
         next_particle_id = None
         if "particle_id" in state:
@@ -724,6 +755,7 @@ class STFLIPSolver:
             self.particle_id = xp.arange(count, dtype=xp.int64)
             self._next_particle_id = count
         self._substep_index = int(substep_index)
+        self._gamma_prev = gamma_prev_restore
         self.time = time_value
         self._dt_prev = dt_prev
         self._rng = restored_rng
@@ -1142,7 +1174,7 @@ class STFLIPSolver:
 
     # ------------------------------------------------------------- deposition
 
-    def _jitter_gamma(self, dt: float):
+    def _jitter_gamma(self, dt: float, phi_gate=None):
         """Per-particle jitter strength gamma_p in [0, 1] (Eq. 10, Sec 3.10).
 
         Called at the jitter draw (end of a substep, with that substep's dt)
@@ -1160,7 +1192,17 @@ class STFLIPSolver:
             (self.pos.shape[0],), dtype=xp.float32)
         if p.adaptive_gamma:
             local_cfl = _norm_rows(xp, self.vel) * dt / p.dx
-            gamma = gamma * kernels.smoothstep(xp, 0.0, 1.0, local_cfl)
+            gate = kernels.smoothstep(xp, 0.0, 1.0, local_cfl)
+            if phi_gate is not None:
+                # Surface mode (CALM-M3): interiorness ADDS to the speed
+                # gate and is clipped, so it can only restore jitter, never
+                # remove it.  phi_gate has solid-occluded cells forced to
+                # one so wall-adjacent bulk behaves like deep bulk.
+                interior = kernels.smoothstep(
+                    xp, 0.85, 0.98,
+                    self._sample_cells(phi_gate, self.pos))
+                gate = xp.clip(gate + interior, 0.0, 1.0)
+            gamma = gamma * gate
         return gamma
 
     def _calibrate_m0(self) -> float:
@@ -1203,8 +1245,26 @@ class STFLIPSolver:
                 # the up-to-3.9-percent phi_st depression on attenuated calm
                 # surfaces.  gamma_p is recomputed from unmodified state; see
                 # the draw-site contract comment.
-                wt = wt / kernels.w_temporal_mean(
-                    xp, self._jitter_gamma(dt_prev))
+                if p.gamma_mode == "surface":
+                    # Surface-mode gamma was persisted at the draw (the
+                    # interiorness input no longer exists).  Fresh-seeded
+                    # particles that never drew get the full-jitter divisor
+                    # for exactly one substep: bounded in [1, 1024/945],
+                    # self-healing after their first draw.
+                    gamma = self._gamma_prev
+                    n_now = theta.shape[0]
+                    if gamma is None:
+                        gamma = xp.full(
+                            (n_now,), p.jitter_strength, dtype=xp.float32)
+                    elif gamma.shape[0] < n_now:
+                        gamma = xp.concatenate([gamma, xp.full(
+                            (n_now - gamma.shape[0],), p.jitter_strength,
+                            dtype=xp.float32)])
+                    elif gamma.shape[0] > n_now:
+                        gamma = gamma[:n_now]
+                else:
+                    gamma = self._jitter_gamma(dt_prev)
+                wt = wt / kernels.w_temporal_mean(xp, gamma)
             wt = wt.astype(xp.float32)
         else:
             wt = xp.ones_like(theta)
@@ -1570,6 +1630,9 @@ class STFLIPSolver:
         self.age = self.age[keep]
         self.source_id = self.source_id[keep]
         self.particle_id = self.particle_id[keep]
+        if (self._gamma_prev is not None
+                and self._gamma_prev.shape[0] == keep.shape[0]):
+            self._gamma_prev = self._gamma_prev[keep]
         if stats is not None:
             stats.volume_outflow_removed += volume_count
             stats.pressure_outflow_removed += pressure_count
@@ -2402,8 +2465,17 @@ class STFLIPSolver:
             # the committed dt reproduces this gamma exactly at deposit
             # time.  The exact temporal normalization (Sec 3.10, roadmap
             # NORM-M1) relies on that; changes to the step tail must
-            # preserve it or persist gamma instead.
-            gamma = self._jitter_gamma(dt)
+            # preserve it or persist gamma instead.  Surface mode DOES
+            # persist it: the interiorness term reads this substep's
+            # c_phi, which next substep's P2G cannot reproduce.
+            if p.gamma_mode == "surface":
+                phi_gate = xp.where(
+                    solid_c, xp.float32(1.0), grids["c_phi"])
+                gamma = self._jitter_gamma(dt, phi_gate)
+                if p.exact_temporal_norm:
+                    self._gamma_prev = gamma
+            else:
+                gamma = self._jitter_gamma(dt)
             if p.temporal_sampling == "sobol_owen":
                 xi = sampling.temporal_xi(
                     xp, self.particle_id, self._substep_index, p.seed)
