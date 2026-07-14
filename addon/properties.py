@@ -295,6 +295,20 @@ class STFLIPSettings(bpy.types.PropertyGroup):
                     "disables. "
                     "Small-scale effect; needs high resolution (paper Sec 3.9)",
     )
+    st_clamp_scale: FloatProperty(
+        name="Capillary Clamp Scale", default=1.0, min=1.0, max=16.0,
+        description="Relax the surface-tension time-step clamp by this "
+                    "factor. 1 = paper-faithful stability limit; 2-4 trades "
+                    "capillary accuracy for fewer substeps (pair with the "
+                    "Kick Limiter). Higher values risk interface chatter",
+    )
+    st_max_dv_cells: FloatProperty(
+        name="Capillary Kick Limiter", default=0.0, min=0.0, soft_max=2.0,
+        description="Clip the surface-tension kick so one substep displaces "
+                    "at most this many cells. 0 disables. Keeps a relaxed "
+                    "clamp from blowing up; may leave bounded grid-scale "
+                    "chatter on calm surfaces instead",
+    )
     viscosity: FloatProperty(
         name="Viscosity", default=0.0, min=0.0, soft_max=1.0, precision=4,
         description="Physical kinematic viscosity in m^2/s. 0 = inviscid; "

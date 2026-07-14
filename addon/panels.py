@@ -228,6 +228,10 @@ class STFLIP_PT_solver(bpy.types.Panel):
         gas.prop(st, "rho_gas")
         gas.prop(st, "gas_particles_per_cell")
         layout.prop(st, "surface_tension")
+        capillary = layout.column(align=True)
+        capillary.enabled = st.surface_tension > 0.0
+        capillary.prop(st, "st_clamp_scale")
+        capillary.prop(st, "st_max_dv_cells")
         layout.prop(st, "viscosity")
         layout.prop(st, "sheeting")
         layout.prop(st, "sparse")
