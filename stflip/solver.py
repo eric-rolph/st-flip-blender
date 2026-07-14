@@ -955,15 +955,18 @@ class STFLIPSolver:
         """Register an art-directable body force applied like gravity.
 
         ``force_type`` is 'DIRECTIONAL' (wind along ``direction``), 'VORTEX'
-        (swirl about ``axis`` through ``center`` with ``radius`` falloff), or
-        'TURBULENCE' (divergence-free curl noise of wavelength ``scale``).
+        (swirl about ``axis`` through ``center`` with ``radius`` falloff),
+        'TURBULENCE' (divergence-free curl noise of wavelength ``scale``), or
+        'CONFINEMENT' (vorticity confinement -- re-energizes existing swirls
+        from the flow's own vorticity; a look control that injects energy).
         ``strength`` is the acceleration magnitude. ``center`` is solver-local;
         ``direction`` and ``axis`` are normalized world-oriented vectors.
         """
         ft = str(force_type).strip().upper()
-        if ft not in {"DIRECTIONAL", "VORTEX", "TURBULENCE"}:
+        if ft not in {"DIRECTIONAL", "VORTEX", "TURBULENCE", "CONFINEMENT"}:
             raise ValueError(
-                "force_type must be DIRECTIONAL, VORTEX, or TURBULENCE")
+                "force_type must be DIRECTIONAL, VORTEX, TURBULENCE, "
+                "or CONFINEMENT")
         if not math.isfinite(float(strength)):
             raise ValueError("force strength must be finite")
         self._forces.append({
@@ -991,6 +994,9 @@ class STFLIPSolver:
                 a = forces.vortex_accel(
                     xp, self.shape, self.p.dx, f["center"], f["axis"],
                     f["strength"], f["radius"], origin)
+            elif ft == "CONFINEMENT":
+                a = forces.confinement_accel(
+                    xp, self.p.dx, grids, f["strength"])
             else:
                 a = forces.turbulence_accel(
                     xp, self.shape, self.p.dx, f["strength"], f["scale"],

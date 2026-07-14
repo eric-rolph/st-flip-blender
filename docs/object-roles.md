@@ -80,6 +80,8 @@ guide; its geometry is not voxelized. Set **Force Type**:
 - **Vortex** — swirl about the object's +Z axis, within a **radius**.
 - **Turbulence** — divergence-free curl-noise for chop and churn, with a
   spatial **scale**.
+- **Vorticity Confinement** — a liveliness dial that re-energizes the
+  flow's own swirls where large time steps and transfers smooth them away.
 
 Directional uses local **+Z**. Vortex uses the origin as its centre and local
 **+Z** as its axis. **Strength** scales the effect.
@@ -87,6 +89,13 @@ Directional uses local **+Z**. Vortex uses the origin as its centre and local
 Turbulence is domain-wide and uses **Strength**, **Scale**, and the simulation
 seed; the guide transform does not localize it. Forces are how the *Stormy
 Pool* preset gets its agitation.
+
+Vorticity Confinement is also domain-wide (the guide transform is ignored)
+and reads only **Strength**. Be aware of what it is: it *injects* energy to
+counteract the look of numerical dissipation, it does not restore the energy
+physics lost — so keep it off when comparing solver settings or judging
+physical accuracy, and dial it in as a final look pass. Accelerations are
+capped at ten gravities per cell, so any slider value is safe.
 
 ## How roles combine
 

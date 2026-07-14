@@ -25,6 +25,8 @@ import math
 
 import numpy as np
 
+from .surface_tension import smooth_phase
+
 
 def _solver_local_coords(xp, shape, dx, origin):
     nx, ny, nz = shape
@@ -117,3 +119,44 @@ def turbulence_accel(xp, shape, dx, strength, scale, time, seed, origin,
     out[..., 1] = dpx_dz - dpz_dx
     out[..., 2] = dpy_dx - dpx_dy
     return out
+
+
+def confinement_accel(xp, dx, grids, strength, clamp=98.1, smooth_iters=1):
+    """Vorticity confinement (Fedkiw et al. 2001): ``a = eps*dx*(N x omega)``.
+
+    Re-energizes swirls that transfers and coarse grids smooth away.  This
+    INJECTS energy: it counteracts the LOOK of dissipation and is not a
+    conservation fix, so it must stay OFF in validation and decision runs
+    (roadmap ENER-M1, Decision 6c).  The acceleration is restricted to
+    liquid cells (``c_phi >= 0.5``) and magnitude-clamped per cell (default
+    ten gravities) so any slider value stays unconditionally safe.
+    """
+
+    if strength == 0.0:
+        return None
+    u = 0.5 * (grids["u"][1:, :, :] + grids["u"][:-1, :, :])
+    v = 0.5 * (grids["v"][:, 1:, :] + grids["v"][:, :-1, :])
+    w = 0.5 * (grids["w"][:, :, 1:] + grids["w"][:, :, :-1])
+    ox = xp.gradient(w, dx, axis=1) - xp.gradient(v, dx, axis=2)
+    oy = xp.gradient(u, dx, axis=2) - xp.gradient(w, dx, axis=0)
+    oz = xp.gradient(v, dx, axis=0) - xp.gradient(u, dx, axis=1)
+    if smooth_iters > 0:
+        # One binomial pass per component tames Monte-Carlo-noise-driven
+        # vorticity-magnitude gradients before they are differentiated again.
+        ox = smooth_phase(xp, ox, smooth_iters)
+        oy = smooth_phase(xp, oy, smooth_iters)
+        oz = smooth_phase(xp, oz, smooth_iters)
+    mag = xp.sqrt(ox * ox + oy * oy + oz * oz)
+    gx = xp.gradient(mag, dx, axis=0)
+    gy = xp.gradient(mag, dx, axis=1)
+    gz = xp.gradient(mag, dx, axis=2)
+    norm = xp.maximum(xp.sqrt(gx * gx + gy * gy + gz * gz), 1e-12)
+    nhat_x, nhat_y, nhat_z = gx / norm, gy / norm, gz / norm
+    ax = strength * dx * (nhat_y * oz - nhat_z * oy)
+    ay = strength * dx * (nhat_z * ox - nhat_x * oz)
+    az = strength * dx * (nhat_x * oy - nhat_y * ox)
+    liquid = grids["c_phi"] >= 0.5
+    out = xp.stack([ax, ay, az], axis=-1) * liquid[..., None]
+    amag = xp.sqrt((out * out).sum(axis=-1))
+    scale = xp.minimum(1.0, clamp / xp.maximum(amag, 1e-12))
+    return (out * scale[..., None]).astype(xp.float32)
