@@ -2041,6 +2041,143 @@ class STFLIPSolver:
 
     # ------------------------------------------------------------------- step
 
+    def _project(self, grids, dt, stats, alpha, open_faces, solid_vel,
+                 inv_rho, active) -> None:
+        """Pressure-project grids[u/v/w] in place (Eq. 14-16).
+
+        The projected velocity is invariant to the ``dt`` used here: the
+        pressure scales as 1/dt, the PPE coefficients as dt, and the
+        correction as dt, so dt cancels in the corrected velocity.  This
+        makes the method reusable for a second projection within one substep
+        (advection-reflection, roadmap ENER-M2b) without recalibration.
+        """
+
+        xp = self.be.xp
+        p = self.p
+        alpha_u, alpha_v, alpha_w = alpha
+        open_u, open_v, open_w = open_faces
+        us_sol, vs_sol, ws_sol = solid_vel
+        inv_rho_u, inv_rho_v, inv_rho_w = inv_rho
+
+        # PPE coefficients are aperture-weighted, while the velocity update
+        # itself is not: k_f = dt * alpha_f / rho_f, followed by
+        # u_f <- u_f - dt/rho_f * grad(p) on every alpha_f > 0 face.
+        kx = dt * alpha_u * inv_rho_u
+        ky = dt * alpha_v * inv_rho_v
+        kz = dt * alpha_w * inv_rho_w
+
+        div = apertures.weighted_divergence(
+            grids["u"], grids["v"], grids["w"],
+            alpha_u, alpha_v, alpha_w, p.dx, array_module=xp,
+        )
+        if self.solid_vel is not None:
+            # Moving-wall flux: the blocked fraction (1 - alpha) of each face
+            # carries the solid velocity, so its divergence enters the RHS.
+            div = div + apertures.weighted_divergence(
+                us_sol, vs_sol, ws_sol,
+                1.0 - alpha_u, 1.0 - alpha_v, 1.0 - alpha_w, p.dx,
+                array_module=xp,
+            )
+
+        # Solve sum_f k_f (p_c - p_nb)/dx^2 = -(div u*)_c on active cells.
+        rhs = -(div) * active
+        kx2, ky2, kz2 = kx / p.dx**2, ky / p.dx**2, kz / p.dx**2
+        ppe_solve = (
+            multigrid.solve if p.pressure_solver == "multigrid"
+            else pressure.solve)
+        pr, iters, rel = ppe_solve(
+            xp, rhs, kx2, ky2, kz2, active, tol=p.pcg_tol,
+            max_iter=p.pcg_max_iter)
+        stats.pcg_iters.append(iters)
+        stats.pcg_rel_residuals.append(rel)
+        if not math.isfinite(rel) or rel > p.pcg_tol:
+            raise pressure.PressureSolveError(iters, rel, p.pcg_tol)
+
+        pm = pr * active
+        gradx = (pm[1:, :, :] - pm[:-1, :, :]) / p.dx
+        correction = dt * inv_rho_u[1:-1, :, :] * gradx
+        grids["u"][1:-1, :, :] -= xp.where(
+            open_u[1:-1, :, :], correction, 0.0)
+        grady = (pm[:, 1:, :] - pm[:, :-1, :]) / p.dx
+        correction = dt * inv_rho_v[:, 1:-1, :] * grady
+        grids["v"][:, 1:-1, :] -= xp.where(
+            open_v[:, 1:-1, :], correction, 0.0)
+        gradz = (pm[:, :, 1:] - pm[:, :, :-1]) / p.dx
+        correction = dt * inv_rho_w[:, :, 1:-1] * gradz
+        grids["w"][:, :, 1:-1] -= xp.where(
+            open_w[:, :, 1:-1], correction, 0.0)
+
+        if self._has_pressure_outflow:
+            # Exterior pressure-outflow faces place p=0 half a cell from the
+            # adjacent cell centre. The factor two matches the half-cell
+            # pressure gradient and the boundary terms in pressure.py.
+            pressure_u, pressure_v, pressure_w = self._pressure_face_masks()
+            grids["u"][0] -= xp.where(
+                pressure_u[0],
+                dt * inv_rho_u[0] * (2.0 * pm[0] / p.dx),
+                0.0,
+            )
+            grids["u"][-1] -= xp.where(
+                pressure_u[-1],
+                dt * inv_rho_u[-1] * (-2.0 * pm[-1] / p.dx),
+                0.0,
+            )
+            grids["v"][:, 0] -= xp.where(
+                pressure_v[:, 0],
+                dt * inv_rho_v[:, 0] * (2.0 * pm[:, 0] / p.dx),
+                0.0,
+            )
+            grids["v"][:, -1] -= xp.where(
+                pressure_v[:, -1],
+                dt * inv_rho_v[:, -1] * (-2.0 * pm[:, -1] / p.dx),
+                0.0,
+            )
+            grids["w"][:, :, 0] -= xp.where(
+                pressure_w[:, :, 0],
+                dt * inv_rho_w[:, :, 0] * (2.0 * pm[:, :, 0] / p.dx),
+                0.0,
+            )
+            grids["w"][:, :, -1] -= xp.where(
+                pressure_w[:, :, -1],
+                dt * inv_rho_w[:, :, -1] * (-2.0 * pm[:, :, -1] / p.dx),
+                0.0,
+            )
+
+        grids["u"] = xp.where(open_u, grids["u"], us_sol)
+        grids["v"] = xp.where(open_v, grids["v"], vs_sol)
+        grids["w"] = xp.where(open_w, grids["w"], ws_sol)
+
+    def _extrapolate_valid_faces(self, grids, old, open_faces, solid_vel,
+                                 layers: int) -> None:
+        """Extrapolate grids (and the FLIP baseline) into invalid faces.
+
+        Jittered advection can move a particle up to 2*dt, i.e. 2*CFL cells,
+        so the band must cover that worst case.  The saved pre-force field
+        ``old`` (None for PIC/APIC transfers) is extrapolated with the SAME
+        mask: forming the FLIP delta between an extrapolated new field and
+        hard zeros would hand isolated spray particles their neighbours'
+        full velocity as a spurious energy kick (temporal weights can
+        invalidate all of a particle's own faces when theta lands in the
+        kernel's zero tail).
+        """
+
+        xp = self.be.xp
+        open_u, open_v, open_w = open_faces
+        us_sol, vs_sol, ws_sol = solid_vel
+        for gname, face_open, sfv in (
+            ("u", open_u, us_sol), ("v", open_v, vs_sol),
+            ("w", open_w, ws_sol),
+        ):
+            valid = grids[gname + "_valid"] & face_open
+            grids[gname], _ = self._extrapolate(
+                grids[gname], valid, layers, allowed=face_open)
+            # Re-enforce no-through defensively after extrapolation.
+            grids[gname] = xp.where(face_open, grids[gname], sfv)
+            if old is not None:
+                old[gname], _ = self._extrapolate(
+                    old[gname], valid, layers, allowed=face_open)
+                old[gname] = xp.where(face_open, old[gname], sfv)
+
     def _step(self, dt: float, stats: FrameStats) -> None:
         if self._sparse_engaged() and self.pos.shape[0]:
             xp = self.be.xp
@@ -2151,116 +2288,22 @@ class STFLIPSolver:
         grids["v"] = xp.where(open_v, grids["v"], vs_sol)
         grids["w"] = xp.where(open_w, grids["w"], ws_sol)
 
-        # PPE coefficients are aperture-weighted, while the velocity update
-        # itself is not: k_f = dt * alpha_f / rho_f, followed by
-        # u_f <- u_f - dt/rho_f * grad(p) on every alpha_f > 0 face.
-        kx = dt * alpha_u * inv_rho_u
-        ky = dt * alpha_v * inv_rho_v
-        kz = dt * alpha_w * inv_rho_w
-
-        div = apertures.weighted_divergence(
-            grids["u"], grids["v"], grids["w"],
-            alpha_u, alpha_v, alpha_w, p.dx, array_module=xp,
+        self._project(
+            grids, dt, stats,
+            (alpha_u, alpha_v, alpha_w),
+            (open_u, open_v, open_w),
+            (us_sol, vs_sol, ws_sol),
+            (inv_rho_u, inv_rho_v, inv_rho_w),
+            active,
         )
-        if self.solid_vel is not None:
-            # Moving-wall flux: the blocked fraction (1 - alpha) of each face
-            # carries the solid velocity, so its divergence enters the RHS.
-            div = div + apertures.weighted_divergence(
-                us_sol, vs_sol, ws_sol,
-                1.0 - alpha_u, 1.0 - alpha_v, 1.0 - alpha_w, p.dx,
-                array_module=xp,
-            )
 
-        # Solve sum_f k_f (p_c - p_nb)/dx^2 = -(div u*)_c on active cells.
-        rhs = -(div) * active
-        kx2, ky2, kz2 = kx / p.dx**2, ky / p.dx**2, kz / p.dx**2
-        ppe_solve = (
-            multigrid.solve if p.pressure_solver == "multigrid"
-            else pressure.solve)
-        pr, iters, rel = ppe_solve(
-            xp, rhs, kx2, ky2, kz2, active, tol=p.pcg_tol,
-            max_iter=p.pcg_max_iter)
-        stats.pcg_iters.append(iters)
-        stats.pcg_rel_residuals.append(rel)
-        if not math.isfinite(rel) or rel > p.pcg_tol:
-            raise pressure.PressureSolveError(iters, rel, p.pcg_tol)
-
-        pm = pr * active
-        gradx = (pm[1:, :, :] - pm[:-1, :, :]) / p.dx
-        correction = dt * inv_rho_u[1:-1, :, :] * gradx
-        grids["u"][1:-1, :, :] -= xp.where(
-            open_u[1:-1, :, :], correction, 0.0)
-        grady = (pm[:, 1:, :] - pm[:, :-1, :]) / p.dx
-        correction = dt * inv_rho_v[:, 1:-1, :] * grady
-        grids["v"][:, 1:-1, :] -= xp.where(
-            open_v[:, 1:-1, :], correction, 0.0)
-        gradz = (pm[:, :, 1:] - pm[:, :, :-1]) / p.dx
-        correction = dt * inv_rho_w[:, :, 1:-1] * gradz
-        grids["w"][:, :, 1:-1] -= xp.where(
-            open_w[:, :, 1:-1], correction, 0.0)
-
-        if self._has_pressure_outflow:
-            # Exterior pressure-outflow faces place p=0 half a cell from the
-            # adjacent cell centre. The factor two matches the half-cell
-            # pressure gradient and the boundary terms in pressure.py.
-            pressure_u, pressure_v, pressure_w = self._pressure_face_masks()
-            grids["u"][0] -= xp.where(
-                pressure_u[0],
-                dt * inv_rho_u[0] * (2.0 * pm[0] / p.dx),
-                0.0,
-            )
-            grids["u"][-1] -= xp.where(
-                pressure_u[-1],
-                dt * inv_rho_u[-1] * (-2.0 * pm[-1] / p.dx),
-                0.0,
-            )
-            grids["v"][:, 0] -= xp.where(
-                pressure_v[:, 0],
-                dt * inv_rho_v[:, 0] * (2.0 * pm[:, 0] / p.dx),
-                0.0,
-            )
-            grids["v"][:, -1] -= xp.where(
-                pressure_v[:, -1],
-                dt * inv_rho_v[:, -1] * (-2.0 * pm[:, -1] / p.dx),
-                0.0,
-            )
-            grids["w"][:, :, 0] -= xp.where(
-                pressure_w[:, :, 0],
-                dt * inv_rho_w[:, :, 0] * (2.0 * pm[:, :, 0] / p.dx),
-                0.0,
-            )
-            grids["w"][:, :, -1] -= xp.where(
-                pressure_w[:, :, -1],
-                dt * inv_rho_w[:, :, -1] * (-2.0 * pm[:, :, -1] / p.dx),
-                0.0,
-            )
-
-        grids["u"] = xp.where(open_u, grids["u"], us_sol)
-        grids["v"] = xp.where(open_v, grids["v"], vs_sol)
-        grids["w"] = xp.where(open_w, grids["w"], ws_sol)
-
-        # Extrapolate into under-sampled faces so advection sees a full
-        # field.  Jittered advection can move a particle up to 2*dt, i.e.
-        # 2*CFL cells, so the band must cover that worst case.  The saved
-        # pre-force field is extrapolated with the SAME mask: forming the
-        # FLIP delta between an extrapolated new field and hard zeros would
-        # hand isolated spray particles their neighbours' full velocity as
-        # a spurious energy kick (temporal weights can invalidate all of a
-        # particle's own faces when theta lands in the kernel's zero tail).
         layers = int(math.ceil(2.0 * p.cfl_target)) + 2
-        for gname, face_open, sfv in (
-            ("u", open_u, us_sol), ("v", open_v, vs_sol),
-            ("w", open_w, ws_sol),
-        ):
-            valid = grids[gname + "_valid"] & face_open
-            grids[gname], _ = self._extrapolate(
-                grids[gname], valid, layers, allowed=face_open)
-            # Re-enforce no-through defensively after extrapolation.
-            grids[gname] = xp.where(face_open, grids[gname], sfv)
-            if flip:
-                old[gname], _ = self._extrapolate(
-                    old[gname], valid, layers, allowed=face_open)
-                old[gname] = xp.where(face_open, old[gname], sfv)
+        self._extrapolate_valid_faces(
+            grids, old,
+            (open_u, open_v, open_w),
+            (us_sol, vs_sol, ws_sol),
+            layers,
+        )
 
         # G2P (Sec 3.9): FLIP/PIC blend, pure PIC, or APIC affine transfer.
         u_new = self._sample_faces(grids, self.pos)
