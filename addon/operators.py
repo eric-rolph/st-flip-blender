@@ -870,6 +870,8 @@ def _solver_params(settings, dims, dx, gravity, fps, unit_boundary=None):
         gas_particles_per_cell=settings.gas_particles_per_cell,
         surface_tension=units.surface_tension_si_to_solver(
             settings.surface_tension),
+        st_clamp_scale=settings.st_clamp_scale,
+        st_max_dv_cells=settings.st_max_dv_cells,
         viscosity=units.kinematic_viscosity_si_to_solver(settings.viscosity),
         sheeting=settings.sheeting,
         sparse=settings.sparse,

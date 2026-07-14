@@ -128,6 +128,18 @@ class Params:
     # --- Surface tension (Sec 3.9, CSF model) ----------------------------
     surface_tension: float = 0.0      # sigma (N/m); 0 disables the CSF force
     st_smooth_iters: int = 2          # B-spline smoothing passes for curvature
+    # Capillary clamp relaxation (roadmap CAP-M0).  Scales the Brackbill dt
+    # cap; above 1 the explicit CSF feedback is no longer provably stable,
+    # so pair modest scales (2-4) with the st_max_dv_cells limiter.  The
+    # clamp itself is never removed, only scaled by this bounded factor.
+    st_clamp_scale: float = 1.0       # 1 = paper-faithful Brackbill clamp
+    # Per-face limiter on the explicit CSF kick: the velocity change per
+    # substep is clipped so it can displace at most this many cells per
+    # step (dv_max = st_max_dv_cells * dx / dt).  0 disables the limiter.
+    # Above the Brackbill limit the clipped feedback saturates as bounded
+    # grid-scale interface chatter instead of blowing up -- robustness
+    # insurance, not accuracy.
+    st_max_dv_cells: float = 0.0
 
     # --- Viscosity (implicit diffusion) ----------------------------------
     viscosity: float = 0.0            # kinematic viscosity (dx^2/s); 0 = inviscid
@@ -235,6 +247,14 @@ class Params:
         if not math.isfinite(st) or st < 0.0:
             raise ValueError("surface_tension must be non-negative")
         self.surface_tension = st
+        clamp_scale = float(self.st_clamp_scale)
+        if not math.isfinite(clamp_scale) or not 1.0 <= clamp_scale <= 16.0:
+            raise ValueError("st_clamp_scale must lie in [1, 16]")
+        self.st_clamp_scale = clamp_scale
+        max_dv = float(self.st_max_dv_cells)
+        if not math.isfinite(max_dv) or max_dv < 0.0:
+            raise ValueError("st_max_dv_cells must be non-negative")
+        self.st_max_dv_cells = max_dv
         visc = float(self.viscosity)
         if not math.isfinite(visc) or visc < 0.0:
             raise ValueError("viscosity must be non-negative")
@@ -2013,9 +2033,20 @@ class STFLIPSolver:
             fv[:, 1:-1] = 0.5 * (F[:, 1:, :, 1] + F[:, :-1, :, 1])
             fw = xp.zeros_like(grids["w"])
             fw[:, :, 1:-1] = 0.5 * (F[:, :, 1:, 2] + F[:, :, :-1, 2])
-            grids["u"] = grids["u"] + dt * fu * inv_rho_u
-            grids["v"] = grids["v"] + dt * fv * inv_rho_v
-            grids["w"] = grids["w"] + dt * fw * inv_rho_w
+            ku = dt * fu * inv_rho_u
+            kv = dt * fv * inv_rho_v
+            kw = dt * fw * inv_rho_w
+            if p.st_max_dv_cells > 0.0:
+                # Clip the kick so one substep displaces at most
+                # st_max_dv_cells cells; above the Brackbill limit the
+                # explicit feedback then saturates instead of growing.
+                dv_max = p.st_max_dv_cells * p.dx / dt
+                ku = xp.clip(ku, -dv_max, dv_max)
+                kv = xp.clip(kv, -dv_max, dv_max)
+                kw = xp.clip(kw, -dv_max, dv_max)
+            grids["u"] = grids["u"] + ku
+            grids["v"] = grids["v"] + kv
+            grids["w"] = grids["w"] + kw
 
         # Implicit viscosity (Stam-style diffusion): unconditionally stable, so
         # it preserves large time steps for thick fluids.  Fully-blocked solid
@@ -2242,8 +2273,11 @@ class STFLIPSolver:
                 # tension caps dt at O(dx^{3/2}) independently of the velocity
                 # CFL (paper Sec 5), so large sigma and large CFL targets
                 # cannot be combined without this clamp blowing up the sim.
+                # st_clamp_scale (CAP-M0) relaxes the cap by a bounded user
+                # factor; it trades capillary accuracy/stability margin for
+                # substeps and is meant to pair with st_max_dv_cells.
                 rho_sum = p.rho + (p.rho_gas if p.two_phase else 0.0)
-                dt = min(dt, math.sqrt(
+                dt = min(dt, p.st_clamp_scale * math.sqrt(
                     rho_sum * p.dx ** 3
                     / (4.0 * math.pi * p.surface_tension)))
             # Subdivide the remaining frame time into even parts (Alg. 1 l.7).

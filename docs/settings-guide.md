@@ -87,6 +87,22 @@ energy) and density-gated, so it will not inflate the free surface. Try
 filaments. It is a *small-scale* effect and needs high resolution to show —
 don't expect droplets to bead on a coarse grid.
 
+Any σ > 0 also activates a capillary stability clamp on the time step
+(independent of Target CFL, and much stricter at fine resolution), so
+surface-tension scenes can quietly run many more substeps per frame than the
+CFL alone would need. Two dials trade capillary accuracy for that time back:
+
+- **Capillary Clamp Scale** relaxes the clamp by a bounded factor. 1 is the
+  paper-faithful stability limit; 2–4 is a reasonable robustness trade that
+  cuts clamp-bound substeps by the same factor. Above the true limit the
+  explicit force is no longer provably stable — pair anything over 1 with
+  the limiter below, and treat 8–16 as experimental.
+- **Capillary Kick Limiter** clips the per-substep surface-tension kick so it
+  can displace at most this many cells per step (0 disables). It converts a
+  potential blow-up into bounded, grid-scale interface chatter — robustness
+  insurance, not accuracy. If a calm surface shows persistent fine chatter
+  with a relaxed clamp, lower the Clamp Scale rather than the limiter.
+
 ## Pressure solver (speed at high resolution)
 
 **Pressure Solver** chooses the preconditioner for the pressure projection:
