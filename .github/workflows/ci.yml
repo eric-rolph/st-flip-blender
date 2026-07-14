@@ -36,7 +36,6 @@ jobs:
       BLENDER_ARCHIVE: blender-4.2.0-linux-x64.tar.xz
       BLENDER_SHA256: 4f4fd7646af01f6fee9d420408318381a6e52571268eb7cf9cd5033bd9e7a359
       BLENDER_URL: https://ftp.nluug.nl/pub/graphics/blender/release/Blender4.2/blender-4.2.0-linux-x64.tar.xz
-      BLENDER_USER_RESOURCES: ${{ runner.temp }}/stflip-blender-user
     steps:
       - uses: actions/checkout@v6
       - name: Cache pinned Blender runtime
@@ -62,6 +61,8 @@ jobs:
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - name: Install extension into isolated Blender profile
         shell: bash
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/stflip-blender-user
         run: |
           rm -rf "$BLENDER_USER_RESOURCES"
           mkdir -p "$BLENDER_USER_RESOURCES"
@@ -71,6 +72,8 @@ jobs:
             "${{ steps.extension.outputs.archive }}"
       - name: Run installed-extension CPU and OpenVDB smoke
         shell: bash
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/stflip-blender-user
         run: |
           .ci/blender-4.2.0-linux-x64/blender \
             --background --offline-mode --python-exit-code 1 \
