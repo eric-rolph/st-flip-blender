@@ -93,14 +93,11 @@ Python/NumPy/backend environment, not bitwise-determinism claims across
 hardware or numerical-library versions.
 
 The checked [three-seed CPU evidence artifact](https://github.com/eric-rolph/st-flip-blender/blob/main/validation/stflip_matched_cpu.json)
-is historical v0.7.0 evidence. It records revision `3b182277` from a dirty
-worktree, and its embedded source hashes do not match the current v0.23 series.
-
-Treat it as provenance, not validation of current main, until it is regenerated.
-
-In that artifact, every run reached observed particle CFL above 10.6. Mean
-Eq. 13 phase RMSE was `0.07880` for ST-FLIP versus `0.08574` for the
-instantaneous ablation (ratio `0.9191`, ST better in 3/3 seeds).
+was regenerated for v0.23.1 from clean implementation commit `84837bc`. Its
+embedded solver-source hashes match the release implementation. Every run
+reached observed particle CFL above 10.6. Mean Eq. 13 phase RMSE was `0.07880`
+for ST-FLIP versus `0.08574` for the instantaneous ablation (ratio `0.9191`,
+ST better in 3/3 seeds).
 
 Mean threshold-interface IoU was `0.92829` versus `0.92175` (ST better in 3/3).
 Raw deposited-mass RMSE was `0.23379` versus `0.23034` (ratio `1.0150`, ST
@@ -108,22 +105,17 @@ better in only 1/3), so that diagnostic remains inconclusive.
 
 ## Install
 
-The source tree currently identifies as v0.23.1.
+The current source and packaged release identify as v0.23.1.
 
-Until a matching release is published, the
-[latest public release](https://github.com/eric-rolph/st-flip-blender/releases/latest)
-is v0.11.0 and does not include all later features documented below.
-
-1. For the current v0.23-series source, clone the repository and build its
-   deterministic extension archive:
+1. Download `st_flip-<version>.zip` from the
+   [latest release](https://github.com/eric-rolph/st-flip-blender/releases/latest),
+   or clone the repository and build the same deterministic extension archive:
 
    ```bash
    python tools/build_extension.py
    ```
 
-   The archive is written to `dist/st_flip-<version>.zip`. To install the older
-   public v0.11.0 package instead, download its `st_flip-<version>.zip` asset
-   from the release page.
+   The archive is written to `dist/st_flip-<version>.zip`.
 
    Do not install a GitHub source ZIP directly. Its extra top-level folder and
    development files are not a valid Blender extension package layout.

@@ -3,12 +3,11 @@
 ## 1. Install the add-on
 
 ST-FLIP is a Blender **extension** for Blender 4.2+. This guide follows the
-current v0.23.1 source; the latest public package is still v0.11.0 and lacks
-features added later.
+current v0.23.1 release and source.
 
-Build current source or install the older release's `.zip` via *Edit →
-Preferences → Get Extensions → Install from Disk*. See the top-level
-[README](../README.md#install) for the exact choices.
+Download the packaged release or build current source, then install its `.zip`
+via *Edit → Preferences → Get Extensions → Install from Disk*. See the
+top-level [README](../README.md#install) for the exact choices.
 
 Finish resumable bakes before updating. Resume requires the same add-on version
 that created the checkpoint.
