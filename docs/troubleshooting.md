@@ -68,6 +68,16 @@ together. **FLIP** transfer preserves splash energy better than PIC.
 Lower the **FLIP Fraction** (more PIC smoothing) or switch **Transfer** to
 **APIC**. **Adaptive Attenuation** also calms flat surfaces.
 
+Since v0.29.0 the solver conditions each particle's temporal deposit weight
+on its own attenuation strength (paper Sec 3.10 calls this adaptation
+theoretically required but skips it; the error it accepted was up to 7.7
+percent of mean weight and 3.9 percent of the phase field on calm
+surfaces). The correction is exact math, costs under one percent, and is
+on by default; `Params.exact_temporal_norm = False` restores the
+paper-faithful legacy weighting for comparisons. Full-jitter runs are
+bit-identical either way. Upgrading invalidates resume of pre-0.29 bakes
+(any solver-parameter addition does); completed caches still play back.
+
 **Motion is too smooth / mushy.**
 The opposite: use **FLIP** with a high FLIP Fraction (0.95–0.98), and make sure
 Resolution is high enough to carry the detail.
