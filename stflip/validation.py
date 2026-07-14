@@ -25,8 +25,18 @@ import numpy as np
 
 from . import __version__, kernels
 from .backend import get_backend
-from .metrics import METRICS_SCHEMA, SCHEMA_VERSION, measure_frame
+from .metrics import (
+    METRICS_SCHEMA,
+    SCHEMA_VERSION,
+    height_map_stats,
+    measure_frame,
+    particle_height_map,
+    process_peak_memory_bytes,
+    surface_height_map,
+)
 from .solver import Params, STFLIPSolver
+from .surface import reconstruct_surface
+from .whitewater import Whitewater, WhitewaterParams
 
 
 VALIDATION_SCHEMA = "stflip.matched_ablation_validation"
@@ -1048,7 +1058,307 @@ def write_validation_artifact(path: str | os.PathLike, artifact: dict) -> str:
     return str(destination)
 
 
+# --------------------------------------------------------------------------
+# Calm-surface scenes and runner (roadmap CALM-M1).
+#
+# The shared instrument for the sampling A/B (SAMP-M5), the temporal-levels
+# decision (TIME-M3), the step-control study (ERR-M1), and the CALM tiers.
+# Report-only: results never gate CI and never touch the frame-record schema.
+
+CALM_SURFACE_SCHEMA = "stflip.calm_surface_validation"
+CALM_SURFACE_VERSION = 1
+
+# Scene gating notes (enforced by consumers, recorded here once):
+# - stirred_pool: a sustained vortex physically dips the surface, so spatial
+#   height RMS is physics-contaminated and may NEVER gate; only the temporal
+#   per-column std gates, and spatial statistics subtract the per-column
+#   temporal mean.
+# - translating_slab: zero-gravity uniform translation; the exact solution is
+#   rigid motion, so any surface roughening is sampling noise (Galilean
+#   flatness).
+CALM_SURFACE_SCENES = (
+    "still_pool",
+    "stirred_pool",
+    "ballistic_droplet",
+    "translating_slab",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CalmSurfaceConfig:
+    """Configuration for the calm-surface scene family."""
+
+    resolution: int = 24
+    frames: int = 8
+    particles_per_cell: int = 4
+    seed: int = 0
+    backend: str = "cpu"
+    frame_rate: float = 24.0
+    cfl_target: float = 16.0
+    scenes: tuple = CALM_SURFACE_SCENES
+    probe_count: int = 8
+    whitewater: bool = False
+    surface_iterations: int = 10
+
+    def __post_init__(self) -> None:
+        for name in ("resolution", "frames", "particles_per_cell", "seed",
+                     "probe_count", "surface_iterations"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+        if self.resolution < 8:
+            raise ValueError("resolution must be at least 8")
+        if self.frames < 1:
+            raise ValueError("frames must be positive")
+        if self.particles_per_cell < 1:
+            raise ValueError("particles_per_cell must be positive")
+        if self.seed < 0:
+            raise ValueError("seed must not be negative")
+        if self.probe_count < 1:
+            raise ValueError("probe_count must be positive")
+        if self.surface_iterations < 0:
+            raise ValueError("surface_iterations must not be negative")
+        if self.backend not in {"cpu", "cuda"}:
+            raise ValueError("backend must be 'cpu' or 'cuda'")
+        if not math.isfinite(self.frame_rate) or self.frame_rate <= 0.0:
+            raise ValueError("frame_rate must be positive and finite")
+        if not math.isfinite(self.cfl_target) or self.cfl_target <= 0.0:
+            raise ValueError("cfl_target must be positive and finite")
+        unknown = set(self.scenes) - set(CALM_SURFACE_SCENES)
+        if unknown:
+            raise ValueError(f"unknown calm-surface scenes: {sorted(unknown)}")
+
+
+def _calm_scene_params(config: CalmSurfaceConfig, scene: str) -> Params:
+    n = config.resolution
+    gravity = (0.0, 0.0, -9.81)
+    if scene in {"ballistic_droplet", "translating_slab"}:
+        gravity = (0.0, 0.0, 0.0)
+    return Params(
+        resolution=(n, n, n),
+        dx=1.0 / n,
+        gravity=gravity,
+        frame_dt=1.0 / float(config.frame_rate),
+        cfl_target=config.cfl_target,
+        particles_per_cell=config.particles_per_cell,
+        st_enabled=True,
+        seed=config.seed,
+    )
+
+
+def _calm_scene_setup(
+    solver: STFLIPSolver, config: CalmSurfaceConfig, scene: str,
+) -> None:
+    n = config.resolution
+    mask = np.zeros((n,) * 3, dtype=bool)
+    if scene == "still_pool":
+        mask[:, :, : n // 2] = True
+        solver.add_liquid_mask(mask)
+    elif scene == "stirred_pool":
+        mask[:, :, : n // 2] = True
+        solver.add_liquid_mask(mask)
+        # Subsurface swirl: the bulk moves while the surface should stay
+        # near its steady, gently dipped shape.
+        solver.add_force(
+            "VORTEX", 6.0,
+            center=(0.5, 0.5, 0.2),
+            axis=(0.0, 0.0, 1.0),
+            radius=0.35,
+        )
+    elif scene == "ballistic_droplet":
+        centre = np.asarray((0.3, 0.5, 0.5))
+        radius = 0.15
+        cells = (np.stack(np.meshgrid(
+            *(np.arange(n),) * 3, indexing="ij"), axis=-1) + 0.5) / n
+        mask[:] = np.linalg.norm(cells - centre, axis=-1) <= radius
+        solver.add_liquid_mask(mask)
+        solver.vel[:, 0] = 2.0
+    elif scene == "translating_slab":
+        mask[n // 8: n // 2, :, : (2 * n) // 5] = True
+        solver.add_liquid_mask(mask)
+        solver.vel[:, 0] = 1.0
+    else:  # pragma: no cover - guarded by CalmSurfaceConfig
+        raise ValueError(f"unknown calm-surface scene: {scene}")
+
+
+def _probe_columns(wet_mask: np.ndarray, count: int) -> list:
+    """Deterministic, evenly spaced wet probe columns for PSD time series."""
+
+    ii, jj = np.nonzero(wet_mask)
+    if not len(ii):
+        return []
+    take = min(count, len(ii))
+    picks = np.linspace(0, len(ii) - 1, take).astype(np.int64)
+    return [(int(ii[p]), int(jj[p])) for p in picks]
+
+
+def _probe_heights(height_map: np.ndarray, columns: list) -> list:
+    out = []
+    for i, j in columns:
+        value = float(height_map[i, j])
+        out.append(value if math.isfinite(value) else None)
+    return out
+
+
+def run_calm_surface_validation(
+    config: CalmSurfaceConfig | None = None,
+) -> dict:
+    """Run the calm-surface scene family and return a report dictionary.
+
+    Per frame and scene this records the sub-voxel particle-count height map
+    statistics, the render-path (Appendix-B density crossing) statistics --
+    the primary gating variant -- probe-column height series for later PSD
+    analysis, surfacing and resync wall time, and optional whitewater seeding
+    counts.  End-of-run summaries add per-column temporal std and drift.
+    """
+
+    config = config or CalmSurfaceConfig()
+    scenes_report: dict[str, Any] = {}
+    for scene in config.scenes:
+        params = _calm_scene_params(config, scene)
+        backend = get_backend(config.backend)
+        solver = STFLIPSolver(params, backend)
+        _calm_scene_setup(solver, config, scene)
+        whitewater = None
+        if config.whitewater:
+            whitewater = Whitewater(
+                solver, WhitewaterParams(seed=config.seed))
+
+        particle_maps: list[np.ndarray] = []
+        render_maps: list[np.ndarray] = []
+        frames: list[dict[str, Any]] = []
+        probe_columns: list = []
+        for frame in range(1, config.frames + 1):
+            backend.synchronize()
+            started = time.perf_counter()
+            stats = solver.step_frame()
+            backend.synchronize()
+            step_wall_s = time.perf_counter() - started
+
+            whitewater_counts = None
+            if whitewater is not None:
+                whitewater_counts = whitewater.step(params.frame_dt)
+
+            started = time.perf_counter()
+            positions, _velocities = solver.get_render_particles()
+            backend.synchronize()
+            resync_wall_s = time.perf_counter() - started
+            positions = np.ascontiguousarray(positions, dtype=np.float64)
+
+            particle_map = particle_height_map(
+                positions,
+                dx=params.dx,
+                resolution=params.resolution,
+                particles_per_cell=params.particles_per_cell,
+            )
+            started = time.perf_counter()
+            reconstruction = reconstruct_surface(
+                positions.astype(np.float32),
+                params.dx,
+                iterations=config.surface_iterations,
+            )
+            backend.synchronize()
+            surfacing_wall_s = time.perf_counter() - started
+            render_map = surface_height_map(
+                solver.be.to_numpy(reconstruction.density),
+                origin=reconstruction.origin,
+                voxel_size=reconstruction.voxel_size,
+            )
+            particle_maps.append(particle_map)
+            render_maps.append(render_map)
+            if not probe_columns:
+                probe_columns = _probe_columns(
+                    particle_map > 0.0, config.probe_count)
+
+            frames.append({
+                "frame": frame,
+                "simulation_time_s": float(solver.time),
+                "particle_count": int(stats.n_particles),
+                "solver_steps": int(stats.steps),
+                "particle_height": height_map_stats(
+                    np.where(particle_map > 0.0, particle_map, np.nan)),
+                "render_height": height_map_stats(render_map),
+                "probe_heights_particle": _probe_heights(
+                    particle_map, probe_columns),
+                "probe_heights_render": _probe_heights(
+                    render_map, probe_columns),
+                "whitewater_counts": whitewater_counts,
+                "timing": {
+                    "step_wall_s": float(step_wall_s),
+                    "render_resynchronization_wall_s": float(resync_wall_s),
+                    "surface_reconstruction_wall_s": float(surfacing_wall_s),
+                },
+                "peak_rss_bytes": process_peak_memory_bytes(),
+            })
+
+        summary = _calm_scene_summary(particle_maps, render_maps)
+        summary["gating_note"] = (
+            "temporal std only; spatial stats subtract per-column temporal "
+            "mean" if scene == "stirred_pool" else
+            "render-path height_rms_spatial is the primary gating metric")
+        scenes_report[scene] = {
+            "params": {
+                "gravity_z": float(params.gravity[2]),
+                "cfl_target": float(params.cfl_target),
+                "resolution": int(config.resolution),
+                "particles_per_cell": int(config.particles_per_cell),
+            },
+            "probe_columns": [list(c) for c in probe_columns],
+            "frames": frames,
+            "summary": summary,
+        }
+
+    return {
+        "schema": CALM_SURFACE_SCHEMA,
+        "version": CALM_SURFACE_VERSION,
+        "library_version": __version__,
+        "config": asdict(config),
+        "scenes": scenes_report,
+    }
+
+
+def _stacked_wet(maps: list) -> tuple[np.ndarray, np.ndarray]:
+    stack = np.stack(maps, axis=0)
+    return stack, np.all(np.isfinite(stack) & (stack != 0.0), axis=0)
+
+
+def _calm_scene_summary(
+    particle_maps: list, render_maps: list,
+) -> dict[str, Any]:
+    """Temporal statistics over the frame series of height maps."""
+
+    out: dict[str, Any] = {}
+    for label, maps in (("particle", particle_maps), ("render", render_maps)):
+        stack, wet = _stacked_wet(maps)
+        if not wet.any():
+            out[label] = {
+                "wet_column_count": 0,
+                "height_std_temporal_mean": None,
+                "height_drift": None,
+                "height_rms_spatial_about_temporal_mean": None,
+            }
+            continue
+        series = stack[:, wet]
+        temporal_mean = series.mean(axis=0, dtype=np.float64)
+        temporal_std = series.std(axis=0, dtype=np.float64)
+        deviation = series - temporal_mean
+        out[label] = {
+            "wet_column_count": int(np.count_nonzero(wet)),
+            "height_std_temporal_mean": float(temporal_std.mean()),
+            "height_drift": float(
+                (series[-1] - series[0]).mean(dtype=np.float64)),
+            "height_rms_spatial_about_temporal_mean": float(
+                np.sqrt(np.mean(deviation ** 2, dtype=np.float64))),
+        }
+    return out
+
+
+
 __all__ = [
+    "CALM_SURFACE_SCENES",
+    "CALM_SURFACE_SCHEMA",
+    "CALM_SURFACE_VERSION",
+    "CalmSurfaceConfig",
     "MATCHED_CASES",
     "MULTI_SEED_SCHEMA",
     "MULTI_SEED_VERSION",
@@ -1057,6 +1367,7 @@ __all__ = [
     "ValidationCase",
     "ValidationConfig",
     "detect_high_cfl",
+    "run_calm_surface_validation",
     "run_matched_validation",
     "run_multi_seed_validation",
     "temporal_quadrature_coverage",

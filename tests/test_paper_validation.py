@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from stflip import __version__ as stflip_version
 from stflip.paper_validation import (
     DEFAULT_GLUG_SURFACE_TENSION,
     PAPER_VALIDATION_SCHEMA,
@@ -32,7 +33,7 @@ def test_kleefsman_quick_run_records_gauges_without_claiming_reference():
     assert artifact["case"] == "kleefsman"
     assert artifact["reference"] is None
     assert artifact["comparison"] is None
-    assert artifact["implementation"]["version"] == "0.24.0"
+    assert artifact["implementation"]["version"] == stflip_version
     assert len(artifact["implementation"]["python_source_sha256"]) == 64
     runtime = artifact["implementation"]["runtime"]
     assert runtime["python_version"]
