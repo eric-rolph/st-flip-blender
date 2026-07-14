@@ -9,6 +9,7 @@ directly and does not promise SI conversion for non-default scene unit scales.
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -423,3 +424,207 @@ def validate_frame_record(record: Mapping[str, Any]) -> None:
             raise TypeError(f"metric field {name!r} must be a JSON scalar")
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f"metric field {name!r} must be finite or null")
+
+
+# --------------------------------------------------------------------------
+# Calm-surface height metrics (roadmap CALM-M1).
+#
+# These are standalone helpers consumed by the calm-surface validation
+# scenarios; they never touch the strict frame-record schema above.
+
+
+def particle_height_map(
+    positions: np.ndarray,
+    *,
+    dx: float,
+    resolution: Sequence[int],
+    particles_per_cell: int,
+    floor_z: float = 0.0,
+) -> np.ndarray:
+    """Column water-height map from particle counts.
+
+    ``h(x, y) = dx * column_count(x, y) / particles_per_cell`` resolves
+    sub-voxel surface motion: one particle entering or leaving a column moves
+    the estimate by ``dx / particles_per_cell``.  A boolean occupancy column
+    sum would quantize to whole cells, which hides exactly the low-amplitude
+    calm-surface noise this metric exists to measure.
+    """
+
+    values = np.asarray(positions, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError("positions must be an (N, 3) array")
+    if values.size and not np.all(np.isfinite(values)):
+        raise ValueError("positions must be finite")
+    if not math.isfinite(dx) or dx <= 0.0:
+        raise ValueError("dx must be finite and positive")
+    if isinstance(particles_per_cell, bool) or not isinstance(
+            particles_per_cell, int) or particles_per_cell < 1:
+        raise ValueError("particles_per_cell must be a positive integer")
+    shape = tuple(int(n) for n in resolution)
+    if len(shape) != 3 or any(n < 1 for n in shape):
+        raise ValueError("resolution must contain three positive integers")
+    nx, ny = shape[0], shape[1]
+    heights = np.zeros((nx, ny), dtype=np.float64)
+    if values.size:
+        above = values[values[:, 2] >= floor_z]
+        if len(above):
+            ix = np.clip((above[:, 0] / dx).astype(np.int64), 0, nx - 1)
+            iy = np.clip((above[:, 1] / dx).astype(np.int64), 0, ny - 1)
+            np.add.at(heights, (ix, iy), 1.0)
+    heights *= dx / float(particles_per_cell)
+    return heights
+
+
+def surface_height_map(
+    density: np.ndarray,
+    *,
+    origin: Sequence[float],
+    voxel_size: float,
+    iso: float = 0.5,
+) -> np.ndarray:
+    """Per-column height of the highest ``iso`` crossing of a render density.
+
+    Operates on the Appendix-B reconstruction density (``reconstruct_surface``
+    output moved to the host).  The crossing between the highest wet voxel and
+    its dry neighbour above is located by linear interpolation, giving
+    sub-voxel sensitivity; this is the primary gating variant because it
+    measures the surface users actually see.  Columns with no wet voxel
+    return NaN.
+    """
+
+    field = np.asarray(density, dtype=np.float64)
+    if field.ndim != 3:
+        raise ValueError("density must be a 3D array")
+    anchor = tuple(float(v) for v in origin)
+    if len(anchor) != 3 or not all(math.isfinite(v) for v in anchor):
+        raise ValueError("origin must contain three finite values")
+    if not math.isfinite(voxel_size) or voxel_size <= 0.0:
+        raise ValueError("voxel_size must be finite and positive")
+    if not math.isfinite(iso):
+        raise ValueError("iso must be finite")
+    nx, ny, nz = field.shape
+    heights = np.full((nx, ny), np.nan, dtype=np.float64)
+    if 0 in field.shape:
+        return heights
+    wet = field >= iso
+    any_wet = wet.any(axis=2)
+    if not any_wet.any():
+        return heights
+    # Highest wet voxel per column: argmax over the reversed z axis.
+    top = nz - 1 - np.argmax(wet[:, :, ::-1], axis=2)
+    ii, jj = np.nonzero(any_wet)
+    kk = top[ii, jj]
+    d_wet = field[ii, jj, kk]
+    interior = kk < nz - 1
+    d_dry = np.where(interior, field[ii, jj, np.minimum(kk + 1, nz - 1)], iso)
+    # Fraction of the voxel above the wet centre where density falls to iso.
+    delta = d_wet - d_dry
+    with np.errstate(divide="ignore", invalid="ignore"):
+        frac = np.where(delta > 0.0, (d_wet - iso) / delta, 0.5)
+    frac = np.clip(frac, 0.0, 1.0)
+    # Wet voxels saturated to the domain top report their upper voxel face.
+    frac = np.where(interior, frac, 0.5)
+    heights[ii, jj] = anchor[2] + (kk + 0.5 + frac) * voxel_size
+    return heights
+
+
+def height_map_stats(
+    height_map: np.ndarray,
+    *,
+    reference_map: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Spatial statistics of one height map over its wet columns.
+
+    ``reference_map`` (typically the per-column temporal mean) is subtracted
+    before spatial statistics when given, so scenes whose equilibrium surface
+    is legitimately non-flat (a stirred pool dips at the vortex core) can be
+    measured for NOISE about their own steady shape rather than for shape.
+    """
+
+    values = np.asarray(height_map, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("height_map must be a 2D array")
+    wet = np.isfinite(values)
+    if reference_map is not None:
+        reference = np.asarray(reference_map, dtype=np.float64)
+        if reference.shape != values.shape:
+            raise ValueError("reference_map shape must match height_map")
+        wet = wet & np.isfinite(reference)
+    count = int(np.count_nonzero(wet))
+    if count == 0:
+        return {
+            "wet_column_count": 0,
+            "height_mean": None,
+            "height_rms_spatial": None,
+        }
+    sample = values[wet]
+    if reference_map is not None:
+        sample = sample - np.asarray(reference_map, dtype=np.float64)[wet]
+    mean = float(sample.mean(dtype=np.float64))
+    rms = float(np.sqrt(np.mean((sample - mean) ** 2, dtype=np.float64)))
+    return {
+        "wet_column_count": count,
+        "height_mean": mean,
+        "height_rms_spatial": rms,
+    }
+
+
+def process_peak_memory_bytes() -> int | None:
+    """Best-effort peak resident-set size of this process, in bytes.
+
+    Several roadmap features stack transient memory (particle ids, temporal
+    moment grids, reflection snapshots); this probe lets validation runs
+    report the stack without adding a dependency.  Returns None when the
+    platform offers no cheap peak-RSS source.
+    """
+
+    try:
+        import resource
+    except ImportError:
+        resource = None
+    if resource is not None:
+        peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # ru_maxrss is kilobytes on Linux and bytes on macOS.
+        scale = 1 if sys.platform == "darwin" else 1024
+        return int(peak * scale)
+    if sys.platform == "win32":
+        import ctypes
+        import ctypes.wintypes
+
+        class _MemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.wintypes.DWORD),
+                ("PageFaultCount", ctypes.wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = _MemoryCounters()
+        counters.cb = ctypes.sizeof(_MemoryCounters)
+        # The pseudo-handle is (HANDLE)-1; it must travel as a pointer-sized
+        # value or the upper 32 bits are lost on 64-bit Python.
+        handle = ctypes.c_void_p(-1)
+        # Modern Windows exports the call from kernel32 as K32...; the
+        # legacy psapi export is a fallback for older systems.
+        for module, name in (
+            (ctypes.windll.kernel32, "K32GetProcessMemoryInfo"),
+            (ctypes.windll.psapi, "GetProcessMemoryInfo"),
+        ):
+            query = getattr(module, name, None)
+            if query is None:
+                continue
+            query.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(_MemoryCounters),
+                ctypes.wintypes.DWORD,
+            ]
+            query.restype = ctypes.wintypes.BOOL
+            if query(handle, ctypes.byref(counters), counters.cb):
+                return int(counters.PeakWorkingSetSize)
+    return None
