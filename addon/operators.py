@@ -632,6 +632,7 @@ def paper_surface_config(
     iterations: int,
     adaptivity: float,
     backend_name: str,
+    calm_iterations: int = 0,
 ) -> dict:
     """Canonical, versioned Appendix-B reconstruction configuration.
 
@@ -647,6 +648,10 @@ def paper_surface_config(
         raise ValueError("paper surface dx must be finite and positive")
     if not 1 <= iterations <= 100:
         raise ValueError("paper MCF iterations must be between 1 and 100")
+    calm_iterations = int(calm_iterations)
+    if not 0 <= calm_iterations <= 100:
+        raise ValueError(
+            "paper calm smoothing iterations must be between 0 and 100")
     if not math.isfinite(adaptivity) or not 0.0 <= adaptivity <= 1.0:
         raise ValueError("paper mesh adaptivity must be between 0 and 1")
     if backend_name not in {"cpu", "cuda"}:
@@ -682,6 +687,7 @@ def paper_surface_config(
         "gradient_epsilon": surface_core.NORMAL_EPSILON,
         "isovalue": surface_core.SURFACE_ISOVALUE,
         "mcf_iterations": iterations,
+        "calm_smoothing_iterations": calm_iterations,
         "mesh_adaptivity": adaptivity,
     }
 
@@ -720,6 +726,7 @@ def matching_resume_paper_surface_config(
     dx: float,
     iterations: int,
     adaptivity: float,
+    calm_iterations: int = 0,
 ) -> tuple[dict | None, str | None, str]:
     """Resolve an existing derived cache without constraining simulation.
 
@@ -742,6 +749,7 @@ def matching_resume_paper_surface_config(
             iterations,
             adaptivity,
             config.get("backend"),
+            calm_iterations,
         )
         if expected != config:
             raise cache.SurfaceCacheError(
@@ -1906,6 +1914,7 @@ def _reconstruct_paper_surface(
         positions_local,
         dx,
         iterations=int(config["mcf_iterations"]),
+        calm_iterations=int(config["calm_smoothing_iterations"]),
         max_voxels=int(max_voxels),
         array_module=backend.xp,
     )
@@ -2308,6 +2317,7 @@ def apply_paper_fidelity_settings(settings) -> None:
         "surface_voxel": surface_core.VOXEL_SIZE_DX,
         "surface_smoothing": False,
         "paper_mcf_iterations": surface_core.DEFAULT_MCF_ITERATIONS,
+        "paper_calm_smoothing_iterations": 0,
         "paper_mesh_adaptivity": 0.0,
     }
     for name, value in values.items():
@@ -3058,6 +3068,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                     dx=dx,
                     iterations=st.paper_mcf_iterations,
                     adaptivity=st.paper_mesh_adaptivity,
+                    calm_iterations=st.paper_calm_smoothing_iterations,
                 )
             )
             if paper_config is not None:
@@ -3122,6 +3133,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 st.paper_mcf_iterations,
                 st.paper_mesh_adaptivity,
                 paper_surface_backend.name,
+                st.paper_calm_smoothing_iterations,
             )
             paper_fingerprint = paper_surface_fingerprint(paper_config)
         if (paper_config is not None

@@ -274,6 +274,78 @@ def mean_curvature_flow(density, mask, *, iterations: int = DEFAULT_MCF_ITERATIO
     return values
 
 
+def _axis_min3(values, axis: int, xp):
+    padding = [(0, 0)] * 3
+    padding[axis] = (1, 1)
+    padded = xp.pad(values, padding, mode="edge")
+    lo = [slice(None)] * 3
+    mid = [slice(None)] * 3
+    hi = [slice(None)] * 3
+    lo[axis] = slice(0, values.shape[axis])
+    mid[axis] = slice(1, values.shape[axis] + 1)
+    hi[axis] = slice(2, values.shape[axis] + 2)
+    return xp.minimum(
+        padded[tuple(lo)],
+        xp.minimum(padded[tuple(mid)], padded[tuple(hi)]))
+
+
+def _axis_max3(values, axis: int, xp):
+    padding = [(0, 0)] * 3
+    padding[axis] = (1, 1)
+    padded = xp.pad(values, padding, mode="edge")
+    lo = [slice(None)] * 3
+    mid = [slice(None)] * 3
+    hi = [slice(None)] * 3
+    lo[axis] = slice(0, values.shape[axis])
+    mid[axis] = slice(1, values.shape[axis] + 1)
+    hi[axis] = slice(2, values.shape[axis] + 2)
+    return xp.maximum(
+        padded[tuple(lo)],
+        xp.maximum(padded[tuple(mid)], padded[tuple(hi)]))
+
+
+def erode_dilate_bounds(density, *, array_module=None):
+    """Separable 3x3x3 min/max envelopes of a density field."""
+
+    xp = _array_module(density, array_module)
+    values = _validate_field(density, "density", xp)
+    lower = values
+    upper = values
+    for axis in range(3):
+        lower = _axis_min3(lower, axis, xp)
+        upper = _axis_max3(upper, axis, xp)
+    return lower, upper
+
+
+def calm_region_smooth(density, mask, *, extra_iterations: int,
+                       array_module=None):
+    """Extra calm-region mean-curvature flow, band-clamped (CALM-M2).
+
+    Runs ``extra_iterations`` additional fixed-mask MCF passes -- the same
+    self-quotient feature mask as the main Appendix-B flow, so droplets,
+    sheets, and crests stay protected -- then clamps the result between the
+    3x3x3 erode/dilate envelopes of the PRE-pass density.  The clamp bounds
+    isosurface drift to one voxel and bounds volume loss; note it bounds
+    surface DRIFT, not thin-feature volume, which is why the feature mask
+    (not the clamp) is what protects one-to-two-voxel sheets.
+
+    Render-time only: callers apply this to the reconstruction density, so
+    simulation dynamics are untouched.  ``extra_iterations == 0`` returns
+    the input unchanged.
+    """
+
+    xp = _array_module(density, array_module)
+    values = _validate_field(density, "density", xp, bounded=True)
+    extra_iterations = _validate_integer(
+        extra_iterations, "extra_iterations", minimum=0)
+    if extra_iterations == 0 or values.size == 0:
+        return values
+    lower, upper = erode_dilate_bounds(values, array_module=xp)
+    smoothed = mean_curvature_flow(
+        values, mask, iterations=extra_iterations, array_module=xp)
+    return xp.clip(smoothed, lower, upper).astype(xp.float32)
+
+
 def _default_padding(iterations: int) -> int:
     # Explicit curvature flow has diffusion distance O(sqrt(k*dtau)). Add two
     # guard samples beyond that band; the compact sphere ramp itself is already
@@ -383,6 +455,7 @@ def reconstruct_surface(
     dx: float,
     *,
     iterations: int = DEFAULT_MCF_ITERATIONS,
+    calm_iterations: int = 0,
     padding_voxels: int | None = None,
     max_voxels: int = DEFAULT_MAX_VOXELS,
     particle_chunk_size: int = DEFAULT_PARTICLE_CHUNK_SIZE,
@@ -404,12 +477,15 @@ def reconstruct_surface(
     if not math.isfinite(voxel_size) or voxel_size <= 0.0:
         raise ValueError("dx is too small to define a positive float voxel size")
     iterations = _validate_integer(iterations, "iterations", minimum=0)
+    calm_iterations = _validate_integer(
+        calm_iterations, "calm_iterations", minimum=0)
     max_voxels = _validate_integer(max_voxels, "max_voxels", minimum=1)
     particle_chunk_size = _validate_integer(
         particle_chunk_size, "particle_chunk_size", minimum=1)
     anchor = _validate_anchor(grid_anchor)
     if padding_voxels is None:
-        padding = _default_padding(iterations)
+        # The calm pass diffuses too, so the crop band must cover both.
+        padding = _default_padding(iterations + calm_iterations)
     else:
         padding = _validate_integer(
             padding_voxels, "padding_voxels", minimum=0)
@@ -431,6 +507,7 @@ def reconstruct_surface(
             "grid_shape": (0, 0, 0),
             "voxel_count": 0,
             "iterations_completed": 0,
+            "calm_iterations_completed": 0,
             "pseudo_time_step": 0.0,
             "feature_mask_min": None,
             "feature_mask_max": None,
@@ -486,11 +563,16 @@ def reconstruct_surface(
     dtau = _pseudo_time_step(mask)
     result = mean_curvature_flow(
         density, mask, iterations=iterations, array_module=xp)
+    if calm_iterations > 0:
+        result = calm_region_smooth(
+            result, mask, extra_iterations=calm_iterations,
+            array_module=xp)
     diagnostics.update({
         "empty": False,
         "grid_shape": shape,
         "voxel_count": voxel_count,
         "iterations_completed": iterations,
+        "calm_iterations_completed": calm_iterations,
         "pseudo_time_step": dtau,
         "feature_mask_min": _scalar(mask.min()),
         "feature_mask_max": _scalar(mask.max()),

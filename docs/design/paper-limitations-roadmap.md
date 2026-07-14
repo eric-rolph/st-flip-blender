@@ -964,8 +964,14 @@ Review fixes:
 - **Thin features**: the band clamp bounds isosurface DRIFT, not
   thin-feature volume -- a <= 1-voxel sheet can erode to an empty lower
   bound. Add a thin-sheet retention test (1-2 voxel slab survives, relying
-  on the feature mask) beside the >= 95 percent sphere-volume test, and
-  report min-feature-thickness in diagnostics.
+  on the feature mask). Volume contract refined during implementation (the
+  original flat ">= 95 percent sphere volume" is unachievable for RESOLVED
+  spheres: they read as calm at self-quotient ~ 1 and the clamp permits one
+  voxel of erosion, which is 42 percent of a radius-6-voxel sphere): the
+  shipped two-tier contract is (a) droplets smaller than the blur kernel
+  are feature-mask-protected at >= 95 percent, and (b) resolved calm
+  spheres never erode past the 3x3x3 erosion envelope (one voxel). Both
+  are tested.
 - Config/UI: `paper_calm_smoothing_iterations` IntProperty (default 0,
   range 0..100 -- 0 allowed, unlike mcf_iterations' 1..100, so it needs
   its own validation in `paper_surface_config`, operators.py:560/578);

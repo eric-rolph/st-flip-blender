@@ -453,6 +453,15 @@ class STFLIPSettings(bpy.types.PropertyGroup):
         description="Mean-curvature-flow reconstruction iterations; the "
                     "paper uses 30",
     )
+    paper_calm_smoothing_iterations: IntProperty(
+        name="Calm Smoothing",
+        default=0,
+        min=0,
+        max=100,
+        description="Extra calm-region smoothing passes on the paper "
+                    "surface, band-clamped so the surface moves less than "
+                    "one voxel; render-time only, zero disables",
+    )
     paper_mesh_adaptivity: FloatProperty(
         name="OpenVDB Mesh Adaptivity",
         default=0.0,

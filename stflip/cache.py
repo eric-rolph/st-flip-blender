@@ -28,7 +28,10 @@ SURFACE_SCHEMA = "stflip-paper-surface"
 SURFACE_VERSION = 2
 SURFACE_LEGACY_VERSION = 1
 SURFACE_CONFIG_SCHEMA = "stflip-paper-surface-config"
-SURFACE_CONFIG_VERSION = 2
+# Version 3: paper_surface_config gained calm_smoothing_iterations
+# (CALM-M2).  All existing paper-surface caches re-reconstruct once after
+# upgrade (derived data; the soft-warning resume path handles it).
+SURFACE_CONFIG_VERSION = 3
 
 _FRAME_RE = re.compile(r"^stflip_(-?\d+)\.npz$")
 _CHECKPOINT_RE = re.compile(r"^stflip_checkpoint_(-?\d+)\.npz$")
