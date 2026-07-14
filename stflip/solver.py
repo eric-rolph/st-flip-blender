@@ -332,6 +332,14 @@ class STFLIPSolver:
         self.age = xp.zeros((0,), dtype=xp.float32)
         self.source_id = xp.zeros((0,), dtype=xp.int32)
         self._next_source = 0
+        # Stable per-particle identity (roadmap SAMP-M1): ids are allocated
+        # monotonically, survive outflow compaction, and are never reused --
+        # a duplicated id would silently correlate two particles in any
+        # id-keyed sampling scheme.  Physics never reads them.
+        self.particle_id = xp.zeros((0,), dtype=xp.int64)
+        self._next_particle_id = 0
+        # Global substep counter, committed once per completed substep.
+        self._substep_index = 0
 
         # Device-resident constants (allocating these per call would force
         # host->device transfers inside the advection hot loop on GPU).
@@ -426,6 +434,18 @@ class STFLIPSolver:
                 xp.concatenate(
                     [self.source_id, xp.zeros((n - sm,), dtype=xp.int32)])
                 if sm < n else self.source_id[:n])
+        pm = int(self.particle_id.shape[0])
+        if pm != n:
+            if pm < n:
+                # Pad with FRESH ids, never zeros: a duplicated id would
+                # silently correlate two particles in id-keyed sampling.
+                fresh = xp.arange(
+                    self._next_particle_id,
+                    self._next_particle_id + (n - pm), dtype=xp.int64)
+                self._next_particle_id += n - pm
+                self.particle_id = xp.concatenate([self.particle_id, fresh])
+            else:
+                self.particle_id = self.particle_id[:n]
 
     def checkpoint_state(self) -> dict:
         """Return an owned, backend-neutral snapshot sufficient to restart.
@@ -470,6 +490,11 @@ class STFLIPSolver:
             "source_id": np.array(
                 self.be.to_numpy(self.source_id), dtype=np.int32, order="C",
                 copy=True),
+            "particle_id": np.array(
+                self.be.to_numpy(self.particle_id), dtype=np.int64, order="C",
+                copy=True),
+            "next_particle_id": int(self._next_particle_id),
+            "substep_index": int(self._substep_index),
         }
 
     def restore_state(self, state: dict) -> None:
@@ -484,7 +509,10 @@ class STFLIPSolver:
             "outflow_removed_total", "volume_outflow_removed_total",
             "pressure_outflow_removed_total",
         }
-        optional = {"phase", "C", "age", "source_id"}
+        optional = {
+            "phase", "C", "age", "source_id",
+            "particle_id", "next_particle_id", "substep_index",
+        }
         if (not isinstance(state, dict)
                 or not required <= set(state)
                 or not set(state) <= (required | optional)):
@@ -588,6 +616,35 @@ class STFLIPSolver:
                 raise ValueError("checkpoint source_id must be non-negative")
             source_restore = self.be.from_numpy(
                 np.array(source_np, dtype=np.int32, order="C", copy=True))
+        particle_id_restore = None
+        next_particle_id = None
+        if "particle_id" in state:
+            id_np = np.asarray(state["particle_id"])
+            if id_np.dtype != np.dtype(np.int64) or id_np.shape != (count,):
+                raise ValueError(
+                    "checkpoint particle_id has an incompatible shape")
+            if id_np.size:
+                if int(id_np.min()) < 0:
+                    raise ValueError(
+                        "checkpoint particle_id must be non-negative")
+                if np.unique(id_np).size != count:
+                    raise ValueError("checkpoint particle_id must be unique")
+            particle_id_restore = self.be.from_numpy(
+                np.array(id_np, dtype=np.int64, order="C", copy=True))
+            next_value = state.get("next_particle_id", 0)
+            if (isinstance(next_value, bool)
+                    or not isinstance(next_value, numbers.Integral)
+                    or int(next_value) < 0):
+                raise ValueError(
+                    "checkpoint next_particle_id must be a non-negative "
+                    "integer")
+            next_particle_id = int(next_value)
+        substep_index = state.get("substep_index", 0)
+        if (isinstance(substep_index, bool)
+                or not isinstance(substep_index, numbers.Integral)
+                or int(substep_index) < 0):
+            raise ValueError(
+                "checkpoint substep_index must be a non-negative integer")
 
         # Commit only after the complete state validates, so a rejected restore
         # cannot leave a running solver partially mutated.
@@ -618,6 +675,23 @@ class STFLIPSolver:
         if source_restore is not None and count:
             self._next_source = max(
                 self._next_source, int(self.be.to_numpy(self.source_id).max()) + 1)
+        # Restore stable particle ids when persisted (checkpoint v3);
+        # pre-v3 checkpoints synthesize ids 0..n-1 and restart the substep
+        # counter -- permitted today because nothing samples by id yet.
+        # When SAMP-M3 lands an id-keyed sampler, this synthesis path must
+        # gain the mode gate (refuse for non-pseudo temporal_sampling).
+        if particle_id_restore is not None:
+            self.particle_id = particle_id_restore
+            floor = int(next_particle_id)
+            if count:
+                floor = max(
+                    floor,
+                    int(self.be.to_numpy(self.particle_id).max()) + 1)
+            self._next_particle_id = floor
+        else:
+            self.particle_id = xp.arange(count, dtype=xp.int64)
+            self._next_particle_id = count
+        self._substep_index = int(substep_index)
         self.time = time_value
         self._dt_prev = dt_prev
         self._rng = restored_rng
@@ -979,6 +1053,12 @@ class STFLIPSolver:
             [self.age, xp.zeros((n,), dtype=xp.float32)])
         self.source_id = xp.concatenate(
             [self.source_id, xp.full((n,), int(source_id), dtype=xp.int32)])
+        self.particle_id = xp.concatenate([
+            self.particle_id,
+            xp.arange(self._next_particle_id,
+                      self._next_particle_id + n, dtype=xp.int64),
+        ])
+        self._next_particle_id += n
         return n
 
     def add_gas_mask(
@@ -1418,6 +1498,7 @@ class STFLIPSolver:
             self.C = self.C[keep]
         self.age = self.age[keep]
         self.source_id = self.source_id[keep]
+        self.particle_id = self.particle_id[keep]
         if stats is not None:
             stats.volume_outflow_removed += volume_count
             stats.pressure_outflow_removed += pressure_count
@@ -2226,6 +2307,7 @@ class STFLIPSolver:
             self._apply_sheeting()
         self._grids = grids
         self._dt_prev = dt
+        self._substep_index += 1
         self.time += dt
         if self.age.shape[0] == self.pos.shape[0]:
             self.age = self.age + np.float32(dt)

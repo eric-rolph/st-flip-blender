@@ -802,16 +802,22 @@ def test_checkpoint_v2_round_trip_allows_empty_affine(tmp_path):
     assert loaded["C"].shape == (0, 3, 3)
 
 
-def test_checkpoint_write_upgrades_base_only_state_to_v2(tmp_path):
-    # A base-only state (no extras) is written as a valid v2 archive whose
-    # extras hold the historical defaults.
+def test_checkpoint_write_upgrades_base_only_state_to_current(tmp_path):
+    # A base-only state (no extras) is written as a valid current-version
+    # archive whose extras hold the historical defaults, including
+    # synthesized particle ids (the same identities a pre-v3 restore
+    # would synthesize).
     cache.write_checkpoint(str(tmp_path), 9, _checkpoint_state(2))
     path = Path(cache.checkpoint_path(str(tmp_path), 9))
     with np.load(path, allow_pickle=False) as data:
-        assert int(data["version"]) == 2
-        assert set(data.files) == cache._CHECKPOINT_KEYS_V2
+        assert int(data["version"]) == cache.CHECKPOINT_VERSION == 3
+        assert set(data.files) == cache._CHECKPOINT_KEYS_V3
         assert np.array_equal(data["phase"], np.ones(2, dtype=np.float32))
         assert data["affine_c"].shape == (0, 3, 3)
+        assert np.array_equal(
+            data["particle_id"], np.arange(2, dtype=np.int64))
+        assert int(data["next_particle_id"]) == 2
+        assert int(data["substep_index"]) == 0
 
 
 @pytest.mark.parametrize(
