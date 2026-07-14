@@ -54,12 +54,16 @@ def test_surface_tension_stays_finite():
 
 
 def test_zero_sigma_is_a_noop():
-    """surface_tension = 0 must reproduce the plain result bit-for-bit."""
-    def run(sigma):
+    """sigma = 0 must be bitwise plain, even with the stabilizer enabled.
+
+    The original form compared run(0.0) to run(0.0) -- a tautology that
+    guarded nothing (roadmap CAP review).  The real guard: enabling
+    st_implicit with zero surface tension must not perturb one bit.
+    """
+    def run(**st_kwargs):
         n = 16
         p = Params(resolution=(n, n, n), dx=1.0 / n, gravity=(0, 0, -9.81),
-                   frame_dt=1 / 24, cfl_target=4.0, seed=2,
-                   surface_tension=sigma)
+                   frame_dt=1 / 24, cfl_target=4.0, seed=2, **st_kwargs)
         s = STFLIPSolver(p, "cpu")
         m = np.zeros((n, n, n), bool)
         m[:n // 2, :, :n // 2] = True
@@ -67,7 +71,8 @@ def test_zero_sigma_is_a_noop():
         for _ in range(3):
             s.step_frame()
         return s.be.to_numpy(s.pos)
-    assert np.array_equal(run(0.0), run(0.0))
+    assert np.array_equal(
+        run(), run(surface_tension=0.0, st_implicit=True))
 
 
 def test_capillary_time_step_clamp():

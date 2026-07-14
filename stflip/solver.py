@@ -29,6 +29,7 @@ from . import (
     multigrid,
     pressure,
     sampling,
+    st_implicit,
     surface_tension,
     viscosity,
 )
@@ -155,6 +156,13 @@ class Params:
     # so pair modest scales (2-4) with the st_max_dv_cells limiter.  The
     # clamp itself is never removed, only scaled by this bounded factor.
     st_clamp_scale: float = 1.0       # 1 = paper-faithful Brackbill clamp
+    # Semi-implicit capillary stabilizer (roadmap CAP-M2): an
+    # interface-concentrated Helmholtz solve per velocity component that
+    # damps the stiff capillary-wave feedback, letting st_clamp_scale be
+    # raised (recommended 4-16 for droplet/glugging scenes) without the
+    # explicit CSF loop blowing up.  No unconditional-stability proof is
+    # claimed; the Brackbill clamp is scaled, never removed.
+    st_implicit: bool = False
     # Per-face limiter on the explicit CSF kick: the velocity change per
     # substep is clipped so it can displace at most this many cells per
     # step (dv_max = st_max_dv_cells * dx / dt).  0 disables the limiter.
@@ -243,7 +251,8 @@ class Params:
             ):
                 raise ValueError(f"{name} must be a positive integer")
             setattr(self, name, int(value))
-        for name in ("st_enabled", "adaptive_gamma", "exact_temporal_norm"):
+        for name in ("st_enabled", "adaptive_gamma", "exact_temporal_norm",
+                     "st_implicit"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
         if isinstance(self.seed, bool) or not isinstance(self.seed, numbers.Integral):
@@ -336,6 +345,8 @@ class FrameStats:
     # ERR-M1 step-control diagnostics (populated only when the solver's
     # internal _collect_step_diagnostics attribute is set; plain FrameStats
     # payload, NOT the strict metrics frame-record schema).
+    st_cg_iters: list = field(default_factory=list)
+    st_cg_rel_residuals: list = field(default_factory=list)
     clamp_bind_fractions: list = field(default_factory=list)
     undersampled_marginal_fractions: list = field(default_factory=list)
     undersampled_subthreshold_fractions: list = field(default_factory=list)
@@ -2375,10 +2386,16 @@ class STFLIPSolver:
         inv_rho_w = 1.0 / xp.maximum(rho_w, eps_rho)
 
         # Surface tension (CSF, Sec 3.9): sigma * kappa * grad(phi) as a face
-        # acceleration before projection.
+        # acceleration before projection.  The smoothed-phase gradient is
+        # computed once and shared between the explicit predictor and the
+        # optional semi-implicit stabilizer so both see the same interface
+        # delta function.
         if p.surface_tension > 0.0:
-            F = surface_tension.cell_force(
-                xp, grids["c_phi"], p.dx, p.surface_tension, p.st_smooth_iters)
+            _phi_s, st_gx, st_gy, st_gz, st_mag = (
+                surface_tension.smoothed_phase_gradient(
+                    xp, grids["c_phi"], p.dx, p.st_smooth_iters))
+            F = surface_tension.cell_force_from_gradient(
+                xp, st_gx, st_gy, st_gz, st_mag, p.dx, p.surface_tension)
             fu = xp.zeros_like(grids["u"])
             fu[1:-1] = 0.5 * (F[1:, :, :, 0] + F[:-1, :, :, 0])
             fv = xp.zeros_like(grids["v"])
@@ -2399,6 +2416,29 @@ class STFLIPSolver:
             grids["u"] = grids["u"] + ku
             grids["v"] = grids["v"] + kv
             grids["w"] = grids["w"] + kw
+
+            if p.st_implicit:
+                # CAP-M2: (R + A) u = R * u_hat per component. Edges are
+                # gated to VALID open faces only -- invalid faces hold
+                # pre-extrapolation values and must not drag interface
+                # velocities (spurious drag masquerading as damping).
+                for axis, gname, rho_f, open_f in (
+                    (0, "u", rho_u, open_u),
+                    (1, "v", rho_v, open_v),
+                    (2, "w", rho_w, open_w),
+                ):
+                    delta = st_implicit.face_delta(xp, st_mag, axis)
+                    dof = grids[gname + "_valid"] & open_f
+                    ekx, eky, ekz = st_implicit.edge_coefficients(
+                        xp, delta, dof, dt, p.surface_tension, p.dx)
+                    grids[gname], st_iters, st_rel = (
+                        st_implicit.stabilize_component(
+                            xp, grids[gname],
+                            xp.maximum(rho_f, eps_rho), ekx, eky, ekz,
+                            dof, tol=p.pcg_tol,
+                            max_iter=p.pcg_max_iter))
+                    stats.st_cg_iters.append(st_iters)
+                    stats.st_cg_rel_residuals.append(st_rel)
 
         # Implicit viscosity (Stam-style diffusion): unconditionally stable, so
         # it preserves large time steps for thick fluids.  Fully-blocked solid

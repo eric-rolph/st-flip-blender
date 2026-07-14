@@ -232,6 +232,7 @@ class STFLIP_PT_solver(bpy.types.Panel):
         capillary.enabled = st.surface_tension > 0.0
         capillary.prop(st, "st_clamp_scale")
         capillary.prop(st, "st_max_dv_cells")
+        capillary.prop(st, "st_implicit")
         layout.prop(st, "viscosity")
         layout.prop(st, "sheeting")
         layout.prop(st, "sparse")

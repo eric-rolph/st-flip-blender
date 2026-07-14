@@ -312,6 +312,13 @@ class STFLIPSettings(bpy.types.PropertyGroup):
                     "clamp from blowing up; may leave bounded grid-scale "
                     "chatter on calm surfaces instead",
     )
+    st_implicit: BoolProperty(
+        name="Implicit Capillary Stabilizer", default=False,
+        description="Damp stiff capillary waves with an implicit "
+                    "interface solve so the Clamp Scale can be raised "
+                    "(4-16 for droplets and glugging) without chatter; "
+                    "adds three small CG solves per substep",
+    )
     viscosity: FloatProperty(
         name="Viscosity", default=0.0, min=0.0, soft_max=1.0, precision=4,
         description="Physical kinematic viscosity in m^2/s. 0 = inviscid; "

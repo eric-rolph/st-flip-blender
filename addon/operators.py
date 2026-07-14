@@ -880,6 +880,7 @@ def _solver_params(settings, dims, dx, gravity, fps, unit_boundary=None):
             settings.surface_tension),
         st_clamp_scale=settings.st_clamp_scale,
         st_max_dv_cells=settings.st_max_dv_cells,
+        st_implicit=settings.st_implicit,
         viscosity=units.kinematic_viscosity_si_to_solver(settings.viscosity),
         sheeting=settings.sheeting,
         sparse=settings.sparse,
