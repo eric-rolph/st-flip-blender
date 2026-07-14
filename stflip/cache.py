@@ -23,7 +23,7 @@ from .metrics import (
 META_NAME = "stflip_meta.json"
 METRICS_NAME = "stflip_metrics.jsonl"
 CHECKPOINT_SCHEMA = "stflip-solver-checkpoint"
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 SURFACE_SCHEMA = "stflip-paper-surface"
 SURFACE_VERSION = 2
 SURFACE_LEGACY_VERSION = 1
@@ -63,13 +63,37 @@ _CHECKPOINT_EXTRA_KEYS = frozenset({
     "source_id",
 })
 _CHECKPOINT_KEYS_V2 = _CHECKPOINT_KEYS_V1 | _CHECKPOINT_EXTRA_KEYS
+# Version 3 (roadmap SAMP-M1) adds stable per-particle ids, the id
+# allocation counter, and the global substep counter, so id-keyed sampling
+# schemes survive resume.  Version-2 archives are still readable: their
+# missing members restore with synthesized ids 0..n-1 and substep 0.
+_CHECKPOINT_V3_EXTRA_KEYS = frozenset({
+    "particle_id",
+    "next_particle_id",
+    "substep_index",
+})
+_CHECKPOINT_KEYS_V3 = _CHECKPOINT_KEYS_V2 | _CHECKPOINT_V3_EXTRA_KEYS
 _CHECKPOINT_KEYS_BY_VERSION = {
     1: _CHECKPOINT_KEYS_V1,
     2: _CHECKPOINT_KEYS_V2,
+    3: _CHECKPOINT_KEYS_V3,
+}
+# Reserved, mode-gated OPTIONAL archive members per version (roadmap
+# Decision 3: the checkpoint schema is bumped exactly once, so members that
+# later milestones may need are reserved here).  ``gamma_prev`` is written
+# only when a bake combines CALM-M3's surface gamma mode with NORM's exact
+# temporal normalization; it is absent otherwise.
+_CHECKPOINT_OPTIONAL_KEYS_BY_VERSION = {
+    1: frozenset(),
+    2: frozenset(),
+    3: frozenset({"gamma_prev"}),
 }
 # Optional keys in the in-memory checkpoint-state mapping (npz ``affine_c`` maps
 # to state key ``C`` to match the solver's attribute name).
-_CHECKPOINT_OPTIONAL_STATE_KEYS = frozenset({"phase", "C", "age", "source_id"})
+_CHECKPOINT_OPTIONAL_STATE_KEYS = frozenset({
+    "phase", "C", "age", "source_id",
+    "particle_id", "next_particle_id", "substep_index", "gamma_prev",
+})
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _SURFACE_KEYS = frozenset({
     "schema",
@@ -536,6 +560,20 @@ def _checkpoint_affine(value, count: int) -> np.ndarray:
     return np.array(array, dtype=np.float32, order="C", copy=True)
 
 
+def _checkpoint_particle_id(value, count: int) -> np.ndarray:
+    array = np.asarray(value)
+    if array.dtype != np.dtype(np.int64) or array.shape != (count,):
+        raise CheckpointError(
+            "checkpoint particle_id must be an int64 array of shape (N,)")
+    if array.size:
+        if int(array.min()) < 0:
+            raise CheckpointError(
+                "checkpoint particle_id must be non-negative")
+        if np.unique(array).size != count:
+            raise CheckpointError("checkpoint particle_id must be unique")
+    return np.array(array, dtype=np.int64, order="C", copy=True)
+
+
 def _checkpoint_source_id(value, count: int) -> np.ndarray:
     """Validate the per-particle source id array: int32, shape (N,), >= 0."""
     try:
@@ -628,6 +666,24 @@ def validate_checkpoint_state(state: dict) -> dict:
         normalized["age"] = _checkpoint_array(state["age"], (count,), "age")
     if "source_id" in state:
         normalized["source_id"] = _checkpoint_source_id(state["source_id"], count)
+    if "particle_id" in state:
+        normalized["particle_id"] = _checkpoint_particle_id(
+            state["particle_id"], count)
+    if "next_particle_id" in state:
+        normalized["next_particle_id"] = _checkpoint_counter(
+            state["next_particle_id"], "next_particle_id")
+    if "substep_index" in state:
+        normalized["substep_index"] = _checkpoint_counter(
+            state["substep_index"], "substep_index")
+    if "gamma_prev" in state:
+        gamma_prev = _checkpoint_array(
+            state["gamma_prev"], (count,), "gamma_prev")
+        if gamma_prev.size and (
+                float(gamma_prev.min()) < 0.0
+                or float(gamma_prev.max()) > 1.0):
+            raise CheckpointError(
+                "checkpoint gamma_prev must lie in [0, 1]")
+        normalized["gamma_prev"] = gamma_prev
     return normalized
 
 
@@ -662,9 +718,11 @@ def write_checkpoint(
     _, rng_bytes = _checkpoint_rng_json(normalized["rng_state"])
     path = checkpoint_path(cache_dir, frame)
     fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=True)
-    # A version-2 archive always carries the extra per-particle members. When a
-    # caller supplies only base state, persist the historical defaults so the
-    # archive still round-trips (liquid phase, empty affine, zero shading).
+    # A version-2+ archive always carries the extra per-particle members.
+    # When a caller supplies only base state, persist the historical defaults
+    # so the archive still round-trips (liquid phase, empty affine, zero
+    # shading, synthesized ids 0..n-1 -- the same identities a version-2
+    # restore would synthesize).
     count = normalized["pos"].shape[0]
     phase = normalized.get(
         "phase", np.ones((count,), dtype=np.float32))
@@ -674,6 +732,13 @@ def write_checkpoint(
         "age", np.zeros((count,), dtype=np.float32))
     source_id = normalized.get(
         "source_id", np.zeros((count,), dtype=np.int32))
+    particle_id = normalized.get(
+        "particle_id", np.arange(count, dtype=np.int64))
+    next_particle_id = normalized.get("next_particle_id", count)
+    substep_index = normalized.get("substep_index", 0)
+    optional_members = {}
+    if "gamma_prev" in normalized:
+        optional_members["gamma_prev"] = normalized["gamma_prev"]
     fd, temporary = _atomic_path(cache_dir, ".npz")
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -699,6 +764,12 @@ def write_checkpoint(
                 affine_c=affine_c,
                 age=age,
                 source_id=source_id,
+                particle_id=particle_id,
+                next_particle_id=np.asarray(
+                    int(next_particle_id), dtype=np.int64),
+                substep_index=np.asarray(
+                    int(substep_index), dtype=np.int64),
+                **optional_members,
             )
             stream.flush()
             os.fsync(stream.fileno())
@@ -735,7 +806,10 @@ def read_checkpoint(
                     or int(version) not in _CHECKPOINT_KEYS_BY_VERSION):
                 raise CheckpointError("checkpoint schema version is unsupported")
             archived_version = int(version)
-            if files != _CHECKPOINT_KEYS_BY_VERSION[archived_version]:
+            required_keys = _CHECKPOINT_KEYS_BY_VERSION[archived_version]
+            optional_keys = _CHECKPOINT_OPTIONAL_KEYS_BY_VERSION[
+                archived_version]
+            if not required_keys <= files <= (required_keys | optional_keys):
                 raise CheckpointError(
                     "checkpoint archive keys do not match schema")
             schema = data["schema"]
@@ -781,6 +855,12 @@ def read_checkpoint(
                 state["C"] = data["affine_c"]
                 state["age"] = data["age"]
                 state["source_id"] = data["source_id"]
+            if archived_version >= 3:
+                state["particle_id"] = data["particle_id"]
+                state["next_particle_id"] = int(data["next_particle_id"])
+                state["substep_index"] = int(data["substep_index"])
+                if "gamma_prev" in files:
+                    state["gamma_prev"] = data["gamma_prev"]
             return validate_checkpoint_state(state)
     except CheckpointError:
         raise
