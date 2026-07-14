@@ -49,6 +49,76 @@ _PAPER_SURFACE_HOST_FIELD_EQUIVALENTS = 8
 _PAPER_SURFACE_SPLAT_BYTES_PER_CANDIDATE = 128
 _PAPER_SURFACE_DEVICE_BYTES_PER_PARTICLE = 12
 _PAPER_SURFACE_HOST_BYTES_PER_PARTICLE = 24
+_PAPER_LOCAL_POSITION_ATTRIBUTE = "stflip_surface_local_position"
+_PAPER_MESH_COORDINATE_FRAME = "domain_local_object_translation_v1"
+
+
+class SceneUnitBoundary:
+    """Translate physical controls at Blender's solver boundary.
+
+    Blender stores geometry, ``VELOCITY`` properties, and scene gravity in
+    internal Blender units; ``scale_length`` only converts their UI display.
+    Those RNA values therefore pass through to the solver.  Controls whose
+    dimensions Blender cannot express (density and kinematic viscosity) are
+    authored in SI and converted here.  Surface tension has dimensions
+    mass/time^2 (N/m), so its numerical value is unchanged when only the
+    length unit changes.
+    """
+
+    __slots__ = ("meters_per_blender_unit",)
+
+    def __init__(self, meters_per_blender_unit=1.0):
+        if (isinstance(meters_per_blender_unit, bool)
+                or not isinstance(meters_per_blender_unit, numbers.Real)):
+            raise ValueError("scene unit scale must be finite and positive")
+        scale = float(meters_per_blender_unit)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("scene unit scale must be finite and positive")
+        self.meters_per_blender_unit = scale
+
+    def rna_velocity_to_solver(self, value):
+        """Blender RNA already stores velocity in Blender units/second."""
+        return np.asarray(value, dtype=np.float64)
+
+    def rna_acceleration_to_solver(self, value):
+        """Blender RNA already stores acceleration in Blender units/s^2."""
+        return np.asarray(value, dtype=np.float64)
+
+    def density_si_to_solver(self, value: float) -> float:
+        return float(value) * self.meters_per_blender_unit ** 3
+
+    def kinematic_viscosity_si_to_solver(self, value: float) -> float:
+        return float(value) / self.meters_per_blender_unit ** 2
+
+    def surface_tension_si_to_solver(self, value: float) -> float:
+        return float(value)
+
+    def distance_to_si(self, value):
+        return np.asarray(value, dtype=np.float64) * self.meters_per_blender_unit
+
+    def velocity_to_si(self, value):
+        return np.asarray(value, dtype=np.float64) * self.meters_per_blender_unit
+
+    def acceleration_to_si(self, value):
+        return np.asarray(value, dtype=np.float64) * self.meters_per_blender_unit
+
+    def descriptor(self) -> dict:
+        return {
+            "schema": "stflip-scene-unit-boundary",
+            "version": 1,
+            "meters_per_blender_unit": self.meters_per_blender_unit,
+            "geometry": "blender_units",
+            "velocity": "blender_units_per_second_rna",
+            "acceleration": "blender_units_per_second2_rna",
+            "density_input": "kilograms_per_meter3",
+            "kinematic_viscosity_input": "meters2_per_second",
+            "surface_tension_input": "newtons_per_meter",
+        }
+
+
+def _scene_unit_boundary(scene) -> SceneUnitBoundary:
+    settings = getattr(scene, "unit_settings", None)
+    return SceneUnitBoundary(getattr(settings, "scale_length", 1.0))
 
 
 def _value(source, *names, default=None):
@@ -584,7 +654,7 @@ def paper_surface_config(
     return {
         "schema": cache.SURFACE_CONFIG_SCHEMA,
         "version": cache.SURFACE_CONFIG_VERSION,
-        "algorithm": "appendix_b_feature_preserving_mcf_v1",
+        "algorithm": "appendix_b_feature_preserving_mcf_v2",
         "rasterizer": "linear_subvoxel_union_v1",
         "boundary": {
             "gaussian": "constant_zero_extension_v1",
@@ -593,6 +663,9 @@ def paper_surface_config(
         "padding": "ceil_sqrt_iterations_over_3_plus_2_v1",
         "finite_difference": "centered_level_set_v1",
         "float_precision": "float32",
+        "particle_coordinate_frame": "solver_local_float32",
+        "mesh_coordinate_frame": _PAPER_MESH_COORDINATE_FRAME,
+        "blender_object_translation": "domain_world_origin_float64",
         "backend": backend_name,
         "blender_version": str(getattr(
             getattr(bpy, "app", None), "version_string", "unknown")),
@@ -768,12 +841,14 @@ def _source_mask(obj, depsgraph, origin, dx, dims, not_solid=None):
     return mask, int(np.count_nonzero(mask))
 
 
-def _solver_params(settings, dims, dx, gravity, fps):
+def _solver_params(settings, dims, dx, gravity, fps, unit_boundary=None):
     """Translate Blender controls to the bpy-free solver parameter object."""
+    units = unit_boundary or SceneUnitBoundary()
+    gravity_solver = units.rna_acceleration_to_solver(gravity)
     return Params(
         resolution=dims,
         dx=dx,
-        gravity=gravity,
+        gravity=tuple(float(value) for value in gravity_solver),
         frame_dt=1.0 / fps,
         cfl_target=settings.cfl_target,
         particles_per_cell=settings.particles_per_cell,
@@ -783,7 +858,7 @@ def _solver_params(settings, dims, dx, gravity, fps):
         jitter_strength=settings.jitter_strength,
         adaptive_gamma=settings.adaptive_gamma,
         eta_phi=settings.eta_phi,
-        rho=settings.density,
+        rho=units.density_si_to_solver(settings.density),
         cfl_local=settings.local_cfl,
         pcg_tol=settings.pcg_tolerance,
         pcg_max_iter=settings.pcg_max_iterations,
@@ -791,10 +866,11 @@ def _solver_params(settings, dims, dx, gravity, fps):
         eps_rho_rel=settings.density_floor_relative,
         transfer=settings.transfer,
         two_phase=settings.two_phase,
-        rho_gas=settings.rho_gas,
+        rho_gas=units.density_si_to_solver(settings.rho_gas),
         gas_particles_per_cell=settings.gas_particles_per_cell,
-        surface_tension=settings.surface_tension,
-        viscosity=settings.viscosity,
+        surface_tension=units.surface_tension_si_to_solver(
+            settings.surface_tension),
+        viscosity=units.kinematic_viscosity_si_to_solver(settings.viscosity),
         sheeting=settings.sheeting,
         sparse=settings.sparse,
     )
@@ -1103,17 +1179,18 @@ def _force_scalar(value, label: str, source_name: str, *, positive=False):
 
 
 def resolve_force_field(settings, matrix_world, domain_origin, scene_seed,
-                        source_name):
+                        source_name, unit_boundary=None):
     """Resolve Blender force controls into solver-local inputs and metadata."""
     source_name = str(source_name)
+    units = unit_boundary or SceneUnitBoundary()
     force_type = str(settings.force_type).strip().upper()
     if force_type not in {"DIRECTIONAL", "VORTEX", "TURBULENCE"}:
         raise ValueError(
             f"{source_name}: Force Type must be DIRECTIONAL, VORTEX, or "
             "TURBULENCE"
         )
-    strength = _force_scalar(
-        settings.force_strength, "Force Strength", source_name)
+    strength = float(units.rna_acceleration_to_solver(_force_scalar(
+        settings.force_strength, "Force Strength", source_name)).item())
 
     try:
         matrix = np.asarray(matrix_world, dtype=np.float64)
@@ -1223,6 +1300,7 @@ def _resolve_source_velocity(
     mode_label: str,
     velocity_key: str,
     mode_key: str,
+    unit_boundary=None,
 ):
     """Validate shared liquid/inflow controls and return the actual field.
 
@@ -1231,8 +1309,9 @@ def _resolve_source_velocity(
     therefore describe the float32 values that actually seed particles.
     """
     source_name = str(source_name)
-    linear = _finite_vector3(
-        linear_velocity, velocity_label, source_name)
+    units = unit_boundary or SceneUnitBoundary()
+    linear = units.rna_velocity_to_solver(_finite_vector3(
+        linear_velocity, velocity_label, source_name))
     origin = _finite_vector3(domain_origin, "Domain Origin", source_name)
     mode = str(mode)
 
@@ -1286,7 +1365,8 @@ def _resolve_source_velocity(
     return field, descriptor
 
 
-def resolve_liquid_initial_velocity(settings, domain_origin, source_name):
+def resolve_liquid_initial_velocity(
+        settings, domain_origin, source_name, unit_boundary=None):
     """Resolve a liquid source's world-space initial-velocity controls."""
     return _resolve_source_velocity(
         settings.initial_velocity_mode,
@@ -1300,10 +1380,12 @@ def resolve_liquid_initial_velocity(settings, domain_origin, source_name):
         mode_label="Initial Velocity Mode",
         velocity_key="initial_velocity",
         mode_key="initial_velocity_mode",
+        unit_boundary=unit_boundary,
     )
 
 
-def resolve_inflow_velocity(settings, domain_origin, source_name):
+def resolve_inflow_velocity(
+        settings, domain_origin, source_name, unit_boundary=None):
     """Resolve an inflow's world-space controls through the shared validator."""
     return _resolve_source_velocity(
         settings.inflow_velocity_mode,
@@ -1317,6 +1399,7 @@ def resolve_inflow_velocity(settings, domain_origin, source_name):
         mode_label="Inflow Velocity Mode",
         velocity_key="velocity",
         mode_key="velocity_mode",
+        unit_boundary=unit_boundary,
     )
 
 
@@ -1672,8 +1755,127 @@ def _measure_output_frame(frame, solver, stats, positions, velocities,
     )
 
 
-def _reconstruct_paper_surface(
+def _validated_world_origin(origin) -> np.ndarray:
+    try:
+        values = np.asarray(origin, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("world origin must contain three finite values") from exc
+    if values.shape != (3,) or not bool(np.all(np.isfinite(values))):
+        raise ValueError("world origin must contain three finite values")
+    return values
+
+
+def _origin_needs_local_surface_cache(origin, dx: float) -> bool:
+    """Whether float32 world coordinates can erase Paper sub-voxel detail."""
+    world = _validated_world_origin(origin).astype(np.float32)
+    spacing = np.abs(np.spacing(world).astype(np.float64))
+    detail = surface_core.VOXEL_SIZE_DX * float(dx)
+    return bool(np.any(spacing >= 0.25 * detail))
+
+
+def _frame_attributes_with_surface_local_positions(
+    attributes,
+    positions_local,
+    world_origin,
+    dx: float,
+    *,
+    force: bool = False,
+) -> dict:
+    """Preserve exact Paper input, or proactively protect lossy large origins."""
+    result = dict(attributes or {})
+    if force or _origin_needs_local_surface_cache(world_origin, dx):
+        result[_PAPER_LOCAL_POSITION_ATTRIBUTE] = np.ascontiguousarray(
+            positions_local, dtype=np.float32)
+    return result
+
+
+def _cached_surface_local_positions(
+    cache_dir: str,
+    frame: int,
     positions_world,
+    world_origin,
+    dx: float,
+) -> tuple[np.ndarray, str]:
+    """Recover synchronized solver-local positions for a derived rebuild."""
+    world = np.asarray(positions_world)
+    if (world.ndim != 2 or world.shape[1:] != (3,)
+            or not np.issubdtype(world.dtype, np.number)
+            or not bool(np.all(np.isfinite(world)))):
+        raise ValueError("cached world positions must be finite with shape (N, 3)")
+    reader = getattr(cache, "read_frame_attributes", None)
+    extra = reader(cache_dir, frame) if reader is not None else {}
+    local = extra.get(_PAPER_LOCAL_POSITION_ATTRIBUTE)
+    if local is not None:
+        local = np.asarray(local)
+        if (local.shape != world.shape
+                or not np.issubdtype(local.dtype, np.number)
+                or not bool(np.all(np.isfinite(local)))):
+            raise ValueError(
+                "cached synchronized local surface positions are corrupt")
+        return (
+            np.ascontiguousarray(local, dtype=np.float32),
+            "synchronized_solver_local_cache_attribute",
+        )
+    if _origin_needs_local_surface_cache(world_origin, dx):
+        raise ValueError(
+            "large-world Paper reconstruction needs synchronized local "
+            "positions that this particle cache does not contain; rebake "
+            "the simulation with the current add-on before rebuilding "
+            "Paper surfaces"
+        )
+    # Legacy/near-origin frames have only authoritative world coordinates.
+    # Subtract in float64 to avoid adding any further cancellation; detail that
+    # was already quantized by a legacy float32 cache cannot be reconstructed.
+    origin = _validated_world_origin(world_origin)
+    local = np.asarray(world, dtype=np.float64) - origin[None, :]
+    return (
+        np.ascontiguousarray(local, dtype=np.float32),
+        "world_cache_float64_subtraction_fallback",
+    )
+
+
+def _read_bound_paper_surface(
+    cache_dir: str,
+    frame: int,
+    fingerprint: str,
+    positions_world,
+    world_origin,
+    dx: float,
+):
+    """Read v2 against reconstruction-local input and v1 against world input."""
+
+    local_positions = None
+    local_source = None
+    local_error = None
+    try:
+        local_positions, local_source = _cached_surface_local_positions(
+            cache_dir, frame, positions_world, world_origin, dx)
+    except ValueError as exc:
+        # A legacy v1 mesh may still be valid at a large world origin because
+        # that archive was intentionally bound to the world-space frame.  A v2
+        # archive (or a missing archive that needs rebuilding) fails closed.
+        local_error = exc
+    surface = cache.read_surface(
+        cache_dir,
+        frame,
+        fingerprint,
+        expected_source_positions=local_positions,
+        expected_legacy_source_positions=positions_world,
+    )
+    if surface is None and local_error is not None:
+        raise cache.SurfaceCacheError(str(local_error)) from local_error
+    return surface, local_positions, local_source
+
+
+def _set_paper_surface_origin(obj, world_origin) -> None:
+    """Keep Paper vertices local and place their Blender object in the world."""
+    if obj is None:
+        return
+    mesher.place_paper_surface_object(obj, world_origin)
+
+
+def _reconstruct_paper_surface(
+    positions_local,
     dx: float,
     config: dict,
     max_voxels: int,
@@ -1688,7 +1890,7 @@ def _reconstruct_paper_surface(
 
     started = time.perf_counter()
     result = surface_core.reconstruct_surface(
-        positions_world,
+        positions_local,
         dx,
         iterations=int(config["mcf_iterations"]),
         max_voxels=int(max_voxels),
@@ -1716,8 +1918,9 @@ def _reconstruct_paper_surface(
         "vertex_count": int(vertices.shape[0]),
         "triangle_count": int(triangles.shape[0]),
         "quad_count": int(quads.shape[0]),
-        "source_positions_sha256": cache.surface_source_fingerprint(
-            positions_world),
+        "source_local_positions_sha256": cache.surface_source_fingerprint(
+            positions_local),
+        "mesh_coordinate_frame": _PAPER_MESH_COORDINATE_FRAME,
         "mesh_sha256": cache.surface_mesh_fingerprint(
             vertices, triangles, quads),
         "field_wall_s": field_wall_s,
@@ -1730,20 +1933,34 @@ def _reconstruct_paper_surface(
 def _write_paper_surface_frame(
     cache_dir: str,
     frame: int,
-    positions_world,
+    positions_local,
     dx: float,
     config: dict,
     fingerprint: str,
     max_voxels: int,
     backend,
+    *,
+    world_origin=(0.0, 0.0, 0.0),
+    source_positions_world=None,
+    local_position_source="live_synchronized_solver_local",
 ):
     vertices, triangles, quads, diagnostics = _reconstruct_paper_surface(
-        positions_world,
+        positions_local,
         dx,
         config,
         max_voxels,
         backend,
     )
+    origin = _validated_world_origin(world_origin)
+    source_positions = (
+        positions_local
+        if source_positions_world is None else source_positions_world)
+    diagnostics.update({
+        "world_origin": [float(value) for value in origin],
+        "local_position_source": str(local_position_source),
+        "source_positions_sha256": cache.surface_source_fingerprint(
+            source_positions),
+    })
     cache.write_surface(
         cache_dir,
         frame,
@@ -1751,7 +1968,7 @@ def _write_paper_surface_frame(
         vertices,
         triangles,
         quads,
-        source_positions=positions_world,
+        source_positions=positions_local,
     )
     return vertices, triangles, quads, diagnostics
 
@@ -2047,6 +2264,66 @@ _PRESET_BUILDERS = {
     "TWO_PHASE_GLUG": _preset_two_phase_glug,
     "FOUNTAIN": _preset_fountain,
 }
+
+
+def apply_paper_fidelity_settings(settings) -> None:
+    """Apply the paper-facing simulation and reconstruction defaults.
+
+    This intentionally changes only settings.  Existing particle caches are
+    preserved so applying an output-quality preset can never delete work; the
+    normal fingerprint and derived-cache checks require a rebake/rebuild where
+    the selected values differ from the committed cache.
+    """
+    values = {
+        # This preset is a deliberate combination of paper-wide solver and
+        # output defaults, not one of the narrower experiment profiles.
+        "experiment_profile": "CUSTOM",
+        "cfl_target": 8.0,
+        "particles_per_cell": 8,
+        "seed": 0,
+        "st_enabled": True,
+        "jitter_strength": 1.0,
+        "adaptive_gamma": True,
+        "eta_phi": 0.5,
+        "transfer": "flip",
+        "flip_blend": 0.98,
+        "local_cfl": 1.0,
+        "pcg_tolerance": 1e-4,
+        "create_surface": True,
+        "surface_method": "PAPER_MCF",
+        "particle_radius": surface_core.SPHERE_RADIUS_DX,
+        "surface_voxel": surface_core.VOXEL_SIZE_DX,
+        "surface_smoothing": False,
+        "paper_mcf_iterations": surface_core.DEFAULT_MCF_ITERATIONS,
+        "paper_mesh_adaptivity": 0.0,
+    }
+    for name, value in values.items():
+        setattr(settings, name, value)
+
+
+class STFLIP_OT_apply_paper_fidelity(bpy.types.Operator):
+    """Select the paper method defaults and Appendix-B render surface."""
+
+    bl_idname = "stflip.apply_paper_fidelity"
+    bl_label = "Final / Paper Fidelity"
+    bl_description = (
+        "Apply ST-FLIP paper defaults plus Paper MCF with 30 iterations and "
+        "zero mesh adaptivity; existing caches are preserved"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if _BAKE.get("running") or _SURFACE_BAKE.get("running"):
+            self.report({"WARNING"}, "Cancel the running bake or rebuild first")
+            return {"CANCELLED"}
+        settings = context.scene.stflip
+        apply_paper_fidelity_settings(settings)
+        settings.bake_status = (
+            "Final / Paper Fidelity selected; rebake simulation or rebuild "
+            "Paper surfaces if the committed cache used different settings"
+        )
+        self.report({"INFO"}, settings.bake_status)
+        return {"FINISHED"}
 
 
 class STFLIP_OT_add_preset(bpy.types.Operator):
@@ -2404,20 +2681,28 @@ class STFLIP_OT_bake(bpy.types.Operator):
         dims, dx, origin = voxelize.domain_grid(st.domain, st.resolution)
         fps = scene.render.fps / scene.render.fps_base
         gravity = tuple(scene.gravity) if scene.use_gravity else (0.0, 0.0, 0.0)
-        params = _solver_params(st, dims, dx, gravity, fps)
+        try:
+            unit_boundary = _scene_unit_boundary(scene)
+            params = _solver_params(
+                st, dims, dx, gravity, fps, unit_boundary=unit_boundary)
+        except ValueError as exc:
+            message = str(exc)
+            _fail_bake(st, message)
+            self.report({"ERROR"}, message)
+            return False
         try:
             liquid_velocity_sources = [
                 (
                     obj,
                     *resolve_liquid_initial_velocity(
-                        obj.stflip, origin, obj.name),
+                        obj.stflip, origin, obj.name, unit_boundary),
                 )
                 for obj in liquids
             ]
             inflow_velocity_sources = []
             for obj in inflows:
                 velocity_field, descriptor = resolve_inflow_velocity(
-                    obj.stflip, origin, obj.name)
+                    obj.stflip, origin, obj.name, unit_boundary)
                 start_time, end_time, schedule, warning = (
                     resolve_inflow_schedule(
                         obj.stflip,
@@ -2672,6 +2957,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 origin,
                 st.seed,
                 obj.name,
+                unit_boundary,
             )
             solver.add_force(**force)
             force_records.append(descriptor)
@@ -2866,6 +3152,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "system": scene.unit_settings.system,
                 "scale_length": scene.unit_settings.scale_length,
             },
+            "unit_conversion": unit_boundary.descriptor(),
             "scene_setup": setup_provenance,
             "experiment_profile": None,
             "settings": {
@@ -2880,12 +3167,23 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 "eta_phi": st.eta_phi,
                 "flip_fraction": st.flip_blend,
                 "density": params.rho,
+                "density_kilograms_per_meter3": st.density,
+                "gas_density_kilograms_per_meter3": st.rho_gas,
                 "local_advection_cfl": params.cfl_local,
                 "pcg_tolerance": params.pcg_tol,
                 "pcg_max_iterations": params.pcg_max_iter,
                 "eps_m": params.eps_m,
                 "eps_rho_relative": params.eps_rho_rel,
-                "gravity": list(gravity),
+                "gravity": list(params.gravity),
+                "gravity_meters_per_second2": [
+                    float(value)
+                    for value in unit_boundary.acceleration_to_si(
+                        params.gravity)
+                ],
+                "surface_tension_newtons_per_meter": st.surface_tension,
+                "kinematic_viscosity_meters2_per_second": st.viscosity,
+                "kinematic_viscosity_solver_units2_per_second": (
+                    params.viscosity),
                 "fps": fps,
                 "create_surface": st.create_surface,
                 "surface_method": st.surface_method,
@@ -2999,23 +3297,30 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 meta.pop("surface_reconstruction", None)
             if paper_config is not None:
                 try:
-                    cached_surface = cache.read_surface(
-                        cache_dir,
-                        latest_frame,
-                        paper_fingerprint,
-                        expected_source_positions=latest_particles[0],
+                    cached_surface, local_positions, local_source = (
+                        _read_bound_paper_surface(
+                            cache_dir,
+                            latest_frame,
+                            paper_fingerprint,
+                            latest_particles[0],
+                            origin,
+                            dx,
+                        )
                     )
                     if cached_surface is None:
                         vertices, triangles, quads, surface_diagnostics = (
                             _write_paper_surface_frame(
                                 cache_dir,
                                 latest_frame,
-                                latest_particles[0],
+                                local_positions,
                                 dx,
                                 paper_config,
                                 paper_fingerprint,
                                 st.paper_max_reconstruction_voxels,
                                 paper_surface_backend,
+                                world_origin=origin,
+                                source_positions_world=latest_particles[0],
+                                local_position_source=local_source,
                             )
                         )
                         paper_mesh = (vertices, triangles, quads)
@@ -3049,12 +3354,21 @@ class STFLIP_OT_bake(bpy.types.Operator):
             collect_enstrophy = bool(
                 st.collect_metrics and st.collect_enstrophy)
             pos, vel, attrs = solver.get_render_particles_ex()
+            # Particle playback stays byte-compatible float32 world space.
+            # Live Paper v2 frames also preserve the exact synchronized local
+            # reconstruction input; non-Paper frames do so when a large origin
+            # would make a later Paper rebuild from the display cache lossy.
+            world_positions = (
+                np.asarray(pos, dtype=np.float32)
+                + np.asarray(origin, dtype=np.float32)[None, :]
+            )
             cache.write_frame(
                 cache_dir,
                 current_frame,
-                pos + origin[None, :].astype(np.float32),
+                world_positions,
                 vel,
-                attributes=attrs,
+                attributes=_frame_attributes_with_surface_local_positions(
+                    attrs, pos, origin, dx, force=paper_config is not None),
             )
             cache.write_checkpoint(
                 cache_dir,
@@ -3064,19 +3378,19 @@ class STFLIP_OT_bake(bpy.types.Operator):
             )
             paper_mesh = None
             if paper_config is not None:
-                world_positions = (
-                    pos + origin[None, :].astype(np.float32))
                 try:
                     vertices, triangles, quads, surface_diagnostics = (
                         _write_paper_surface_frame(
                             cache_dir,
                             current_frame,
-                            world_positions,
+                            pos,
                             dx,
                             paper_config,
                             paper_fingerprint,
                             st.paper_max_reconstruction_voxels,
                             paper_surface_backend,
+                            world_origin=origin,
+                            source_positions_world=world_positions,
                         )
                     )
                     paper_mesh = (vertices, triangles, quads)
@@ -3120,7 +3434,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
 
         _BAKE.update(
             solver=solver,
-            origin=origin.astype(np.float32),
+            origin=origin.copy(),
             scene=scene,
             cache_dir=cache_dir,
             meta=meta,
@@ -3160,6 +3474,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                             *paper_mesh,
                             existing_obj=st.surface_object,
                         )
+                        _set_paper_surface_origin(st.surface_object, origin)
                         _set_surface_enabled(st.surface_object, True)
                     except Exception as exc:
                         self.report(
@@ -3192,6 +3507,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
                     st.surface_voxel,
                     existing_obj=st.surface_object,
                 )
+                _set_paper_surface_origin(st.surface_object, (0.0, 0.0, 0.0))
                 mesher.configure_surface_smoothing(
                     st.surface_object,
                     st.surface_smoothing,
@@ -3247,9 +3563,22 @@ class STFLIP_OT_bake(bpy.types.Operator):
             compute_wall_s = None
         b["frame"] += 1
         pos, vel, attrs = solver.get_render_particles_ex()
-        world_positions = pos + b["origin"][None, :]
+        world_positions = (
+            np.asarray(pos, dtype=np.float32)
+            + np.asarray(b["origin"], dtype=np.float32)[None, :]
+        )
         cache.write_frame(b["cache_dir"], b["frame"],
-                          world_positions, vel, attributes=attrs)
+                          world_positions, vel,
+                          attributes=(
+                              _frame_attributes_with_surface_local_positions(
+                                  attrs,
+                                  pos,
+                                  b["origin"],
+                                  solver.p.dx,
+                                  force=(
+                                      b.get("paper_surface_config") is not None),
+                              )
+                          ))
         ww = b.get("whitewater")
         if ww is not None:
             try:
@@ -3258,7 +3587,9 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 np.savez(
                     os.path.join(b["cache_dir"],
                                  f"stflip_ww_{b['frame']:06d}.npz"),
-                    pos=wpos + b["origin"][None, :], vel=wvel,
+                    pos=np.asarray(
+                        wpos + b["origin"][None, :], dtype=np.float32),
+                    vel=wvel,
                     kind=wkind, life=wlife)
             except Exception as exc:
                 b["whitewater"] = None
@@ -3278,12 +3609,14 @@ class STFLIP_OT_bake(bpy.types.Operator):
                     _write_paper_surface_frame(
                         b["cache_dir"],
                         b["frame"],
-                        world_positions,
+                        pos,
                         solver.p.dx,
                         paper_config,
                         b["paper_surface_fingerprint"],
                         b["paper_surface_max_voxels"],
                         b.get("paper_surface_backend", solver.be),
+                        world_origin=b["origin"],
+                        source_positions_world=world_positions,
                     )
                 )
                 b["meta"]["surface_reconstruction"].update({
@@ -3532,8 +3865,12 @@ class STFLIP_OT_rebuild_paper_surfaces(bpy.types.Operator):
             return False
         try:
             dx = float(meta["dx"])
+            world_origin = _validated_world_origin(meta["origin"])
         except (KeyError, TypeError, ValueError):
-            self.report({"ERROR"}, "Cache metadata has no valid cell size")
+            self.report(
+                {"ERROR"},
+                "Cache metadata has no valid cell size or world origin",
+            )
             return False
         frames = cache.committed_frames(cache_dir, meta)
         if not frames:
@@ -3617,6 +3954,7 @@ class STFLIP_OT_rebuild_paper_surfaces(bpy.types.Operator):
             "frames": frames,
             "index": 0,
             "dx": dx,
+            "world_origin": world_origin,
             "backend": backend,
             "config": config,
             "fingerprint": fingerprint,
@@ -3635,16 +3973,26 @@ class STFLIP_OT_rebuild_paper_surfaces(bpy.types.Operator):
         particle_frame = cache.read_frame(state["cache_dir"], frame)
         if particle_frame is None:
             raise ValueError(f"committed particle frame {frame} is corrupt")
+        local_positions, local_source = _cached_surface_local_positions(
+            state["cache_dir"],
+            frame,
+            particle_frame[0],
+            state["world_origin"],
+            state["dx"],
+        )
         _vertices, _triangles, _quads, diagnostics = (
             _write_paper_surface_frame(
                 state["cache_dir"],
                 frame,
-                particle_frame[0],
+                local_positions,
                 state["dx"],
                 state["config"],
                 state["fingerprint"],
                 state["max_voxels"],
                 state["backend"],
+                world_origin=state["world_origin"],
+                source_positions_world=particle_frame[0],
+                local_position_source=local_source,
             )
         )
         state["latest_diagnostics"] = diagnostics
@@ -3709,11 +4057,13 @@ class STFLIP_OT_rebuild_paper_surfaces(bpy.types.Operator):
                         if particle_frame is None:
                             raise ValueError(
                                 f"committed particle frame {frame} is corrupt")
-                        paper_mesh = cache.read_surface(
+                        paper_mesh, _local, _source = _read_bound_paper_surface(
                             state["cache_dir"],
                             frame,
                             state["fingerprint"],
-                            expected_source_positions=particle_frame[0],
+                            particle_frame[0],
+                            state["world_origin"],
+                            state["dx"],
                         )
                         if paper_mesh is None:
                             raise ValueError(
@@ -3722,6 +4072,8 @@ class STFLIP_OT_rebuild_paper_surfaces(bpy.types.Operator):
                             *paper_mesh,
                             existing_obj=st.surface_object,
                         )
+                        _set_paper_surface_origin(
+                            st.surface_object, state["world_origin"])
                         _set_surface_enabled(st.surface_object, True)
                     except Exception as exc:
                         try:
@@ -3823,8 +4175,12 @@ class STFLIP_OT_refresh_surface(bpy.types.Operator):
         meta = cache.read_meta(resolve_cache_dir(scene))
         try:
             dx = float(meta["dx"])
+            world_origin = _validated_world_origin(meta["origin"])
         except (KeyError, TypeError, ValueError):
-            self.report({"ERROR"}, "Cache metadata has no valid cell size")
+            self.report(
+                {"ERROR"},
+                "Cache metadata has no valid cell size or world origin",
+            )
             return {"CANCELLED"}
         if not math.isfinite(dx) or dx <= 0.0:
             self.report({"ERROR"}, "Cache metadata has no valid cell size")
@@ -3885,11 +4241,13 @@ class STFLIP_OT_refresh_surface(bpy.types.Operator):
                     {"ERROR"}, f"Particle frame {frame} is missing or corrupt")
                 return {"CANCELLED"}
             try:
-                paper_mesh = cache.read_surface(
+                paper_mesh, _local, _source = _read_bound_paper_surface(
                     resolve_cache_dir(scene),
                     frame,
                     active_fingerprint,
-                    expected_source_positions=particle_frame[0],
+                    particle_frame[0],
+                    world_origin,
+                    dx,
                 )
             except cache.SurfaceCacheError as exc:
                 self.report({"ERROR"}, f"Paper surface cache is corrupt: {exc}")
@@ -3904,6 +4262,7 @@ class STFLIP_OT_refresh_surface(bpy.types.Operator):
                 *paper_mesh,
                 existing_obj=st.surface_object,
             )
+            _set_paper_surface_origin(st.surface_object, world_origin)
         else:
             st.surface_object = mesher.restore_preview_surface(
                 particle_obj,
@@ -3912,6 +4271,7 @@ class STFLIP_OT_refresh_surface(bpy.types.Operator):
                 st.surface_voxel,
                 existing_obj=st.surface_object,
             )
+            _set_paper_surface_origin(st.surface_object, (0.0, 0.0, 0.0))
             mesher.configure_surface_smoothing(
                 st.surface_object,
                 st.surface_smoothing,
@@ -4412,6 +4772,7 @@ class STFLIP_OT_setup_studio(bpy.types.Operator):
 CLASSES = (
     STFLIP_OT_quick_setup,
     STFLIP_OT_add_preset,
+    STFLIP_OT_apply_paper_fidelity,
     STFLIP_OT_apply_material,
     STFLIP_OT_setup_studio,
     STFLIP_OT_whirlpool_preview,

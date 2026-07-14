@@ -34,9 +34,17 @@ committed frame after a Paper setting changes.
 **Refresh Surface** applies Fast Preview changes or reloads an already matching
 Paper cache; it does not rebuild.
 
-Playback and Paper surfaces use float32 world-space positions. Keep
-high-resolution domains near the world origin so large offsets do not erase
-subcell detail.
+Playback positions are still stored as float32 world coordinates. Paper MCF,
+however, reconstructs in the Domain-local frame and places the mesh in world
+space by object translation. When an origin-versus-voxel precision check says
+world float32 is inadequate, a current bake also stores synchronized
+solver-local positions for the derived rebuild.
+
+Older particle caches may contain only world-space positions. Near the origin,
+the rebuild can subtract the origin in float64. If a large-world legacy cache
+has already lost Paper-scale detail to float32 quantization, the rebuild fails
+closed and requests a fresh simulation bake with the current add-on; it never
+silently produces a lower-fidelity Paper mesh.
 
 ## Shading the water — the fast path
 
@@ -87,8 +95,11 @@ solver cache.
 
 ## A clean final-frame workflow
 
-1. Bake the simulation (see [performance-and-scaling](performance-and-scaling.md)).
-2. Switch **Surface Method** to **Paper MCF** and **Rebuild Paper Surface
+1. Press **Final / Paper Fidelity**, then bake the simulation (see
+   [performance-and-scaling](performance-and-scaling.md)). The preset preserves
+   existing cache files, so rebake when its solver settings differ from the
+   committed bake.
+2. Confirm **Surface Method = Paper MCF** and **Rebuild Paper Surface
    Cache** for the render range.
 3. In **Materials & Look**, pick a Fluid Material, **Apply** it, and press
    **Setup Studio Look**. Add **Motion Blur** if the fluid moves fast.

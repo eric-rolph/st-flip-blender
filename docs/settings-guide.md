@@ -13,6 +13,37 @@ This is the *practical* companion to the full settings table in the top-level
   Higher CFL = fewer, bigger steps (faster) but coarser time accuracy; lower
   CFL trades speed for accuracy.
 
+## Final / Paper Fidelity preset
+
+Use **Final / Paper Fidelity** when moving from look-dev to a paper-facing
+configuration. This curated mixed preset resets **Experiment Profile** to
+Custom, then sets CFL 8, 8 particles/cell, seed 0, ST sampling with `γ=1`,
+adaptive attenuation, `ηφ=0.5`, FLIP 0.98, local CFL 1, pressure tolerance
+`1e-4`, and Paper MCF with 30 iterations and zero mesh adaptivity. It changes
+settings only and preserves cache files; normal fingerprint checks tell you
+whether the simulation needs a rebake or only the derived surface needs a
+rebuild.
+
+This is not a complete or uniquely paper-mandated production configuration.
+Geometry, resolution, FPS, backend, pressure-solver choice/iteration limit,
+density, two-phase controls, reconstruction memory cap, and other unlisted
+settings remain unchanged.
+
+## Scene units and physical controls
+
+Let `s = Unit Scale`, in metres per Blender unit. Blender already stores mesh
+coordinates, velocity properties, and scene gravity in internal Blender units,
+so those values pass through unchanged. The add-on converts only controls
+authored explicitly in SI:
+
+- liquid/gas density: multiply `kg/m³` by `s³`;
+- kinematic viscosity: divide `m²/s` by `s²`;
+- surface tension: unchanged (`N/m = kg/s²`).
+
+Changing Unit Scale alone changes display conversion; it does not resize
+objects or rewrite existing velocity/gravity values. The boundary policy and
+scale are recorded in bake metadata.
+
 ## Detail vs. smoothness — Transfer
 
 - **FLIP** — most energetic and detailed, but noisier. Good for violent
@@ -71,6 +102,13 @@ Both choices solve the same discretized PPE to the configured tolerance.
 Different reduction order and iteration paths can produce small roundoff-level
 differences, which may eventually separate chaotic trajectories.
 
+The tolerance is a contract, not a hint. If the terminal relative residual is
+non-finite or still above tolerance at the iteration limit, the solver raises
+an explicit pressure-convergence error and the bake fails instead of committing
+that step as valid. There is no automatic fallback solve. Increase the
+iteration limit only after checking scene scale, density ratio, and resolution;
+do not hide a non-finite solve by loosening tolerance.
+
 Both use one or more tight active boxes when the projected reduction is
 worthwhile; otherwise they solve the full grid. Empty lattice planes may split
 independent boxes. This is separate from the **Sparse Grid** toggle.
@@ -82,7 +120,11 @@ speed/memory win when the fluid occupies a small part of a large domain (a
 splash in a big room). It disengages automatically when it cannot help (outflows
 or cut-cell solids present, or Two-Phase filling the domain).
 
-This remains dense storage inside the active window, not a tiled sparse grid.
+This remains dense storage inside the active window. A standalone Phase-1
+tiled representation now provides deterministic core/halo tile layouts, a
+dense coarse lookup table, neighbour slots, dense-field pack/unpack, packed
+halo exchange, and callable sparsity telemetry for future work, but no solver
+step uses it yet. The toggle is therefore not a fully tiled sparse grid.
 
 ## Reproducibility — Random Seed
 

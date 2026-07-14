@@ -100,6 +100,13 @@ class STFLIP_PT_presets(bpy.types.Panel):
         ):
             col.operator("stflip.add_preset", text=label,
                          icon=icon).preset = preset
+        col.separator()
+        col.label(text="Output quality:")
+        col.operator(
+            "stflip.apply_paper_fidelity",
+            text="Final / Paper Fidelity",
+            icon="SHADING_RENDERED",
+        )
 
 
 class STFLIP_PT_object(bpy.types.Panel):

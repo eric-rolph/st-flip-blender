@@ -81,6 +81,10 @@ def _load_operators(monkeypatch, tmp_path):
         module = types.ModuleType(f"{root}.addon.{leaf}")
         if leaf == "handlers":
             module.resolve_cache_dir = lambda scene: ""
+        elif leaf == "mesher":
+            module.place_paper_surface_object = (
+                lambda obj, origin: setattr(
+                    obj, "location", tuple(origin)) or obj)
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
     operators = _load_module(
@@ -615,6 +619,76 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         "viscosity": 0.03,
         "sheeting": 0.4,
     }
+
+
+def test_scene_unit_boundary_preserves_physics_across_unit_scales(
+        monkeypatch, tmp_path):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+    meters = operators.SceneUnitBoundary(1.0)
+    centimeters = operators.SceneUnitBoundary(0.01)
+
+    # The same 0.5 m cell and 2 m/s velocity have different Blender-unit
+    # values, but convert back to identical physical quantities.
+    assert meters.distance_to_si(0.5) == pytest.approx(0.5)
+    assert centimeters.distance_to_si(50.0) == pytest.approx(0.5)
+    assert meters.velocity_to_si(2.0) == pytest.approx(2.0)
+    assert centimeters.velocity_to_si(200.0) == pytest.approx(2.0)
+    assert meters.acceleration_to_si(-9.81) == pytest.approx(-9.81)
+    assert centimeters.acceleration_to_si(-981.0) == pytest.approx(-9.81)
+
+    rho_si = 1000.0
+    nu_si = 1e-6
+    sigma_si = 0.072
+    assert centimeters.density_si_to_solver(rho_si) == pytest.approx(0.001)
+    assert centimeters.kinematic_viscosity_si_to_solver(
+        nu_si) == pytest.approx(0.01)
+    assert centimeters.surface_tension_si_to_solver(
+        sigma_si) == pytest.approx(sigma_si)
+
+    # Reynolds and capillary acceleration scales remain invariant after
+    # converting solver values back to meters.
+    re_m = 2.0 * 0.5 / nu_si
+    re_cm = 200.0 * 50.0 / (
+        centimeters.kinematic_viscosity_si_to_solver(nu_si))
+    assert re_cm == pytest.approx(re_m)
+    capillary_m = sigma_si / (rho_si * 0.5 ** 2)
+    capillary_cm_solver = sigma_si / (
+        centimeters.density_si_to_solver(rho_si) * 50.0 ** 2)
+    assert centimeters.acceleration_to_si(
+        capillary_cm_solver) == pytest.approx(capillary_m)
+
+
+def test_solver_params_converts_si_only_at_scene_unit_boundary(
+        monkeypatch, tmp_path):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+    captured = {}
+    operators.Params = lambda **kwargs: captured.update(kwargs) or captured
+    settings = types.SimpleNamespace(
+        cfl_target=8.0, particles_per_cell=8, seed=0, flip_blend=0.98,
+        st_enabled=True, jitter_strength=1.0, adaptive_gamma=True,
+        eta_phi=0.5, density=1000.0, local_cfl=1.0,
+        pcg_tolerance=1e-4, pcg_max_iterations=400,
+        pressure_solver="jacobi", density_floor_relative=1e-3,
+        transfer="flip", two_phase=True, rho_gas=1.2,
+        gas_particles_per_cell=8, surface_tension=0.072,
+        viscosity=1e-6, sheeting=0.0, sparse=False,
+    )
+
+    operators._solver_params(
+        settings,
+        (8, 8, 8),
+        50.0,
+        (0.0, 0.0, -981.0),
+        24.0,
+        unit_boundary=operators.SceneUnitBoundary(0.01),
+    )
+
+    assert captured["dx"] == 50.0
+    assert captured["gravity"] == (0.0, 0.0, -981.0)
+    assert captured["rho"] == pytest.approx(0.001)
+    assert captured["rho_gas"] == pytest.approx(1.2e-6)
+    assert captured["surface_tension"] == pytest.approx(0.072)
+    assert captured["viscosity"] == pytest.approx(0.01)
 
 
 def test_simulation_fingerprint_is_stable_and_input_complete(

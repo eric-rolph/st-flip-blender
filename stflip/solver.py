@@ -42,6 +42,10 @@ _OFFSETS = {
     "c": (0.5, 0.5, 0.5),
 }
 
+_PRESSURE_OUTFLOW_SIDES = (
+    "x_min", "x_max", "y_min", "y_max", "z_min", "z_max",
+)
+
 _TAPS = [(di, dj, dk) for di in (0, 1) for dj in (0, 1) for dk in (0, 1)]
 
 
@@ -356,6 +360,9 @@ class STFLIPSolver:
         self._pressure_outflow = None
         self._has_volume_outflow = False
         self._has_pressure_outflow = False
+        self._pressure_outflow_side_masks = {
+            side: None for side in _PRESSURE_OUTFLOW_SIDES
+        }
         self._pressure_outflow_faces = None
         self._outflow_geometry_stats_cache = None
         self._outflow_removed_total = 0
@@ -736,20 +743,47 @@ class STFLIPSolver:
             (self.be.from_numpy(mask), field, start, end, phase_value, sid)
         )
 
-    def add_outflow(self, cell_mask: np.ndarray, mode: str = "VOLUME") -> None:
+    def add_outflow(
+        self,
+        cell_mask: np.ndarray,
+        mode: str = "VOLUME",
+        *,
+        faces=None,
+    ) -> None:
         """Register a particle sink or an exterior pressure/open boundary.
 
         ``VOLUME`` removes particles entering any marked cell, with the mask
         tested after every local RK advection substep. ``PRESSURE`` opens only
         the simulation-domain faces intersected by marked boundary cells,
         imposes exterior ``p = 0`` at half-cell distance, and removes particles
-        after they cross one of those faces.
+        after they cross one of those faces.  ``faces`` may restrict a PRESSURE
+        mask to named faces (``x_min`` through ``z_max``); omitting it preserves
+        the historical behavior of opening every exterior face touched by the
+        mask.
         """
         if not isinstance(mode, str):
             raise ValueError("outflow mode must be 'VOLUME' or 'PRESSURE'")
         normalized = mode.strip().upper()
         if normalized not in {"VOLUME", "PRESSURE"}:
             raise ValueError("outflow mode must be 'VOLUME' or 'PRESSURE'")
+        if faces is not None and normalized != "PRESSURE":
+            raise ValueError("outflow faces apply only to PRESSURE mode")
+        if faces is None:
+            selected_sides = _PRESSURE_OUTFLOW_SIDES
+        else:
+            try:
+                values = (faces,) if isinstance(faces, str) else tuple(faces)
+                selected_sides = tuple(
+                    str(side).strip().lower() for side in values)
+            except TypeError as exc:
+                raise ValueError(
+                    "pressure outflow faces must be exterior face names") from exc
+            if (not selected_sides
+                    or len(set(selected_sides)) != len(selected_sides)
+                    or any(side not in _PRESSURE_OUTFLOW_SIDES
+                           for side in selected_sides)):
+                raise ValueError(
+                    "pressure outflow faces must be unique exterior face names")
         mask = self._validate_cell_mask(cell_mask)
         if normalized == "PRESSURE" and np.any(mask) and not (
             np.any(mask[0])
@@ -762,6 +796,23 @@ class STFLIPSolver:
             raise ValueError(
                 "PRESSURE outflow mask must intersect the domain exterior"
             )
+        boundary_views = {
+            "x_min": mask[0],
+            "x_max": mask[-1],
+            "y_min": mask[:, 0],
+            "y_max": mask[:, -1],
+            "z_min": mask[:, :, 0],
+            "z_max": mask[:, :, -1],
+        }
+        if normalized == "PRESSURE":
+            missing = [
+                side for side in selected_sides
+                if not np.any(boundary_views[side])
+            ]
+            if faces is not None and missing:
+                raise ValueError(
+                    "PRESSURE outflow mask has no marked cells on requested "
+                    f"side(s): {', '.join(missing)}")
         has_cells = bool(np.any(mask))
         if not has_cells:
             return
@@ -779,6 +830,19 @@ class STFLIPSolver:
                 if self._pressure_outflow is None
                 else self._pressure_outflow | device_mask
             )
+            device_boundaries = {
+                "x_min": device_mask[0],
+                "x_max": device_mask[-1],
+                "y_min": device_mask[:, 0],
+                "y_max": device_mask[:, -1],
+                "z_min": device_mask[:, :, 0],
+                "z_max": device_mask[:, :, -1],
+            }
+            for side in selected_sides:
+                boundary = device_boundaries[side].copy()
+                existing = self._pressure_outflow_side_masks[side]
+                self._pressure_outflow_side_masks[side] = (
+                    boundary if existing is None else existing | boundary)
             self._has_pressure_outflow = True
             self._pressure_outflow_faces = None
         self._outflow_geometry_stats_cache = None
@@ -1196,17 +1260,29 @@ class STFLIPSolver:
         xp = self.be.xp
         nx, ny, nz = self.shape
         _, _, _, solid_c = self._solid_face_apertures()
-        boundary_cells = self._pressure_outflow & (~solid_c)
         exterior = self._solid_exterior_apertures
         face_u = xp.zeros((nx + 1, ny, nz), dtype=bool)
         face_v = xp.zeros((nx, ny + 1, nz), dtype=bool)
         face_w = xp.zeros((nx, ny, nz + 1), dtype=bool)
-        face_u[0] = boundary_cells[0] & (exterior[0] > 0.0)
-        face_u[-1] = boundary_cells[-1] & (exterior[1] > 0.0)
-        face_v[:, 0] = boundary_cells[:, 0] & (exterior[2] > 0.0)
-        face_v[:, -1] = boundary_cells[:, -1] & (exterior[3] > 0.0)
-        face_w[:, :, 0] = boundary_cells[:, :, 0] & (exterior[4] > 0.0)
-        face_w[:, :, -1] = boundary_cells[:, :, -1] & (exterior[5] > 0.0)
+        side_masks = self._pressure_outflow_side_masks
+        if side_masks["x_min"] is not None:
+            face_u[0] = (side_masks["x_min"] & (~solid_c[0])
+                         & (exterior[0] > 0.0))
+        if side_masks["x_max"] is not None:
+            face_u[-1] = (side_masks["x_max"] & (~solid_c[-1])
+                          & (exterior[1] > 0.0))
+        if side_masks["y_min"] is not None:
+            face_v[:, 0] = (side_masks["y_min"] & (~solid_c[:, 0])
+                            & (exterior[2] > 0.0))
+        if side_masks["y_max"] is not None:
+            face_v[:, -1] = (side_masks["y_max"] & (~solid_c[:, -1])
+                             & (exterior[3] > 0.0))
+        if side_masks["z_min"] is not None:
+            face_w[:, :, 0] = (side_masks["z_min"] & (~solid_c[:, :, 0])
+                               & (exterior[4] > 0.0))
+        if side_masks["z_max"] is not None:
+            face_w[:, :, -1] = (side_masks["z_max"] & (~solid_c[:, :, -1])
+                                & (exterior[5] > 0.0))
         self._pressure_outflow_faces = (face_u, face_v, face_w)
         return self._pressure_outflow_faces
 
@@ -1994,6 +2070,8 @@ class STFLIPSolver:
             max_iter=p.pcg_max_iter)
         stats.pcg_iters.append(iters)
         stats.pcg_rel_residuals.append(rel)
+        if not math.isfinite(rel) or rel > p.pcg_tol:
+            raise pressure.PressureSolveError(iters, rel, p.pcg_tol)
 
         pm = pr * active
         gradx = (pm[1:, :, :] - pm[:-1, :, :]) / p.dx
@@ -2132,6 +2210,19 @@ class STFLIPSolver:
                 if self.pos.shape[0] else 0.0)
         while t_rem > 1e-9 * p.frame_dt:
             if self.pos.shape[0] == 0:
+                # An emitter can become active between output-frame
+                # boundaries. Jump an otherwise idle solver exactly to the
+                # next start time so that the remaining interval is evolved.
+                next_start = self._next_inflow_start(self.time + t_rem)
+                if next_start is not None:
+                    idle_dt = next_start - self.time
+                    self.time += idle_dt
+                    t_rem -= idle_dt
+                    stats.inactive_time_s += idle_dt
+                    self._seed_inflows()
+                    if self.pos.shape[0]:
+                        vmax = float(xp.max(_norm_rows(xp, self.vel)))
+                    continue
                 # No state remains to evolve. Advancing the clock directly
                 # avoids an otherwise catastrophic empty O(grid) projection
                 # and extrapolation pass on production-resolution domains.
@@ -2139,7 +2230,13 @@ class STFLIPSolver:
                 stats.inactive_time_s += t_rem
                 t_rem = 0.0
                 break
-            dt = min(p.cfl_target * p.dx / max(vmax, 1e-6), t_rem)
+            next_start = self._next_inflow_start(self.time + t_rem)
+            segment_rem = (
+                next_start - self.time if next_start is not None else t_rem
+            )
+            dt = min(
+                p.cfl_target * p.dx / max(vmax, 1e-6), segment_rem
+            )
             if p.surface_tension > 0.0:
                 # Capillary stability limit (Brackbill et al. 1992): surface
                 # tension caps dt at O(dx^{3/2}) independently of the velocity
@@ -2150,7 +2247,7 @@ class STFLIPSolver:
                     rho_sum * p.dx ** 3
                     / (4.0 * math.pi * p.surface_tension)))
             # Subdivide the remaining frame time into even parts (Alg. 1 l.7).
-            dt = t_rem / math.ceil(t_rem / dt)
+            dt = segment_rem / math.ceil(segment_rem / dt)
             stats.particle_cfl_estimated_values.append(vmax * dt / p.dx)
             self._step(dt, stats)
             vmax = (float(xp.max(_norm_rows(xp, self.vel)))
@@ -2159,9 +2256,30 @@ class STFLIPSolver:
             stats.steps += 1
             stats.dt_values.append(dt)
             t_rem -= dt
+            if t_rem > 1e-9 * p.frame_dt:
+                # An inflow is a continuous source, not an output-frame event.
+                # Refill at the current global time before the next solver
+                # step; occupancy in _seed_inflows prevents duplicate filling.
+                n_before = self.pos.shape[0]
+                self._seed_inflows()
+                if self.pos.shape[0] != n_before:
+                    # Newly emitted particles may be faster than the particles
+                    # used for the post-step CFL measurement above.
+                    vmax = float(xp.max(_norm_rows(xp, self.vel)))
         stats.n_particles = int(self.pos.shape[0])
         stats.max_speed = vmax
         return stats
+
+    def _next_inflow_start(self, horizon: float) -> float | None:
+        """Return the next nonzero-duration start strictly before horizon."""
+        tolerance = max(1e-12, 1e-9 * self.p.frame_dt)
+        starts = (
+            start_time
+            for _, _, start_time, end_time, _, _ in self._inflows
+            if (end_time is None or end_time > start_time + tolerance)
+            and self.time + tolerance < start_time < horizon - tolerance
+        )
+        return min(starts, default=None)
 
     def _seed_inflows(self) -> None:
         if not self._inflows:
@@ -2242,6 +2360,24 @@ class STFLIPSolver:
         velocities, as host arrays.  Two-phase gas particles are excluded."""
         pos, vel, _attrs = self.get_render_particles_ex()
         return pos, vel
+
+    def get_render_phase_particles(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return global-time positions and aligned phase values on the host.
+
+        Unlike :meth:`get_render_particles`, this snapshot retains both phases
+        so two-phase validation can measure liquid/gas motion at one common
+        output time. Phase is 1 for liquid and 0 for gas; single-phase solvers
+        report every surviving particle as liquid.
+        """
+        self._reconcile_particle_attrs()
+        pos, keep = self._resynced_positions_and_keep()
+        if self.p.two_phase and self.phase.shape[0] == self.pos.shape[0]:
+            phase = self.be.to_numpy(self.phase)
+        else:
+            phase = np.ones((self.pos.shape[0],), dtype=np.float32)
+        if keep is not None:
+            phase = phase[keep]
+        return pos, np.asarray(phase, dtype=np.float32)
 
     def get_render_particles_ex(self):
         """Render positions, velocities, and a dict of shading attributes

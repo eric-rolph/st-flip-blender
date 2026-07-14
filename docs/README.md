@@ -26,12 +26,17 @@ full settings table); the pages here walk you through *doing* things.
    Alembic/USD cache to another DCC.
 7. **[Troubleshooting](troubleshooting.md)** — the failures you are most likely
    to hit, and how to fix each one.
+8. **[Validation artifacts](../validation/README.md)** — run the reproducible
+   Kleefsman/glug scenes and attach attributable water-height reference data.
 
 ## Design notes
 
 - **[Tiled sparse grid](design/tiled-sparse-grid.md)** — the architecture for
-  true tiled sparsity, plus the shipped active-box and axis-separable-region
-  pressure crops that are its safe first increments.
+  true tiled sparsity, the shipped standalone Phase-1 tile representation, and
+  the active-box/axis-separable pressure crops already used by the solver.
+- **[Fidelity roadmap](design/fidelity-roadmap.md)** — milestone acceptance
+  status and the explicit boundary between shipped research-facing behavior
+  and unclaimed PF-FLIP/production-scale work.
 
 ## One-paragraph mental model
 

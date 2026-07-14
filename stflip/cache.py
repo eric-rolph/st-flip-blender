@@ -25,7 +25,8 @@ METRICS_NAME = "stflip_metrics.jsonl"
 CHECKPOINT_SCHEMA = "stflip-solver-checkpoint"
 CHECKPOINT_VERSION = 2
 SURFACE_SCHEMA = "stflip-paper-surface"
-SURFACE_VERSION = 1
+SURFACE_VERSION = 2
+SURFACE_LEGACY_VERSION = 1
 SURFACE_CONFIG_SCHEMA = "stflip-paper-surface-config"
 SURFACE_CONFIG_VERSION = 2
 
@@ -176,7 +177,7 @@ def validate_surface_metadata(metadata: dict) -> str:
         raise SurfaceCacheError("surface metadata schema is invalid")
     version = metadata.get("version")
     if (isinstance(version, bool) or not isinstance(version, Integral)
-            or int(version) != SURFACE_VERSION):
+            or int(version) not in {SURFACE_LEGACY_VERSION, SURFACE_VERSION}):
         raise SurfaceCacheError("surface metadata version is unsupported")
     if metadata.get("mode") != "PAPER_MCF":
         raise SurfaceCacheError("surface metadata mode is invalid")
@@ -295,7 +296,12 @@ def write_surface(
     *,
     source_positions=None,
 ) -> str:
-    """Atomically cache one immutable Appendix-B output mesh."""
+    """Atomically cache one immutable Appendix-B output mesh.
+
+    Version 2 binds the mesh to the solver-local float32 particle positions
+    actually consumed by reconstruction. Version 1 archives remain readable
+    and are interpreted as bound to the legacy world-space particle frame.
+    """
     fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=False)
     vertices, triangles, quads = validate_surface_mesh(
         vertices, triangles, quads)
@@ -334,6 +340,7 @@ def read_surface(
     fingerprint: str,
     *,
     expected_source_positions=None,
+    expected_legacy_source_positions=None,
 ):
     """Read a strict cached paper mesh, returning ``None`` only if absent."""
     fingerprint = _checkpoint_fingerprint(fingerprint, allow_empty=False)
@@ -353,8 +360,11 @@ def read_surface(
             if (schema.shape != () or schema.dtype.kind not in {"U", "S"}
                     or str(schema.item()) != SURFACE_SCHEMA):
                 raise SurfaceCacheError("surface schema identifier is invalid")
-            if (version.shape != () or version.dtype != np.dtype(np.int64)
-                    or int(version) != SURFACE_VERSION):
+            if version.shape != () or version.dtype != np.dtype(np.int64):
+                raise SurfaceCacheError("surface schema version is unsupported")
+            archived_version = int(version)
+            if archived_version not in {
+                    SURFACE_LEGACY_VERSION, SURFACE_VERSION}:
                 raise SurfaceCacheError("surface schema version is unsupported")
             if (archived_frame.shape != ()
                     or archived_frame.dtype != np.dtype(np.int64)
@@ -368,9 +378,19 @@ def read_surface(
                     "surface fingerprint binding does not match filename")
             source_fingerprint = _checkpoint_fingerprint(
                 source_fingerprint, allow_empty=False)
-            if expected_source_positions is not None:
+            expected_positions = expected_source_positions
+            if archived_version == SURFACE_LEGACY_VERSION:
+                expected_positions = (
+                    expected_legacy_source_positions
+                    if expected_legacy_source_positions is not None
+                    else expected_source_positions)
+            elif (expected_positions is None
+                  and expected_legacy_source_positions is not None):
+                raise SurfaceCacheError(
+                    "surface local source particle positions are unavailable")
+            if expected_positions is not None:
                 expected_source = surface_source_fingerprint(
-                    expected_source_positions)
+                    expected_positions)
                 if source_fingerprint != expected_source:
                     raise SurfaceCacheError(
                         "surface source particle positions do not match")

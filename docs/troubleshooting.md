@@ -29,12 +29,36 @@ Check your **Outflow**: a Volume Outflow deletes everything inside it, and a
 Pressure Outflow must intersect a Domain boundary to act as an opening. A
 continuous **Inflow** with no Outflow will simply fill the Domain.
 
+An active inflow checks occupancy before every global simulation step. Cells
+below half target PPC receive a full PPC packet. A scheduled start splits the
+step at its exact time instead of waiting for an output-frame event; refill is
+not repeated at each RK substep. If it remains empty, check the authored
+inclusive frame range and that the source covers at least one cell.
+
+**Bake fails with a pressure-convergence error.**
+The pressure solver rejects a non-finite terminal residual or one still above
+the configured tolerance; it does not silently commit that step. Check for
+extreme density ratios, invalid physical values, too few pressure iterations,
+or a scene whose numerical scale is inappropriate. Try Multigrid and a higher
+iteration limit after fixing invalid inputs. Do not loosen tolerance merely to
+conceal `NaN`/`Inf`.
+
 ## Look / behaviour
 
 **Water looks like blobs, not a surface.**
 That is the raw particle preview. Assign a **Surface Method** and shade the
 generated surface — see [rendering-and-export](rendering-and-export.md). For
 final quality use **Paper MCF**.
+
+**Paper surface rebuild asks for a fresh simulation bake at a large world
+offset.**
+The old particle cache contains only float32 world positions and has already
+lost detail smaller than the Paper voxel. Current bakes add synchronized
+solver-local positions when the origin/voxel precision check requires them.
+Rebake the simulation; the derived rebuild deliberately fails closed rather
+than inventing detail from lossy legacy coordinates. This precision failure
+does not mean every Paper-meshing failure aborts the particle bake. Near-origin
+legacy caches still use the safe subtraction fallback.
 
 **Splashes tear into chunky blobs.**
 Raise **Resolution**, and add some **Sheeting** (`0.3–0.6`) to hold thin sheets
@@ -55,6 +79,12 @@ you will not see droplets bead.
 **Two-Phase with Sparse Grid seems to ignore Sparse.**
 Correct — gas fills the whole domain, so there is no localized active region to
 crop to, and Sparse disengages. They are not meant to combine.
+
+**Changing Unit Scale changed labels but not the motion I expected.**
+That is Blender's boundary: Unit Scale converts display units but does not
+resize objects or rewrite stored velocity/gravity values. ST-FLIP passes those
+Blender-unit RNA values through. Density and kinematic viscosity are SI inputs
+converted at the solver boundary; surface tension is numerically unchanged.
 
 ## Performance
 

@@ -73,6 +73,8 @@ def _load_handlers(monkeypatch):
 
     mesher.output_is_exclusive = output_is_exclusive
     mesher.update_paper_surface_mesh = lambda obj, *mesh: obj
+    mesher.place_paper_surface_object = (
+        lambda obj, origin: setattr(obj, "location", tuple(origin)) or obj)
     monkeypatch.setitem(sys.modules, mesher.__name__, mesher)
     module = _load_source(
         monkeypatch, f"{root}.addon.handlers", "addon/handlers.py")
@@ -404,8 +406,9 @@ def _playback_surface_config():
     return {
         "schema": core_cache.SURFACE_CONFIG_SCHEMA,
         "version": core_cache.SURFACE_CONFIG_VERSION,
-        "algorithm": "appendix_b_feature_preserving_mcf_v1",
+        "algorithm": "appendix_b_feature_preserving_mcf_v2",
         "mcf_iterations": 30,
+        "mesh_coordinate_frame": "domain_local_object_translation_v1",
     }
 
 
@@ -421,6 +424,7 @@ def _playback_metadata(owner, fingerprint=None):
     return {
         "frame_start": 2,
         "frame_end_baked": 4,
+        "origin": [100_000_000.0, -20.0, 3.0],
         core_cache.OWNER_KEY: owner,
         "surface_reconstruction": {
             "schema": core_cache.SURFACE_SCHEMA,
@@ -451,6 +455,8 @@ def test_frame_playback_updates_bound_paper_surface_at_clamped_frame(
     positions = np.array(
         ((1.0, 2.0, 3.0), (4.0, 5.0, 6.0)), dtype=np.float32)
     velocities = -positions
+    local_positions = np.array(
+        ((0.25, 0.5, 0.75), (1.0, 1.25, 1.5)), dtype=np.float32)
     paper_mesh = (
         np.array(((0.0, 0.0, 0.0),), dtype=np.float32),
         np.empty((0, 3), dtype=np.int32),
@@ -474,7 +480,10 @@ def test_frame_playback_updates_bound_paper_surface_at_clamped_frame(
             path,
             frame,
             requested_fingerprint,
-            np.array_equal(kwargs.get("expected_source_positions"), positions),
+            np.array_equal(
+                kwargs.get("expected_source_positions"), local_positions),
+            np.array_equal(
+                kwargs.get("expected_legacy_source_positions"), positions),
         ))
         return paper_mesh
 
@@ -483,6 +492,13 @@ def test_frame_playback_updates_bound_paper_surface_at_clamped_frame(
         return obj
 
     monkeypatch.setattr(handlers.cache, "read_frame", read_frame)
+    monkeypatch.setattr(
+        handlers.cache,
+        "read_frame_attributes",
+        lambda _path, _frame: {
+            "stflip_surface_local_position": local_positions,
+        },
+    )
     monkeypatch.setattr(handlers.cache, "read_surface", read_surface)
     monkeypatch.setattr(
         handlers.mesher, "update_paper_surface_mesh", update_surface)
@@ -492,15 +508,116 @@ def test_frame_playback_updates_bound_paper_surface_at_clamped_frame(
     cache_dir = handlers.resolve_cache_dir(scene)
     assert reads == [
         ("particle", cache_dir, 4),
-        ("surface", cache_dir, 4, fingerprint, True),
+        ("surface", cache_dir, 4, fingerprint, True, True),
     ]
     assert updates == [(surface, paper_mesh)]
+    assert surface.location == pytest.approx(
+        (100_000_000.0, -20.0, 3.0))
     np.testing.assert_array_equal(
         particle.data.vertices.writes["co"], positions.ravel())
     np.testing.assert_array_equal(
         particle.data.attributes["velocity"].data.writes["vector"],
         velocities.ravel(),
     )
+
+
+def test_v2_paper_playback_roundtrips_real_local_hash_at_nonzero_origin(
+        monkeypatch, tmp_path):
+    handlers, bpy = _load_handlers(monkeypatch)
+    owner = "0123456789abcdef0123456789abcdef"
+    frame = 4
+    fingerprint = _playback_fingerprint()
+    origin = np.array((100_000_000.0, -20.0, 3.0), dtype=np.float64)
+    local_positions = np.array(
+        ((0.125, 0.25, 0.5), (0.375, 0.625, 0.875)),
+        dtype=np.float32,
+    )
+    world_positions = np.asarray(
+        origin[None, :] + local_positions.astype(np.float64),
+        dtype=np.float32,
+    )
+    velocities = np.array(
+        ((1.0, -2.0, 3.0), (-4.0, 5.0, -6.0)),
+        dtype=np.float32,
+    )
+    paper_mesh = (
+        np.array(
+            ((0.0, 0.0, 0.0),
+             (1.0, 0.0, 0.0),
+             (1.0, 1.0, 0.0),
+             (0.0, 1.0, 0.0)),
+            dtype=np.float32,
+        ),
+        np.empty((0, 3), dtype=np.int32),
+        np.array(((0, 1, 2, 3),), dtype=np.int32),
+    )
+    metadata = _playback_metadata(owner, fingerprint)
+    metadata["origin"] = origin.tolist()
+    cache_dir = str(tmp_path)
+    core_cache.write_meta(cache_dir, metadata)
+    core_cache.write_frame(
+        cache_dir,
+        frame,
+        world_positions,
+        velocities,
+        attributes={
+            "stflip_surface_local_position": local_positions,
+        },
+    )
+    surface_path = core_cache.write_surface(
+        cache_dir,
+        frame,
+        fingerprint,
+        *paper_mesh,
+        source_positions=local_positions,
+    )
+
+    with np.load(surface_path, allow_pickle=False) as archive:
+        assert int(archive["version"]) == core_cache.SURFACE_VERSION
+        assert str(archive["source_positions_sha256"].item()) == (
+            core_cache.surface_source_fingerprint(local_positions)
+        )
+    np.testing.assert_array_equal(
+        core_cache.read_frame_attributes(cache_dir, frame)[
+            "stflip_surface_local_position"
+        ],
+        local_positions,
+    )
+    assert np.unique(world_positions[:, 0]).size == 1
+    assert np.unique(local_positions[:, 0]).size == 2
+
+    particle = _playback_particle()
+    surface = _SurfaceObject()
+    scene = _scene(
+        cache_dir=cache_dir,
+        cache_id=owner,
+        particle=particle,
+        surface=surface,
+        create_surface=True,
+        surface_method="PAPER_MCF",
+    )
+    bpy.data.scenes = [scene]
+
+    def update_surface(obj, *mesh):
+        obj.applied_mesh = tuple(np.array(value, copy=True) for value in mesh)
+        obj.data.update()
+        obj.update_tag()
+        return obj
+
+    monkeypatch.setattr(
+        handlers.mesher,
+        "update_paper_surface_mesh",
+        update_surface,
+    )
+    assert handlers.cache.read_surface is core_cache.read_surface
+
+    assert handlers._apply_frame(scene, frame) is True
+
+    for actual, expected in zip(surface.applied_mesh, paper_mesh):
+        np.testing.assert_array_equal(actual, expected)
+    assert surface.data.update_count == 1
+    assert surface.tag_count == 1
+    assert surface.location == pytest.approx(origin)
 
 
 @pytest.mark.parametrize(
@@ -1487,6 +1604,90 @@ def test_openvdb_density_meshing_uses_world_transform_and_explicit_controls(
     assert quads.shape == (1, 4)
 
 
+def test_openvdb_loader_falls_back_to_official_blender_pyopenvdb_name(
+        monkeypatch):
+    mesher = _load_mesher(monkeypatch, None, None)
+    imported = []
+
+    class Transform:
+        def postTranslate(self, _origin):
+            pass
+
+    class Grid:
+        def copyFromArray(self, _values):
+            pass
+
+        def convertToPolygons(self, **_kwargs):
+            return (
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.int32),
+                np.empty((0, 4), dtype=np.int32),
+            )
+
+    pyopenvdb = types.SimpleNamespace(
+        FloatGrid=Grid,
+        createLinearTransform=lambda **_kwargs: Transform(),
+    )
+
+    def import_module(name):
+        imported.append(name)
+        if name == "openvdb":
+            return types.SimpleNamespace(
+                FloatGrid=object,
+                # Simulate an unrelated/incompatible package that imported
+                # successfully under the preferred name.
+            )
+        assert name == "pyopenvdb"
+        return pyopenvdb
+
+    monkeypatch.setattr(mesher.importlib, "import_module", import_module)
+
+    vertices, triangles, quads = mesher.density_field_to_polygons(
+        np.ones((2, 2, 2), dtype=np.float32),
+        origin=(0.0, 0.0, 0.0),
+        voxel_size=0.5,
+    )
+
+    assert imported == ["openvdb", "pyopenvdb"]
+    assert vertices.shape == (0, 3)
+    assert triangles.shape == (0, 3)
+    assert quads.shape == (0, 4)
+
+
+def test_paper_surface_placement_assigns_translation_only_world_matrix(
+        monkeypatch):
+    mesher = _load_mesher(monkeypatch, None, None)
+
+    class MatrixValue:
+        def __init__(self):
+            self.translation = None
+
+    matrix_module = types.ModuleType("mathutils")
+    matrix_module.Matrix = types.SimpleNamespace(
+        Identity=lambda _size: MatrixValue())
+    monkeypatch.setitem(sys.modules, "mathutils", matrix_module)
+    obj = types.SimpleNamespace(
+        parent=object(),
+        matrix_world=None,
+        delta_location=(1.0, 2.0, 3.0),
+        delta_rotation_euler=(0.1, 0.2, 0.3),
+        delta_rotation_quaternion=(0.5, 0.5, 0.5, 0.5),
+        delta_scale=(2.0, 2.0, 2.0),
+    )
+
+    result = mesher.place_paper_surface_object(
+        obj, (100_000_000.0, -20.0, 3.0))
+
+    assert result is obj
+    assert obj.parent is not None
+    assert obj.matrix_world.translation == (
+        100_000_000.0, -20.0, 3.0)
+    assert obj.delta_location == (0.0, 0.0, 0.0)
+    assert obj.delta_rotation_euler == (0.0, 0.0, 0.0)
+    assert obj.delta_rotation_quaternion == (1.0, 0.0, 0.0, 0.0)
+    assert obj.delta_scale == (1.0, 1.0, 1.0)
+
+
 def test_paper_surface_writes_plain_mesh_disables_gn_and_restores_preview(
         monkeypatch):
     mesher = _load_mesher(monkeypatch, None, None)
@@ -1723,6 +1924,7 @@ class _RecordingLayout:
     def operator(self, name, **kwargs):
         self.records.append(("operator", name))
         self.states.append(("operator", name, self.effective_enabled))
+        return types.SimpleNamespace()
 
     def separator(self):
         self.records.append(("separator", ""))
@@ -1821,6 +2023,21 @@ def test_surface_panel_separates_preview_and_paper_controls(monkeypatch):
         "surface_smoothing_factor",
     } <= preview_props
     assert "paper_mcf_iterations" not in preview_props
+
+
+def test_presets_panel_exposes_final_paper_fidelity_action(monkeypatch):
+    panels = _load_surface_panels(monkeypatch)
+    context = types.SimpleNamespace(
+        scene=types.SimpleNamespace(
+            stflip=types.SimpleNamespace(bake_state="IDLE")))
+    panel = panels.STFLIP_PT_presets()
+    layout = _RecordingLayout()
+    panel.layout = layout
+
+    panel.draw(context)
+
+    assert ("operator", "stflip.apply_paper_fidelity") in layout.records
+    assert ("label", "Output quality:") in layout.records
 
 
 def test_surface_panel_freezes_rebuild_controls_but_leaves_cancel_enabled(

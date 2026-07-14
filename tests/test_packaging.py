@@ -2,8 +2,12 @@ import re
 import tomllib
 import zipfile
 
-from stflip import __version__
+from stflip import PressureSolveError, __version__
 from tools.build_extension import ROOT, build, package_files, package_payload
+
+
+def test_pressure_solve_error_is_publicly_exported():
+    assert PressureSolveError.__module__ == "stflip.pressure"
 
 
 def test_package_allowlist_excludes_development_files():

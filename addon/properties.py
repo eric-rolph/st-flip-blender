@@ -77,15 +77,20 @@ class STFLIPObjectSettings(bpy.types.PropertyGroup):
     )
     force_strength: FloatProperty(
         name="Force Strength", default=5.0, soft_min=-50.0, soft_max=50.0,
-        description="Acceleration magnitude of the force field",
+        unit="ACCELERATION",
+        description="Acceleration magnitude of the force field; Blender's "
+                    "scene-unit display is converted to internal units",
     )
     force_scale: FloatProperty(
         name="Turbulence Scale", default=0.5, min=0.01, soft_max=10.0,
-        description="Coarsest turbulence wavelength in Blender units",
+        subtype="DISTANCE",
+        description="Coarsest turbulence wavelength in scene units",
     )
     force_radius: FloatProperty(
         name="Vortex Radius", default=1.0, min=0.01, soft_max=50.0,
-        description="Radial falloff distance of the vortex swirl",
+        subtype="DISTANCE",
+        description="Radial falloff distance of the vortex swirl in scene "
+                    "units",
     )
     obstacle_animated: BoolProperty(
         name="Animated (Moving Wall)", default=False,
@@ -278,21 +283,23 @@ class STFLIPSettings(bpy.types.PropertyGroup):
     )
     rho_gas: FloatProperty(
         name="Gas Density", default=1.2, min=1e-3, soft_max=100.0,
-        description="Density of the gas phase (air ~ 1.2 mass/unit^3)",
+        description="Physical gas density in kg/m^3 (air ~ 1.2); converted "
+                    "through Scene Unit Scale at bake setup",
     )
     gas_particles_per_cell: IntProperty(
         name="Gas Particles / Cell", default=8, min=1, max=64,
     )
     surface_tension: FloatProperty(
         name="Surface Tension", default=0.0, min=0.0, soft_max=1.0,
-        description="CSF surface-tension coefficient sigma. 0 disables. "
+        description="CSF surface-tension coefficient sigma in N/m. 0 "
+                    "disables. "
                     "Small-scale effect; needs high resolution (paper Sec 3.9)",
     )
     viscosity: FloatProperty(
         name="Viscosity", default=0.0, min=0.0, soft_max=1.0, precision=4,
-        description="Kinematic viscosity (thickness). 0 = inviscid water; "
-                    "raise for oil, honey, lava. Solved implicitly so large "
-                    "time steps stay stable",
+        description="Physical kinematic viscosity in m^2/s. 0 = inviscid; "
+                    "converted through Scene Unit Scale and solved "
+                    "implicitly so large time steps stay stable",
     )
     sheeting: FloatProperty(
         name="Sheeting", default=0.0, min=0.0, soft_max=2.0,
@@ -323,8 +330,9 @@ class STFLIPSettings(bpy.types.PropertyGroup):
     density: FloatProperty(
         name="Liquid Density", default=1000.0, min=1e-6,
         soft_max=5000.0,
-        description="Liquid density used by the variable-density pressure "
-                    "projection (mass per cubic Blender unit)",
+        description="Physical liquid density in kg/m^3 used by the "
+                    "variable-density pressure projection; converted "
+                    "through Scene Unit Scale at bake setup",
     )
     local_cfl: FloatProperty(
         name="Local Advection CFL", default=1.0, min=0.05, max=4.0,

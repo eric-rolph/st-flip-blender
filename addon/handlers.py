@@ -328,7 +328,7 @@ def _apply_frame(scene, frame: int) -> bool:
     # Paper reconstruction is a derived display cache.  Once particles have
     # loaded successfully, a missing or invalid paper mesh must never turn the
     # authoritative particle frame into a playback failure.
-    _apply_paper_surface_frame(scene, cache_dir, meta, f, pos)
+    _apply_paper_surface_frame(scene, cache_dir, meta, f, pos, extra)
     _apply_whitewater_frame(scene, cache_dir, f)
     return True
 
@@ -413,6 +413,7 @@ def _apply_paper_surface_frame(
     meta: dict,
     frame: int,
     source_positions,
+    source_attributes=None,
 ) -> bool:
     """Best-effort playback of one cached Appendix-B surface mesh."""
     settings = getattr(scene, "stflip", None)
@@ -427,6 +428,38 @@ def _apply_paper_surface_frame(
     reconstruction = meta.get("surface_reconstruction")
     try:
         fingerprint = cache.validate_surface_metadata(reconstruction)
+        config = reconstruction.get("config", {})
+        coordinate_frame = config.get("mesh_coordinate_frame")
+        if coordinate_frame == "domain_local_object_translation_v1":
+            world_origin = np.asarray(meta.get("origin"), dtype=np.float64)
+            if (world_origin.shape != (3,)
+                    or not bool(np.all(np.isfinite(world_origin)))):
+                raise cache.SurfaceCacheError(
+                    "local paper mesh has no valid domain world origin")
+            attributes = source_attributes or {}
+            local_source_positions = attributes.get(
+                "stflip_surface_local_position")
+            if local_source_positions is None:
+                local_source_positions = (
+                    np.asarray(source_positions, dtype=np.float64)
+                    - world_origin[None, :]
+                ).astype(np.float32)
+            else:
+                local_source_positions = np.asarray(local_source_positions)
+                if (local_source_positions.shape
+                        != np.asarray(source_positions).shape
+                        or not np.issubdtype(
+                            local_source_positions.dtype, np.number)
+                        or not bool(np.all(np.isfinite(local_source_positions)))):
+                    raise cache.SurfaceCacheError(
+                        "local paper source positions are corrupt")
+        elif coordinate_frame is None:
+            # Legacy v1 derived caches stored vertices directly in world space.
+            world_origin = np.zeros(3, dtype=np.float64)
+            local_source_positions = None
+        else:
+            raise cache.SurfaceCacheError(
+                "paper mesh coordinate frame is unsupported")
     except cache.SurfaceCacheError:
         _clear_scene_paper_surface(scene, surface)
         return False
@@ -436,7 +469,8 @@ def _apply_paper_surface_frame(
             cache_dir,
             frame,
             fingerprint,
-            expected_source_positions=source_positions,
+            expected_source_positions=local_source_positions,
+            expected_legacy_source_positions=source_positions,
         )
     except (cache.CheckpointError, cache.SurfaceCacheError):
         _clear_scene_paper_surface(scene, surface)
@@ -446,6 +480,7 @@ def _apply_paper_surface_frame(
         return False
     try:
         mesher.update_paper_surface_mesh(surface, *paper_mesh)
+        mesher.place_paper_surface_object(surface, world_origin)
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         _clear_scene_paper_surface(scene, surface)
         return False

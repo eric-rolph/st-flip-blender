@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -23,3 +26,60 @@ jobs:
           path: dist/st_flip-*.zip
           archive: false
           if-no-files-found: error
+
+  blender-headless:
+    name: Blender 4.2 headless / OpenVDB
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BLENDER_VERSION: "4.2.0"
+      BLENDER_ARCHIVE: blender-4.2.0-linux-x64.tar.xz
+      BLENDER_SHA256: 4f4fd7646af01f6fee9d420408318381a6e52571268eb7cf9cd5033bd9e7a359
+      BLENDER_URL: https://ftp.nluug.nl/pub/graphics/blender/release/Blender4.2/blender-4.2.0-linux-x64.tar.xz
+      BLENDER_USER_RESOURCES: ${{ runner.temp }}/stflip-blender-user
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache pinned Blender runtime
+        id: blender-cache
+        uses: actions/cache@v5
+        with:
+          path: .ci/blender-4.2.0-linux-x64
+          key: blender-linux-x64-${{ env.BLENDER_VERSION }}-${{ env.BLENDER_SHA256 }}
+      - name: Download pinned Blender runtime
+        if: steps.blender-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p .ci
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "$RUNNER_TEMP/$BLENDER_ARCHIVE" "$BLENDER_URL"
+          echo "$BLENDER_SHA256  $RUNNER_TEMP/$BLENDER_ARCHIVE" | sha256sum --check --strict
+          tar --extract --xz --file "$RUNNER_TEMP/$BLENDER_ARCHIVE" --directory .ci
+      - name: Build Blender extension
+        id: extension
+        shell: bash
+        run: |
+          archive="$(python tools/build_extension.py)"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - name: Install extension into isolated Blender profile
+        shell: bash
+        run: |
+          rm -rf "$BLENDER_USER_RESOURCES"
+          mkdir -p "$BLENDER_USER_RESOURCES"
+          .ci/blender-4.2.0-linux-x64/blender \
+            --background --factory-startup --offline-mode \
+            --command extension install-file -r user_default -e \
+            "${{ steps.extension.outputs.archive }}"
+      - name: Run installed-extension CPU and OpenVDB smoke
+        shell: bash
+        run: |
+          .ci/blender-4.2.0-linux-x64/blender \
+            --background --offline-mode --python-exit-code 1 \
+            --python tools/blender_headless_smoke.py -- \
+            --require-openvdb --output "$RUNNER_TEMP/blender-headless-smoke.json"
+      - name: Upload Blender smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: blender-headless-smoke
+          path: ${{ runner.temp }}/blender-headless-smoke.json
+          if-no-files-found: warn

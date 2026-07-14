@@ -78,6 +78,10 @@ def _load_operators(monkeypatch, tmp_path):
         module = types.ModuleType(f"{root}.addon.{leaf}")
         if leaf == "handlers":
             module.resolve_cache_dir = lambda scene: ""
+        elif leaf == "mesher":
+            module.place_paper_surface_object = (
+                lambda obj, origin: setattr(
+                    obj, "location", tuple(origin)) or obj)
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
     path = Path(__file__).parents[1] / "addon" / "operators.py"
@@ -282,7 +286,7 @@ def test_paper_surface_config_pins_paper_and_discretization_constants(
 
     config = operators.paper_surface_config(0.125, 30, 0.0, "cuda")
 
-    assert config["algorithm"] == "appendix_b_feature_preserving_mcf_v1"
+    assert config["algorithm"] == "appendix_b_feature_preserving_mcf_v2"
     assert config["rasterizer"] == "linear_subvoxel_union_v1"
     assert config["schema"] == core_cache.SURFACE_CONFIG_SCHEMA
     assert config["version"] == core_cache.SURFACE_CONFIG_VERSION
@@ -304,6 +308,150 @@ def test_paper_surface_config_pins_paper_and_discretization_constants(
     assert config["mcf_iterations"] == 30
     assert config["mesh_adaptivity"] == 0.0
     assert config["backend"] == "cuda"
+    assert config["particle_coordinate_frame"] == "solver_local_float32"
+    assert config["mesh_coordinate_frame"] == (
+        "domain_local_object_translation_v1")
+    assert config["blender_object_translation"] == (
+        "domain_world_origin_float64")
+
+
+def test_large_world_paper_reconstruction_keeps_subcell_geometry_local(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    local = np.array(
+        ((0.125, 0.0, 0.0), (0.375, 0.0, 0.0)), dtype=np.float32)
+    origin = np.array((100_000_000.0, -100_000_000.0, 0.0))
+    collapsed_world = (local.astype(np.float64) + origin).astype(np.float32)
+    assert collapsed_world[0, 0] == collapsed_world[1, 0]
+    observed = {}
+
+    def reconstruct(positions, _dx, **_kwargs):
+        observed["positions"] = np.asarray(positions).copy()
+        return types.SimpleNamespace(
+            density=np.ones((2, 2, 2), dtype=np.float32),
+            origin=(0.0, 0.0, 0.0),
+            voxel_size=0.5,
+            diagnostics={"particle_count": 2},
+        )
+
+    monkeypatch.setattr(operators.surface_core, "reconstruct_surface", reconstruct)
+    monkeypatch.setattr(
+        operators.mesher,
+        "density_field_to_polygons",
+        lambda *_args, **_kwargs: (
+            local.copy(),
+            np.empty((0, 3), dtype=np.int32),
+            np.empty((0, 4), dtype=np.int32),
+        ),
+        raising=False,
+    )
+    backend = types.SimpleNamespace(
+        name="cpu",
+        xp=np,
+        synchronize=lambda: None,
+        to_numpy=np.asarray,
+    )
+    config = operators.paper_surface_config(1.0, 30, 0.0, "cpu")
+
+    vertices, _triangles, _quads, _diagnostics = (
+        operators._reconstruct_paper_surface(
+            local, 1.0, config, 1000, backend))
+    surface_obj = types.SimpleNamespace(location=None)
+    operators._set_paper_surface_origin(surface_obj, origin)
+
+    np.testing.assert_array_equal(observed["positions"], local)
+    assert vertices[1, 0] - vertices[0, 0] == pytest.approx(0.25)
+    assert surface_obj.location == pytest.approx(tuple(origin))
+    world_x = np.asarray(surface_obj.location[0], dtype=np.float64) + (
+        vertices[:, 0].astype(np.float64))
+    assert world_x[1] - world_x[0] == pytest.approx(0.25)
+
+
+def test_large_origin_frames_preserve_local_positions_for_surface_rebuild(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    local = np.array(
+        ((0.125, 0.0, 0.0), (0.375, 0.0, 0.0)), dtype=np.float32)
+    origin = np.array((100_000_000.0, 0.0, 0.0))
+    world = (local.astype(np.float64) + origin).astype(np.float32)
+
+    attributes = operators._frame_attributes_with_surface_local_positions(
+        {"age": np.zeros(2, dtype=np.float32)}, local, origin, 1.0)
+    monkeypatch.setattr(
+        operators.cache,
+        "read_frame_attributes",
+        lambda _path, _frame: attributes,
+        raising=False,
+    )
+    recovered, source = operators._cached_surface_local_positions(
+        str(tmp_path), 7, world, origin, 1.0)
+
+    assert operators._PAPER_LOCAL_POSITION_ATTRIBUTE in attributes
+    np.testing.assert_array_equal(recovered, local)
+    assert source == "synchronized_solver_local_cache_attribute"
+
+
+def test_live_paper_surface_forces_exact_local_source_at_near_origin(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    local = np.array(
+        ((0.125, 0.25, 0.5), (0.375, 0.75, 0.875)), dtype=np.float32)
+    origin = np.array((0.1, -0.2, 0.3), dtype=np.float64)
+
+    attributes = operators._frame_attributes_with_surface_local_positions(
+        {}, local, origin, 1.0, force=True)
+
+    np.testing.assert_array_equal(
+        attributes["stflip_surface_local_position"], local)
+
+
+def test_large_origin_rebuild_refuses_lossy_legacy_world_only_cache(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    origin = np.array((100_000_000.0, 0.0, 0.0))
+    world = np.full((2, 3), origin, dtype=np.float32)
+    monkeypatch.setattr(
+        operators.cache,
+        "read_frame_attributes",
+        lambda _path, _frame: {},
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="rebake.*current add-on"):
+        operators._cached_surface_local_positions(
+            str(tmp_path), 7, world, origin, 1.0)
+
+
+def test_final_paper_fidelity_preset_is_explicit_and_non_destructive(
+        monkeypatch, tmp_path):
+    operators = _load_operators(monkeypatch, tmp_path)
+    settings = types.SimpleNamespace(
+        experiment_profile="DAM_BREAK_ST_CFL_16",
+        bake_status="existing cache remains",
+    )
+    expected = {
+        "experiment_profile": "CUSTOM",
+        "cfl_target": 8.0,
+        "particles_per_cell": 8,
+        "st_enabled": True,
+        "jitter_strength": 1.0,
+        "adaptive_gamma": True,
+        "eta_phi": 0.5,
+        "transfer": "flip",
+        "flip_blend": 0.98,
+        "local_cfl": 1.0,
+        "pcg_tolerance": 1e-4,
+        "create_surface": True,
+        "surface_method": "PAPER_MCF",
+        "paper_mcf_iterations": 30,
+        "paper_mesh_adaptivity": 0.0,
+    }
+
+    operators.apply_paper_fidelity_settings(settings)
+
+    for name, value in expected.items():
+        assert getattr(settings, name) == value
+    assert settings.experiment_profile == "CUSTOM"
 
 
 def test_paper_surface_config_reads_live_surface_core_constants(
@@ -538,6 +686,7 @@ def test_surface_rebuild_preflight_pins_cpu_fallback_in_config_and_state(
     reports = []
     metadata = {
         "dx": 0.25,
+        "origin": [0.0, 0.0, 0.0],
         "frame_start": 1,
         "frame_end_baked": 2,
         "settings": {
@@ -600,6 +749,7 @@ def test_surface_rebuild_refuses_noncontiguous_committed_particles(
     operators = _load_operators(monkeypatch, tmp_path)
     metadata = {
         "dx": 0.25,
+        "origin": [0.0, 0.0, 0.0],
         "frame_start": 1,
         "frame_end_baked": 3,
     }
@@ -715,6 +865,7 @@ def test_surface_rebuild_completion_does_not_apply_mesh_after_ui_mode_change(
         "meta": {"frame_start": 1, "frame_end_baked": 1},
         "cache_dir": str(tmp_path),
         "backend": types.SimpleNamespace(name="cpu"),
+        "world_origin": np.zeros(3, dtype=np.float64),
         "latest_diagnostics": None,
     })
     operator = operators.STFLIP_OT_rebuild_paper_surfaces()
@@ -753,6 +904,7 @@ def _active_surface_finish_state(operators, tmp_path):
         "meta": {"frame_start": 1, "frame_end_baked": 1},
         "cache_dir": str(tmp_path),
         "backend": types.SimpleNamespace(name="cpu"),
+        "world_origin": np.zeros(3, dtype=np.float64),
         "latest_diagnostics": {"voxel_count": 12},
     })
     operator = operators.STFLIP_OT_rebuild_paper_surfaces()

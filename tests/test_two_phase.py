@@ -263,3 +263,22 @@ def test_render_particles_exclude_gas():
     assert len(pos) == len(vel)
     assert 0 < len(pos) <= n_liquid
     assert len(pos) < s.pos.shape[0]
+
+
+def test_render_phase_particles_resynchronizes_both_phases(monkeypatch):
+    s = _two_phase(n=8, seed=2)
+    s.pos = s.be.from_numpy(np.array(
+        ((0.1, 0.2, 0.3), (0.4, 0.5, 0.6), (0.7, 0.8, 0.9)),
+        dtype=np.float32,
+    ))
+    s.phase = s.be.from_numpy(np.array((1.0, 0.0, 1.0), dtype=np.float32))
+    synchronized = np.array(
+        ((1.1, 1.2, 1.3), (1.7, 1.8, 1.9)), dtype=np.float32)
+    keep = np.array((True, False, True))
+    monkeypatch.setattr(
+        s, "_resynced_positions_and_keep", lambda: (synchronized, keep))
+
+    positions, phase = s.get_render_phase_particles()
+
+    np.testing.assert_array_equal(positions, synchronized)
+    np.testing.assert_array_equal(phase, np.array((1.0, 1.0), dtype=np.float32))

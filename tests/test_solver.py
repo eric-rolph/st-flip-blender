@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from stflip import cache
+from stflip import cache, pressure
 from stflip import (
     FrameStats,
     Params,
@@ -368,6 +368,160 @@ def test_inflow_exclusive_endpoint_tolerates_accumulated_frame_roundoff():
     assert solver.pos.shape[0] == 0
 
 
+def test_zero_duration_inflow_does_not_subdivide_unrelated_fluid_steps():
+    params = Params(
+        resolution=(3, 2, 2),
+        dx=1.0,
+        gravity=(0.0, 0.0, 0.0),
+        frame_dt=0.2,
+        cfl_target=8.0,
+        particles_per_cell=1,
+        transfer="pic",
+        st_enabled=False,
+        seed=2,
+    )
+    solver = STFLIPSolver(params, "cpu")
+    liquid = np.zeros(params.resolution, dtype=bool)
+    liquid[2, 0, 0] = True
+    solver.add_liquid_mask(liquid)
+    inactive = np.zeros(params.resolution, dtype=bool)
+    inactive[0, 0, 0] = True
+    solver.add_inflow(inactive, start_time=0.1, end_time=0.1)
+
+    stats = solver.step_frame()
+
+    assert stats.steps == 1
+    assert stats.dt_values == pytest.approx([0.2])
+    assert solver.pos.shape[0] == 1
+
+
+def test_inflow_refills_an_emptied_source_between_global_steps():
+    params = Params(
+        resolution=(4, 2, 2),
+        dx=1.0,
+        gravity=(0.0, 0.0, 0.0),
+        frame_dt=0.15,
+        cfl_target=0.5,
+        particles_per_cell=1,
+        transfer="pic",
+        st_enabled=False,
+        seed=0,
+    )
+    solver = STFLIPSolver(params, "cpu")
+    source = np.zeros(params.resolution, dtype=bool)
+    source[0, 0, 0] = True
+    solver.add_inflow(source, (4.0, 0.0, 0.0))
+
+    stats = solver.step_frame()
+
+    assert stats.steps == 2
+    # The first particle leaves the source during step one. The second global
+    # step must start with a refill, without waiting for another output frame.
+    assert solver.pos.shape[0] == 2
+    source_cells = np.floor(solver.pos / params.dx).astype(int)
+    assert np.count_nonzero(np.all(source_cells == (0, 0, 0), axis=1)) == 1
+
+
+def test_future_inflow_activates_at_its_actual_start_time_inside_a_frame():
+    params = Params(
+        resolution=(3, 2, 2),
+        dx=1.0,
+        gravity=(0.0, 0.0, 0.0),
+        frame_dt=0.2,
+        particles_per_cell=1,
+        transfer="pic",
+        st_enabled=False,
+        seed=4,
+    )
+    solver = STFLIPSolver(params, "cpu")
+    source = np.zeros(params.resolution, dtype=bool)
+    source[0, 0, 0] = True
+    solver.add_inflow(
+        source,
+        (1.0, 0.0, 0.0),
+        start_time=0.1,
+        end_time=0.2,
+    )
+
+    stats = solver.step_frame()
+
+    assert solver.time == pytest.approx(0.2)
+    assert stats.inactive_time_s == pytest.approx(0.1)
+    assert stats.steps == 1
+    assert solver.pos.shape[0] == 1
+    # The particle exists for only the active half of this output frame.
+    assert solver.age[0] == pytest.approx(0.1)
+
+
+def test_inflow_start_splits_a_global_step_at_the_schedule_boundary():
+    params = Params(
+        resolution=(4, 2, 2),
+        dx=1.0,
+        gravity=(0.0, 0.0, 0.0),
+        frame_dt=0.2,
+        cfl_target=8.0,
+        particles_per_cell=1,
+        transfer="pic",
+        st_enabled=False,
+        seed=9,
+    )
+    solver = STFLIPSolver(params, "cpu")
+    initial = np.zeros(params.resolution, dtype=bool)
+    initial[3, 0, 0] = True
+    solver.add_liquid_mask(initial)
+    source = np.zeros(params.resolution, dtype=bool)
+    source[0, 0, 0] = True
+    solver.add_inflow(source, start_time=0.1, end_time=0.2)
+
+    stats = solver.step_frame()
+
+    assert stats.steps == 2
+    np.testing.assert_allclose(stats.dt_values, (0.1, 0.1))
+    assert solver.pos.shape[0] == 2
+    ages_by_source = {
+        int(source_id): float(age)
+        for source_id, age in zip(solver.source_id, solver.age)
+    }
+    assert ages_by_source[0] == pytest.approx(0.2)
+    assert ages_by_source[1] == pytest.approx(0.1)
+
+
+def test_inflow_refill_is_invariant_to_output_frame_subdivision():
+    def make_solver(frame_dt):
+        params = Params(
+            resolution=(4, 2, 2),
+            dx=1.0,
+            gravity=(0.0, 0.0, 0.0),
+            frame_dt=frame_dt,
+            cfl_target=0.5,
+            particles_per_cell=1,
+            transfer="pic",
+            st_enabled=False,
+            seed=0,
+        )
+        solver = STFLIPSolver(params, "cpu")
+        source = np.zeros(params.resolution, dtype=bool)
+        source[0, 0, 0] = True
+        solver.add_inflow(source, (4.0, 0.0, 0.0))
+        return solver
+
+    one_frame = make_solver(0.25)
+    two_frames = make_solver(0.125)
+
+    one_stats = one_frame.step_frame()
+    two_stats = [two_frames.step_frame(), two_frames.step_frame()]
+
+    assert one_stats.steps == 2
+    assert [stats.steps for stats in two_stats] == [1, 1]
+    # Both executions have global steps at t=0 and t=0.125. Refill occupancy,
+    # particle ordering, and RNG consumption therefore remain identical.
+    assert one_frame.pos.shape[0] == two_frames.pos.shape[0] == 2
+    np.testing.assert_array_equal(one_frame.pos, two_frames.pos)
+    np.testing.assert_array_equal(one_frame.vel, two_frames.vel)
+    np.testing.assert_array_equal(one_frame.age, two_frames.age)
+    np.testing.assert_array_equal(one_frame.source_id, two_frames.source_id)
+
+
 def test_dam_break_runs_and_stays_finite():
     s = _dam_break()
     n0 = s.pos.shape[0]
@@ -415,6 +569,72 @@ def test_frame_stats_report_each_substep_without_extra_vmax_samples():
             stats.particle_cfl_estimated_values[i] / stats.dt_values[i]
         )
         assert estimated_speed == pytest.approx(previous_speed)
+
+
+def test_step_frame_fails_with_pressure_diagnostics_at_iteration_limit(
+    monkeypatch,
+):
+    params = Params(
+        resolution=(2, 2, 2),
+        dx=0.5,
+        gravity=(0.0, 0.0, 0.0),
+        frame_dt=0.1,
+        particles_per_cell=1,
+        st_enabled=False,
+        pcg_tol=1e-6,
+        pcg_max_iter=3,
+    )
+    solver = STFLIPSolver(params, "cpu")
+    liquid = np.zeros(params.resolution, dtype=bool)
+    liquid[0, 0, 0] = True
+    solver.add_liquid_mask(liquid)
+
+    def unconverged(xp, rhs, *_args, tol, max_iter):
+        assert tol == params.pcg_tol
+        assert max_iter == params.pcg_max_iter
+        return xp.zeros_like(rhs), max_iter, 2.0 * tol
+
+    monkeypatch.setattr(pressure, "solve", unconverged)
+
+    with pytest.raises(
+        pressure.PressureSolveError,
+        match="pressure solve did not converge",
+    ) as exc:
+        solver.step_frame()
+
+    assert exc.value.iterations == params.pcg_max_iter
+    assert exc.value.rel_residual == pytest.approx(2.0 * params.pcg_tol)
+    assert exc.value.tolerance == params.pcg_tol
+
+
+@pytest.mark.parametrize("bad_residual", (np.nan, np.inf))
+def test_step_frame_fails_on_nonfinite_pressure_residual(
+    monkeypatch, bad_residual,
+):
+    params = Params(
+        resolution=(2, 2, 2),
+        dx=0.5,
+        gravity=(0.0, 0.0, 0.0),
+        frame_dt=0.1,
+        particles_per_cell=1,
+        st_enabled=False,
+    )
+    solver = STFLIPSolver(params, "cpu")
+    liquid = np.zeros(params.resolution, dtype=bool)
+    liquid[0, 0, 0] = True
+    solver.add_liquid_mask(liquid)
+
+    def invalid(xp, rhs, *_args, **_kwargs):
+        return xp.zeros_like(rhs), 8, bad_residual
+
+    monkeypatch.setattr(pressure, "solve", invalid)
+
+    with pytest.raises(pressure.PressureSolveError, match="non-finite") as exc:
+        solver.step_frame()
+
+    assert exc.value.iterations == 8
+    assert not np.isfinite(exc.value.rel_residual)
+    assert exc.value.tolerance == params.pcg_tol
 
 
 def test_actual_particle_cfl_can_exceed_estimate_under_acceleration():
@@ -646,6 +866,43 @@ def test_pressure_outflow_allows_only_its_opened_exterior_face():
         "z_min": 0,
         "z_max": 0,
     }
+
+
+def test_pressure_outflow_face_filter_keeps_roof_edges_off_side_walls():
+    p = Params(
+        resolution=(4, 3, 3), dx=1.0, gravity=(0.0, 0.0, 0.0),
+    )
+    solver = STFLIPSolver(p, "cpu")
+    first = np.zeros(p.resolution, dtype=bool)
+    first[0, 0, -1] = True
+    second = np.zeros(p.resolution, dtype=bool)
+    second[-1, -1, -1] = True
+
+    solver.add_outflow(first, "PRESSURE", faces=("z_max",))
+    solver.add_outflow(second, "PRESSURE", faces="z_max")
+
+    assert solver.outflow_stats()["pressure_open_face_counts"] == {
+        "x_min": 0,
+        "x_max": 0,
+        "y_min": 0,
+        "y_max": 0,
+        "z_min": 0,
+        "z_max": 2,
+    }
+
+
+def test_pressure_outflow_face_filter_validates_mode_names_and_intersection():
+    p = Params(resolution=(3, 3, 3), dx=1.0)
+    solver = STFLIPSolver(p, "cpu")
+    roof_center = np.zeros(p.resolution, dtype=bool)
+    roof_center[1, 1, -1] = True
+
+    with pytest.raises(ValueError, match="only to PRESSURE"):
+        solver.add_outflow(roof_center, "VOLUME", faces=("z_max",))
+    with pytest.raises(ValueError, match="unique exterior face names"):
+        solver.add_outflow(roof_center, "PRESSURE", faces=("ceiling",))
+    with pytest.raises(ValueError, match="no marked cells.*x_min"):
+        solver.add_outflow(roof_center, "PRESSURE", faces=("x_min",))
 
 
 def test_pressure_exit_uses_segment_boundary_intersection_coordinates():

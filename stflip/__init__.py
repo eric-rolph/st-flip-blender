@@ -11,17 +11,19 @@ from .backend import (
     cuda_diagnostics,
     get_backend,
 )
-from . import surface_tension, whitewater
+from . import benchmarks, paper_validation, surface_tension, tiles, whitewater
+from .pressure import PressureSolveError
 from .solver import FrameStats, Params, STFLIPSolver
 from .surface import SurfaceReconstruction, reconstruct_surface
 from .velocity import SolidBodyRotation, UniformVelocity
 
-__version__ = "0.23.1"
+__version__ = "0.24.0"
 
 __all__ = [
     "Backend",
     "FrameStats",
     "Params",
+    "PressureSolveError",
     "SolidBodyRotation",
     "STFLIPSolver",
     "SurfaceReconstruction",
@@ -29,9 +31,12 @@ __all__ = [
     "cuda_available",
     "cuda_device_name",
     "cuda_diagnostics",
+    "benchmarks",
     "get_backend",
+    "paper_validation",
     "reconstruct_surface",
     "surface_tension",
+    "tiles",
     "whitewater",
     "__version__",
 ]
