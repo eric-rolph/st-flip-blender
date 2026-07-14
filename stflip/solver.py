@@ -28,6 +28,7 @@ from . import (
     kernels,
     multigrid,
     pressure,
+    sampling,
     surface_tension,
     viscosity,
 )
@@ -120,6 +121,12 @@ class Params:
     # grid-independent (a large win at production resolutions, a wash on small
     # grids, where it transparently falls back to the diagonal path).
     pressure_solver: str = "jacobi"
+    # Temporal jitter deviate source (roadmap SAMP-M3).  "pseudo" is the
+    # paper-faithful PRNG draw; "sobol_owen" replaces it with the stateless
+    # Owen-scrambled low-discrepancy sequence keyed by stable particle ids
+    # (opt-in until the SAMP-M5 A/B passes); "cp_rot" is an experimental
+    # Cranley-Patterson comparison arm, never a production choice.
+    temporal_sampling: str = "pseudo"
     cfl_local: float = 1.0            # advection sub-step bound
     seed: int = 0
 
@@ -242,6 +249,10 @@ class Params:
             raise ValueError("transfer must be 'flip', 'apic', or 'pic'")
         if self.pressure_solver not in ("jacobi", "multigrid"):
             raise ValueError("pressure_solver must be 'jacobi' or 'multigrid'")
+        if self.temporal_sampling not in ("pseudo", "sobol_owen", "cp_rot"):
+            raise ValueError(
+                "temporal_sampling must be 'pseudo', 'sobol_owen', "
+                "or 'cp_rot'")
         for name in ("two_phase", "sparse"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
@@ -692,9 +703,15 @@ class STFLIPSolver:
                 self._next_source, int(self.be.to_numpy(self.source_id).max()) + 1)
         # Restore stable particle ids when persisted (checkpoint v3);
         # pre-v3 checkpoints synthesize ids 0..n-1 and restart the substep
-        # counter -- permitted today because nothing samples by id yet.
-        # When SAMP-M3 lands an id-keyed sampler, this synthesis path must
-        # gain the mode gate (refuse for non-pseudo temporal_sampling).
+        # counter -- permitted ONLY for the pseudo sampler, whose deviates
+        # never key on ids.  An id-keyed low-discrepancy bake cannot resume
+        # from synthesized identities without silently changing every
+        # subsequent deviate.
+        if particle_id_restore is None and self.p.temporal_sampling != "pseudo":
+            raise ValueError(
+                "checkpoint predates stable particle ids (schema v3); "
+                "resuming a temporal_sampling != 'pseudo' bake requires a "
+                "v3 checkpoint - re-bake from frame zero")
         if particle_id_restore is not None:
             self.particle_id = particle_id_restore
             floor = int(next_particle_id)
@@ -2387,8 +2404,15 @@ class STFLIPSolver:
             # NORM-M1) relies on that; changes to the step tail must
             # preserve it or persist gamma instead.
             gamma = self._jitter_gamma(dt)
-            xi = self.be.from_numpy(
-                self._rng.random(n, dtype=np.float32)) - 0.5
+            if p.temporal_sampling == "sobol_owen":
+                xi = sampling.temporal_xi(
+                    xp, self.particle_id, self._substep_index, p.seed)
+            elif p.temporal_sampling == "cp_rot":
+                xi = sampling.temporal_xi_cp_rot(
+                    xp, self.particle_id, self._substep_index, p.seed)
+            else:
+                xi = self.be.from_numpy(
+                    self._rng.random(n, dtype=np.float32)) - 0.5
             jit = gamma * xi * dt
         else:
             jit = xp.zeros((n,), dtype=xp.float32)
