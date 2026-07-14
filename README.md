@@ -86,9 +86,11 @@ phase-field coherence surrogate, not an exact paper reproduction: it uses a
 dense unit-cube dam break and an internal diffuse-phase instantaneous ablation
 instead of standard FLIP/GFM or APIC. It does not replace the paper's
 predeclared `T=7` SDF/mass-slice studies or MCF-smoothed render-surface normal
-metric. The add-on now implements that surface operator, but the validator does
-not reproduce the paper's geometry or reference data. Output hashes are audit
-fingerprints for the artifact's declared
+metric. The add-on now implements that surface operator, but
+`tools/run_validation.py` does not reproduce the paper's geometry or reference
+data. The separate paper-reference runner below supplies declared geometry
+without bundling experimental traces. Output hashes are audit fingerprints for
+the artifact's declared
 Python/NumPy/backend environment, not bitwise-determinism claims across
 hardware or numerical-library versions.
 
@@ -103,9 +105,38 @@ Mean threshold-interface IoU was `0.92829` versus `0.92175` (ST better in 3/3).
 Raw deposited-mass RMSE was `0.23379` versus `0.23034` (ratio `1.0150`, ST
 better in only 1/3), so that diagnostic remains inconclusive.
 
+### Paper-reference benchmark scenes
+
+`tools/run_paper_validation.py` adds two compact, bpy-free reference scenes:
+
+- **Kleefsman** uses the published 3-D tank, initial water block, obstacle, and
+  H2/H4 x-coordinates. It records fixed-seed water-height series and an exact
+  atmospheric-pressure roof boundary. The
+  centreline y-coordinate and particle-to-height estimator are explicit
+  implementation choices.
+- **Glug** uses the ST-FLIP paper's published dimension ratios for the two
+  containers and connector. Unpublished wall and placement choices are stored
+  as assumptions, so this is a paper-constrained regression scene rather than
+  a pixel-identical reproduction or PF-FLIP comparison.
+
+The defaults below are compact smoke/regression settings, not validation-
+fidelity settings. Choose resolution, `dx`, duration, and sampling for the
+evidence claim you intend to make.
+
+```bash
+python tools/run_paper_validation.py --case kleefsman --output validation/kleefsman.json
+python tools/run_paper_validation.py --case glug --output validation/glug.json
+```
+
+Experimental Kleefsman comparison is opt-in. Supply an attributable CSV plus
+its citation; the artifact hashes the input and reports interpolated RMSE,
+MAE, bias, and peak errors. No experimental trace is bundled or digitized from
+a figure. See [validation/README.md](validation/README.md) for the schema and
+strict-gate example.
+
 ## Install
 
-The current source and packaged release identify as v0.23.1.
+The current source and packaged release identify as v0.24.0.
 
 1. Download `st_flip-<version>.zip` from the
    [latest release](https://github.com/eric-rolph/st-flip-blender/releases/latest),
@@ -157,6 +188,12 @@ custom build. A vendor-neutral wgpu backend is on the roadmap.
    - Select any closed mesh and set its role to **Liquid**, **Inflow**
      (with a velocity), **Outflow**, or **Obstacle**.
    - Use a mesh or Empty as a **Force Field** guide; it is not voxelized.
+   For a settings-only paper-facing configuration, press **Final / Paper
+   Fidelity**. It resets **Experiment Profile** to Custom and selects curated
+   paper-facing solver controls plus Paper MCF output without deleting an
+   existing cache; rebake or rebuild when the selected settings differ from the
+   committed artifact. Geometry, resolution, FPS, backend, pressure-solver
+   choice, density, and other unlisted controls remain unchanged.
 3. Pick **Resolution** (cells along the longest domain axis) and
    **Target CFL** (8 is a good start; higher values may reduce global solves
    when the frame interval does not cap the step, while lower values generally
@@ -228,6 +265,21 @@ Paper Surface Cache**.
 Gravity comes from the scene's gravity settings; frame rate from the render
 settings.
 
+### Scene-unit boundary
+
+Blender's geometry, velocity properties, and scene gravity already arrive as
+internal Blender-unit values. `Unit Scale` changes how Blender displays those
+values; the add-on does not multiply them a second time. At the boundary to the
+solver, controls authored explicitly in SI are converted as follows for
+`s = scene.unit_settings.scale_length` metres per Blender unit:
+
+- density: `rho_solver = rho_kg/m^3 * s^3`;
+- kinematic viscosity: `nu_solver = nu_m^2/s / s^2`;
+- surface tension: unchanged, because `N/m = kg/s^2` has no length dimension.
+
+The conversion policy and `s` are written to bake metadata. Changing Unit Scale
+does not resize existing objects or rewrite their velocity/gravity RNA values.
+
 One-click setups replace generated setup objects, clear this scene's owned
 bake, and may change scene-global units, gravity, FPS, and frame range. When a
 bake exists Blender asks for confirmation because the disk-cache deletion
@@ -282,6 +334,7 @@ need finer boundary-motion sampling.
 | Pressure Solver | §3.6–3.7 | Jacobi-PCG (default) or geometric multigrid; both use one or more tight active boxes when the projected reduction is worthwhile, including splits at empty lattice planes; multigrid falls back to Jacobi on grids too small to coarsen |
 | Materials & Look | — | One-click fluid materials (water, clear, honey, juice, milk, lava) plus a Studio Look setup (EEVEE Next raytracing + sky world + sun) so a bake renders with real refraction immediately |
 | Paper MCF Surface | Appendix B | Fixed radius/voxel `0.5Δx`, Gaussian `σ=2Δx`, feature mask `θ=2, ζ=5`, and `0.5` isovalue; `kψ` defaults to 30 |
+| Final / Paper Fidelity | §3, §4, Appendix B | Curated settings-only preset: resets Experiment Profile to Custom, then applies CFL 8, 8 PPC, seed 0, ST sampling, `γ=1`, adaptive attenuation, `ηφ=0.5`, FLIP 0.98, local CFL 1, PPE tolerance `1e-4`, Paper MCF 30, and zero mesh adaptivity. It preserves existing cache files and leaves unlisted scene/solver controls unchanged |
 
 ### Source velocity fields
 
@@ -297,9 +350,12 @@ particle positions and velocities on CPU and CUDA.
 An inflow may also be restricted to inclusive evolved **Start Frame / End
 Frame** outputs. The cache's first frame is a pre-step snapshot; subsequent
 frames receive emission during their preceding simulation interval. Scheduling
-is checkpoint-safe because it is derived from the restored solver clock; it
-does not turn the occupancy refill source into a prescribed volume-flow
-boundary.
+is checkpoint-safe because it is derived from the restored solver clock. The
+solver splits a global step at an inflow's exact start time, including a start
+inside an output-frame interval, and checks each active source before every
+global simulation step. A cell below half its target PPC receives a full PPC
+packet. Refill does not occur at each RK advection substep and does not turn the
+source into a prescribed volume-flow or pressure/head boundary.
 
 With the paper's vertical axis mapped through Blender's world origin, its
 whirlpool initialization is represented by center `(0, 0, 0)`, axis `+Z`,
@@ -343,7 +399,8 @@ Enstrophy** additionally records
 estimate from the MAC grid.
 
 Distances and derived quantities remain in raw Blender/solver units; the
-scene unit system and scale are saved alongside them. Particle-volume and
+scene unit system, scale, and SI-control conversion boundary are saved
+alongside them. Particle-volume and
 phase-threshold volume are explicitly estimates, not the paper's unspecified
 volume estimator or normalization. The observed CFL fields use this solver's
 maximum particle speed and are therefore not labeled as paper-equivalent grid
@@ -363,9 +420,10 @@ detail generator.
 
 ### Paper coverage
 
-The current v0.23 series extends the free-surface ST-FLIP core with **two-phase
+The current source extends the free-surface ST-FLIP core with **two-phase
 gas coupling, APIC/PIC transfers, CSF surface tension, animated and deforming
-moving-wall boundaries, and a dense active-window crop**.
+moving-wall boundaries, a dense active-window crop, and solver-independent
+tiled-storage primitives**.
 
 It is still not a full reproduction of the paper's production examples.
 
@@ -373,14 +431,14 @@ It is still not a full reproduction of the paper's production examples.
 |---|---|
 | One-sided temporal kernel, slab P2G, residual jitter, phase field, variable-coefficient projection | Implemented |
 | Large target CFL and instantaneous-P2G temporal ablation | Implemented; target CFL 0.5–30 |
-| Reproducible reruns over paper-inspired CFL, particle-count, and FLIP/PIC parameter matrices | ST-FLIP-side profiles, auditable frame diagnostics, and a matched four-case batch validator are implemented; no true FLIP/GFM branches or exact paper scenes |
+| Reproducible reruns over paper-inspired CFL, particle-count, and FLIP/PIC parameter matrices | ST-FLIP-side profiles, auditable frame diagnostics, a matched four-case batch validator, and compact Kleefsman/glug reference scenes are implemented; no true FLIP/GFM branches |
 | Single-phase liquid scenes with static mesh obstacles, inflows, and outflows | Implemented; inflows support uniform/rotational fields and active frame ranges; outflows support volume sinks and exterior atmospheric-pressure faces |
 | Fractional solid face apertures in Eq. 14–17 | Implemented; a moving-wall solid-velocity flux term `div((1-alpha) u_solid)` couples animated obstacles into the same projection |
 | Paper render reconstruction (`0.5Δx` spheres, 2× grid, feature mask, MCF, `0.5` iso) | Implemented as an opt-in, versioned derived mesh cache; the paper does not prescribe the subvoxel rasterizer, so this implementation records its linear one-voxel coverage ramp explicitly |
 | Two-phase liquid/gas coupling | Implemented (v0.9): deposited liquid-volume-fraction phase field, variable-density projection over both phases, gas seeding (`fill_gas`/`add_gas_mask`) |
 | APIC / PIC transfers | Implemented (v0.9): per-particle affine matrix with the same temporal weighting, MAC-grid `B·D⁻¹` reconstruction; implicit-density-projection comparison solver still not implemented |
 | Surface tension (CSF) | Implemented (v0.9): curvature from a cubic-B-spline-smoothed phase field, `σ·κ·∇φ` face acceleration |
-| Sparse/adaptive grids | Partial: a block-aligned dense active-window crop matches the full-domain path for supported scenes, but fully tiled sparse storage and billion-particle scale are not implemented |
+| Sparse/adaptive grids | Partial: a block-aligned dense active-window crop is integrated. Phase-1 deterministic tile layout/table, core+halo activation, 6/26-neighbour lookup, dense-boundary pack/unpack, packed halo exchange, and callable sparsity telemetry are tested but not connected to a solver step. Tiled operators and billion-particle scale are not implemented |
 | Appendix B mean-curvature-flow output reconstruction | Implemented with default `kψ=30`; OpenVDB extracts the render mesh and Fast Preview remains a separate approximation |
 | Animated/deforming obstacle boundary conditions | Implemented for rigid transforms and stable-topology deformation: unchanged-transform deformation uses nearest evaluated-vertex displacement; combined transform/deformation uses rigid velocity, and topology changes are unsupported for deformation velocity |
 
@@ -391,10 +449,10 @@ Experiment-level coverage is narrower than method-level coverage:
 | Laminar/standard dam breaks over large CFL values | Partial: parameter profiles, qualitative setup, and raw diagnostics, without exact geometry, GFM/APIC baselines, or the paper's unspecified normalization |
 | Static-obstacle wake and thin-obstacle inflow jet | Partial: an explicitly approximate High-CFL Jet Preview exercises a scheduled high-speed inflow, thin stationary cut-cell obstacle, and pressure outlet; the paper's exact geometry and jet parameters are unpublished |
 | Particle-count and FLIP-blend studies | ST-FLIP-side parameter profiles, deterministic seed, and enstrophy diagnostic are available; true FLIP/GFM branches, SDF RMSE, and batch-sweep tooling are not |
-| Kleefsman obstacle validation | Missing water-height gauges and experimental-data comparison |
+| Kleefsman obstacle validation | Published geometry, an atmospheric-pressure roof, plus seeded H2/H4 water-height sampling are executable. Experimental comparison requires an external attributable CSV; none is bundled |
 | MCF reconstruction study | MCF is implemented; the paper's reference surfaces and normal-RMSE evaluation dataset are unavailable |
 | Whirlpool, rotational fields, and outflow scenes | Partial: published rotation and pipe/domain dimensions are available in an approximate preview with a pressure outlet; exact fill height, timing, production scale, and rendering remain unpublished/unreproduced |
-| Two-phase glugging/discharge and production-scale scenes | Partial: two-phase coupling and an air-entraining pour demo are implemented; exact discharge scenes/data and fully tiled production-scale sparsity are not reproduced |
+| Two-phase glugging/discharge and production-scale scenes | Partial: two-phase coupling, an air-entraining Blender pour demo, and a paper-constrained glug CLI scene are implemented. Unpublished layout choices are recorded; PF-FLIP equivalence and fully tiled production scale are not reproduced |
 
 The Blender UI exposes these inputs for the implemented solver:
 resolution, target CFL, particles/cell, `γ`, adaptive attenuation, `η`,
@@ -426,7 +484,9 @@ toggle for rigid motion and stable-topology deformation, also scriptable via
 - 4D→3D slab-integrated P2G with weight-accumulator phase field (Eq. 8–13)
 - Variational variable-coefficient pressure projection, matrix-free
   Jacobi-PCG (Eq. 14–17), including node-SDF-derived fractional solid face
-  apertures, `div(alpha * u)`, and aperture-weighted PPE coefficients
+  apertures, `div(alpha * u)`, and aperture-weighted PPE coefficients;
+  non-finite or above-tolerance terminal residuals raise an explicit pressure
+  solve error instead of silently committing a bad step
 - Gain-gated pressure-system crops: one or more tight active boxes when the
   projected reduction is worthwhile, including splits at empty lattice planes
 - Temporal jitter with residual carryover and the Appendix A boundedness
@@ -438,7 +498,8 @@ toggle for rigid motion and stable-topology deformation, also scriptable via
   fixed Gaussian/self-quotient feature mask, 30-iteration default level-set
   mean-curvature flow, strict derived mesh caches, and OpenVDB `0.5` isosurface
 - Stationary solid obstacles via cell/node-sampled voxelised SDF, fractional
-  face apertures, and particle push-back; optionally scheduled inflow emitters
+  face apertures, and particle push-back; scheduled inflows start at their
+  exact solver time and occupancy-refill before each active global step
 - Uniform and right-handed solid-body liquid/inflow velocity fields, sampled
   at actual jittered particle positions with deterministic CPU/CUDA setup
 - Interior volume sinks and exterior half-cell atmospheric-pressure outlets,
@@ -469,6 +530,11 @@ toggle for rigid motion and stable-topology deformation, also scriptable via
 - **Dense active-window crop** (v0.9): every step can crop to a block-aligned
   window around fluid plus its extrapolation band; it disengages for outflows
   or cut-cell node-SDF solids and is not tiled sparse storage
+- **Tiled-storage Phase 1**: deterministic core/halo tile layouts, a dense
+  coarse tile table, face/diagonal neighbours, arbitrary cell-field
+  pack/unpack from/to dense fields, packed one-cell halo exchange, and callable
+  bbox/tile telemetry. This is a tested standalone NumPy representation; no
+  simulation path uses it yet
 - **Shading attributes** on the particle point cloud: `velocity`, `speed`,
   `age` (seconds since seeding), and `source` (per-source id) for age-fade,
   speed-driven effects, and per-source colouring in shaders/Geometry Nodes
@@ -491,12 +557,21 @@ toggle for rigid motion and stable-topology deformation, also scriptable via
   atomic CSV/JSON export; optional discrete MAC-grid enstrophy
 - Matched four-case ST/instantaneous CFL 1/16 validation with observed-CFL,
   quality, state-hash, residual, and separately scoped timing evidence
+- Compact reproducible Kleefsman and paper-constrained glug benchmark CLI with
+  strict JSON artifacts; attributable external gauge CSVs are hashed before
+  Kleefsman error metrics are computed
+- Installed-extension CI smoke in a pinned/checksummed Blender 4.2 release
+  archive from an NLUUG mirror, including a tiny real CPU step, Geometry Nodes,
+  a two-iteration Paper reconstruction, and strict bundled-OpenVDB
+  polygonization; real core CUDA parity is a separate manual job on a labelled
+  self-hosted NVIDIA runner
 - Atomic playback-only downstream handoff with a strict manifest and explicit
   absence declarations for IDs, foam/spray labels, inferred detail, and AI
 
-Not (yet) implemented from the paper: the standard-FLIP/GFM and
-implicit-density-projection comparison baselines, and billion-particle
-production-scale scenes.
+Not (yet) implemented from the paper: the standard-FLIP/GFM,
+implicit-density-projection, or PF-FLIP comparison baselines; tiled solver
+operators/integration; and billion-particle production-scale scenes. The
+standalone Phase-1 tile representation is not evidence for those claims.
 
 Known limitations: two-phase and the Sparse Grid toggle do not combine
 usefully because gas fills the domain. The active window also disengages for
@@ -526,9 +601,14 @@ Temporal-jitter randoms are drawn on the host, so seeded initial random state
 matches across CPU and CUDA. Evolved results are numerically close, not
 guaranteed bitwise-identical across backends.
 
-Playback and Paper-surface positions use float32 world coordinates. Very large
-world offsets can erase subcell detail, so keep high-resolution domains near
-the world origin.
+Playback positions remain float32 world coordinates. Paper MCF reconstructs in
+the Domain-local coordinate frame and places the resulting mesh by object
+translation. New frames store a synchronized solver-local attribute when the
+origin-versus-voxel precision test says world float32 would be insufficient.
+When a legacy cache lacks that required attribute, rebuild fails closed and
+asks for a simulation rebake; it does not silently reconstruct from lossy
+coordinates. Near-origin legacy caches can still use a float64 subtraction
+fallback.
 
 Primary-solver checkpoints are uncompressed and can be much larger than
 playback frames. Paper surfacing uses a dense cropped grid with `O(kψ V)` work;
@@ -561,7 +641,22 @@ committed frame.
 uv run --no-project --with pytest --with numpy pytest tests -v
 # GPU parity test (NVIDIA GPU required)
 uv run --no-project --with pytest --with numpy --with "cupy-cuda13x[ctk]==14.1.1" pytest tests -m gpu -v
+
+# Compact paper-reference scenes (CPU by default)
+python tools/run_paper_validation.py --case kleefsman --output validation/kleefsman.json
+python tools/run_paper_validation.py --case glug --output validation/glug.json
+
+# Explicit CUDA compute/parity smoke (fails if real CUDA work cannot run)
+python tools/cuda_smoke.py --require-gpu --output cuda-smoke.json
 ```
+
+Pull-request CI also installs the built extension into a pinned/checksummed
+Blender 4.2 release archive from an NLUUG mirror and requires Blender's bundled
+OpenVDB path to produce a non-empty isosurface after a tiny two-iteration Paper
+smoke. CUDA is intentionally not inferred from a CPU runner:
+`.github/workflows/cuda-smoke.yml` is a manual core-solver workflow for a
+labelled self-hosted NVIDIA host and passes `--require-gpu`; it does not run
+inside Blender or test Paper surfacing.
 
 The solver (`stflip/`) is bpy-free and usable standalone:
 

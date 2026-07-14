@@ -7,6 +7,7 @@ and writes ordinary Blender mesh geometry without a live Geometry Nodes
 dependency.
 """
 
+import importlib
 import math
 
 import bpy
@@ -28,6 +29,75 @@ _INTERFACE_SCHEMA = (
     ("Material", "INPUT", "NodeSocketMaterial"),
     ("Geometry", "OUTPUT", "NodeSocketGeometry"),
 )
+
+
+def _load_openvdb():
+    """Load either upstream or Blender-bundled OpenVDB Python bindings."""
+    errors = []
+    for module_name in ("openvdb", "pyopenvdb"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            errors.append(exc)
+            continue
+        missing = [
+            name for name in ("FloatGrid", "createLinearTransform")
+            if not callable(getattr(module, name, None))
+        ]
+        if not missing:
+            return module
+        errors.append(ImportError(
+            f"{module_name} lacks required API: {', '.join(missing)}"))
+    raise RuntimeError(
+        "Paper MCF meshing requires Blender's OpenVDB Python module "
+        "('openvdb' or the official-build name 'pyopenvdb'); use an official "
+        "Blender build with OpenVDB enabled"
+    ) from errors[-1]
+
+
+def place_paper_surface_object(obj, world_origin):
+    """Give a domain-local Paper mesh an exact translation-only world frame."""
+    if obj is None:
+        return None
+    try:
+        origin = np.asarray(world_origin, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("world origin must contain three finite values") from exc
+    if origin.shape != (3,) or not bool(np.all(np.isfinite(origin))):
+        raise ValueError("world origin must contain three finite values")
+    values = tuple(float(value) for value in origin)
+
+    # Neutralize delta transforms before assigning matrix_world.  Assignment
+    # preserves an existing parent while solving the local transform required
+    # for this exact world-space translation; it is also rotation-mode agnostic.
+    for name, value in (
+        ("delta_location", (0.0, 0.0, 0.0)),
+        ("delta_rotation_euler", (0.0, 0.0, 0.0)),
+        ("delta_rotation_quaternion", (1.0, 0.0, 0.0, 0.0)),
+        ("delta_scale", (1.0, 1.0, 1.0)),
+    ):
+        if hasattr(obj, name):
+            setattr(obj, name, value)
+    try:
+        from mathutils import Matrix
+
+        transform = Matrix.Identity(4)
+        transform.translation = values
+        obj.matrix_world = transform
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        # Ordinary-Python tests and stripped Blender-like hosts have no
+        # mathutils.  Generated output objects are unparented there, so the
+        # explicit identity channels are equivalent.
+        obj.location = values
+        if hasattr(obj, "rotation_euler"):
+            obj.rotation_euler = (0.0, 0.0, 0.0)
+        if hasattr(obj, "rotation_quaternion"):
+            obj.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+        if hasattr(obj, "rotation_axis_angle"):
+            obj.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+        if hasattr(obj, "scale"):
+            obj.scale = (1.0, 1.0, 1.0)
+    return obj
 
 
 def _new_socket(ng, name, in_out, socket_type):
@@ -783,13 +853,7 @@ def density_field_to_polygons(
     if not math.isfinite(adaptive) or not 0.0 <= adaptive <= 1.0:
         raise ValueError("adaptivity must be between 0 and 1")
 
-    try:
-        import openvdb  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError(
-            "Paper MCF meshing requires Blender's OpenVDB Python module "
-            "('openvdb'); use an official Blender build with OpenVDB enabled"
-        ) from exc
+    openvdb = _load_openvdb()
 
     try:
         grid = openvdb.FloatGrid()

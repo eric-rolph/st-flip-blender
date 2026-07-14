@@ -1,8 +1,8 @@
 # Design: tiled sparse grid
 
-Status: **design + two safe increments shipped.** This document specifies a
-fully tiled sparse grid and describes the active-box and axis-separable-region
-pressure crops already in the codebase.
+Status: **Phase 1 representation + two dense-solver crops shipped; tiled solver
+integration is not shipped.** This document separates the tested storage
+primitives from the Phase 2+ operators required for a genuinely tiled solve.
 
 ## Motivation
 
@@ -65,6 +65,29 @@ cells active), the pressure solve drops from ~650 ms to ~6 ms (Jacobi) and from
 on a `~18^3` box instead of the full grid. This is the ceiling of what a
 bounding-box strategy can do; a thin full-span sheet would see little benefit.
 
+## The tiled-storage Phase-1 increment (shipped, standalone)
+
+`stflip.tiles` now implements the solver-independent representation needed to
+measure and test the next stage:
+
+- `build_tile_layout` converts a 3-D active-cell mask into deterministic,
+  lexicographically ordered core tiles plus a configurable tile halo;
+- a dense coarse tile table maps tile coordinates to packed slots, with stable
+  six-face or 26-neighbour lookups;
+- `pack` and `unpack` round-trip arbitrary cell-centred fields, including
+  fields with trailing component axes and partial Domain-edge tiles;
+- `with_halo` performs a true packed-only one-cell 26-neighbour exchange, with
+  zero fill at missing neighbours and outside partial edge tiles;
+- `TileTelemetry` records active, bounding-box, core-tile, and halo-tile cell
+  counts/fractions plus the bounding-box-to-core-tile ratio.
+
+The primitives have deterministic boundary, neighbour, round-trip, vector
+field, halo, and validation tests. They are deliberately NumPy-side and
+standalone: no allocation, P2G/G2P, pressure, cache, Blender UI, or bake path
+uses them yet, and telemetry is a callable API rather than an automatically
+recorded per-bake metric. Therefore Phase 1 does **not** reduce current bake
+memory/time and is not evidence for PF-FLIP or billion-particle capability.
+
 ## Measured sparsity opportunity
 
 Before committing to the full rewrite, we measured how much sparsity full tiling
@@ -106,6 +129,10 @@ bottlenecked on the dense grid in the disconnected regime, not speculatively.
 
 A cheaper, data-supported middle step is now **shipped**
 (`pressure.crop_boxes`, Phase 1.5 below).
+
+The shipped `TileTelemetry` API can compute the same footprint categories for
+any supplied active mask, making the go/no-go evidence reproducible without
+wiring an unfinished storage path into the solver.
 
 Regions separated by complete empty lattice planes are independent pressure
 systems, so each can use its own tight box without a tiling rewrite.
@@ -196,12 +223,14 @@ parity.
 - **Phase 0 — bounding-box crop (shipped).** `pressure.crop_boxes` returns one
   gain-worthy active box for the compact/contiguous majority; `crop_to_active`
   remains a single-box reference helper.
-- **Phase 1 — tiling data structure + telemetry.** A `tiles` module: the tile
+- **Phase 1 — tiling data structure + telemetry (shipped, standalone).** The
+  `stflip.tiles` module provides the tile
   table, active-set from a cell mask, neighbour lookup, pack/unpack, and a
-  diagnostic that reports the active-tile fraction (the measurement above,
-  online). No solver change. Tests: pack/unpack round-trip, neighbour and
-  boundary-tile correctness. *Deliverable on its own:* per-bake sparsity
-  telemetry to decide when tiling would pay.
+  diagnostic that reports active/bbox/core/halo tile fractions. It also ships
+  packed-only one-cell halo exchange. No solver change. Tests cover
+  pack/unpack, neighbour and boundary-tile correctness, vector fields, halo
+  exchange, empty layouts, and invalid inputs. Automatic per-bake telemetry
+  remains an integration task rather than a shipped claim.
 - **Phase 1.5 — per-axis-separable-region crop (shipped).** `pressure.crop_boxes`
   recursively splits the active box at *complete empty planes* (a lattice plane
   with no liquid) into axis-separable components, and `pressure.solve` /
@@ -231,7 +260,7 @@ parity.
   device-resident tile table, and allocation hysteresis to avoid thrash at the
   moving interface.
 
-## Why this is deferred
+## Why Phase 2+ is deferred
 
 A correct tiled solver is a substantial rewrite of the solver core and every
 stencil, with new failure modes (halo staleness, table/particle desync,

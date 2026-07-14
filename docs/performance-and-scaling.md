@@ -63,6 +63,13 @@ disengages when it cannot safely help (outflows, cut-cell obstacles, or
 Two-Phase filling the domain).
 
 This is a dense active-window optimization, not fully tiled sparse storage.
+The repository now ships Phase-1 tiled-storage primitives—deterministic
+core/halo layouts, a dense coarse lookup table, dense-field pack/unpack,
+one-cell packed halo exchange, neighbour slots, and callable bbox/tile
+telemetry—but they are
+solver-independent. They do not yet reduce a bake's memory or compute cost.
+See the [tiled-grid design](design/tiled-sparse-grid.md) for the parity-gated
+integration phases.
 
 ## Resolution strategy
 
@@ -79,6 +86,22 @@ Bakes can run without the UI for overnight or farm jobs — bake from a Python
 script via Blender's background mode. See the top-level
 [README](../README.md#headless--scripted-baking) for the exact invocation. This
 is also how you drive a bake on a remote machine.
+
+## What CI performance coverage does—and does not—prove
+
+Pull-request CI installs the extension into a pinned/checksummed Blender 4.2
+release archive from an NLUUG mirror, runs a tiny real CPU step, performs a
+two-iteration Paper reconstruction, builds Geometry Nodes, and requires
+Blender's bundled OpenVDB binding to emit a non-empty mesh. This validates a
+narrow installed-extension integration path, not a complete bake or production
+throughput.
+
+CUDA validation is a separate manual workflow for a labelled self-hosted
+NVIDIA runner. It passes `--require-gpu` and compares a tiny core CUDA step with
+CPU within declared tolerances; a CPU-only machine cannot be reported as a CUDA
+pass. It does not run Blender or Paper surfacing, and it is not a required
+public pull-request job. Neither smoke establishes billion-particle scale or
+PF-FLIP equivalence.
 
 ## Cloud / remote baking and rendering
 

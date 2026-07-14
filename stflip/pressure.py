@@ -21,6 +21,29 @@ from __future__ import annotations
 import numpy as np
 
 
+class PressureSolveError(RuntimeError):
+    """Pressure projection failed its convergence contract."""
+
+    def __init__(self, iterations, rel_residual, tolerance):
+        self.iterations = int(iterations)
+        self.rel_residual = float(rel_residual)
+        self.tolerance = float(tolerance)
+        if not np.isfinite(self.rel_residual):
+            message = (
+                "pressure solve produced a non-finite relative residual "
+                f"after {self.iterations} iterations: "
+                f"{self.rel_residual:.6g}"
+            )
+        else:
+            message = (
+                "pressure solve did not converge after "
+                f"{self.iterations} iterations: relative residual "
+                f"{self.rel_residual:.6g} exceeds tolerance "
+                f"{self.tolerance:.6g}"
+            )
+        super().__init__(message)
+
+
 def apply_laplacian(xp, p, kx, ky, kz, liquid):
     """A p = sum_f k_f (p_c - p_nb), restricted to liquid rows.
 

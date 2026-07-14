@@ -27,16 +27,20 @@ Liquid objects can be given an **initial velocity**:
 
 ## Inflow
 
-A closed mesh that **emits fluid over time** — a faucet, a jet, a hose. Inflow
-is occupancy-based: it keeps its volume topped up with fluid each step, rather
-than prescribing a strict volumetric flow rate.
+A closed mesh that **emits fluid over time** — a faucet, a jet, a hose. Before
+each active **global simulation step**, an occupancy-based source checks its
+cells; a cell below half the target particle count receives one full PPC
+packet. This is not an RK-substep refill and does not prescribe a volumetric
+flow rate or guarantee exact target occupancy.
 
 Key options:
 
 - **Inflow velocity** — uniform or solid-body, same as Liquid. A downward
   velocity makes a pour; an upward velocity makes a fountain jet.
 - **Frame range** — limit emission to an inclusive `[start, end]` scene-frame
-  window so a source turns on and off.
+  window so a source turns on and off. A start inside an output-frame interval
+  splits the global time step at the exact scheduled start; it is not delayed
+  to the next output frame.
 - **Emit as gas** — only visible with **Two-Phase** enabled; emits air instead
   of liquid (used for bubbling/glugging).
 

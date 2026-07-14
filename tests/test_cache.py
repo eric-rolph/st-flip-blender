@@ -286,6 +286,63 @@ def test_surface_cache_is_bound_to_source_particle_positions(tmp_path):
         )
 
 
+def test_surface_source_binding_uses_local_v2_and_world_legacy_v1(tmp_path):
+    fingerprint_v2 = "6" * 64
+    local = np.asarray([[0.125, 0.25, 0.5]], dtype=np.float32)
+    world = np.asarray([[100_000_000.0, 2.0, 3.0]], dtype=np.float32)
+    cache.write_surface(
+        str(tmp_path), 10, fingerprint_v2, *_surface_mesh(),
+        source_positions=local)
+
+    assert cache.read_surface(
+        str(tmp_path),
+        10,
+        fingerprint_v2,
+        expected_source_positions=local,
+        expected_legacy_source_positions=world,
+    ) is not None
+    with pytest.raises(cache.SurfaceCacheError, match="source particle"):
+        cache.read_surface(
+            str(tmp_path),
+            10,
+            fingerprint_v2,
+            expected_source_positions=local + 1.0,
+            expected_legacy_source_positions=world,
+        )
+    with pytest.raises(cache.SurfaceCacheError, match="local source"):
+        cache.read_surface(
+            str(tmp_path),
+            10,
+            fingerprint_v2,
+            expected_legacy_source_positions=world,
+        )
+
+    fingerprint_v1 = "7" * 64
+    path = cache.surface_path(str(tmp_path), 11, fingerprint_v1)
+    _write_surface_archive(
+        path,
+        11,
+        fingerprint_v1,
+        version=np.asarray(cache.SURFACE_LEGACY_VERSION, dtype=np.int64),
+        source_positions_sha256=np.asarray(
+            cache.surface_source_fingerprint(world)),
+    )
+    assert cache.read_surface(
+        str(tmp_path),
+        11,
+        fingerprint_v1,
+        expected_source_positions=local + 99.0,
+        expected_legacy_source_positions=world,
+    ) is not None
+
+
+def test_surface_metadata_accepts_legacy_v1_for_playback():
+    metadata = _paper_surface_metadata()
+    metadata["version"] = cache.SURFACE_LEGACY_VERSION
+
+    assert cache.validate_surface_metadata(metadata) == metadata["fingerprint"]
+
+
 def test_surface_cache_detects_valid_but_unhashed_mesh_changes(tmp_path):
     fingerprint = "8" * 64
     path = cache.surface_path(str(tmp_path), 5, fingerprint)

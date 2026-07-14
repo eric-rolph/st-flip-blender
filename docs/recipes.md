@@ -1,12 +1,14 @@
 # Recipes
 
-Concrete scenes. The four **Presets** (in the *ST-FLIP → Presets* sub-panel)
-build these for you in one click; each section below also shows how to build the
-same thing by hand so you can adapt it.
+Concrete scenes. The four scene-building **Presets** (in the *ST-FLIP →
+Presets* sub-panel) build these for you in one click; each section below also
+shows how to build the same thing by hand so you can adapt it. **Final / Paper
+Fidelity** in the same panel is a settings-only preset, not a fifth scene.
 
-Every preset builds a fresh Domain and objects, sets a sensible frame range,
-and configures exactly the solver features it needs — switching presets resets
-feature settings so a viscous pour never leaves a later fountain sticky.
+Every scene-building preset builds a fresh Domain and objects, sets a sensible
+frame range, and configures exactly the solver features it needs — switching
+scene presets resets feature settings so a viscous pour never leaves a later
+fountain sticky.
 
 ---
 
@@ -59,6 +61,17 @@ Build it by hand:
 A bottle-style glug additionally needs suitable container, neck and outlet
 geometry. **Emit as gas** can inject air, but it does not create that boundary
 geometry for you.
+
+For a fixed-seed research-facing geometry, the bpy-free paper-constrained
+glug runner uses the ST-FLIP paper's published container/connector ratios and
+records every unpublished layout choice as an assumption:
+
+```bash
+python tools/run_paper_validation.py --case glug --output validation/glug.json
+```
+
+That artifact is a two-phase regression, not a PF-FLIP-equivalence result and
+not a claim that unpublished production geometry was recovered.
 
 Two-Phase does **not** combine with the Sparse grid (gas fills the whole
 domain, so there is no localized active region to crop to).

@@ -3,7 +3,7 @@
 ## 1. Install the add-on
 
 ST-FLIP is a Blender **extension** for Blender 4.2+. This guide follows the
-current v0.23.1 release and source.
+current v0.24.0 release and source.
 
 Download the packaged release or build current source, then install its `.zip`
 via *Edit → Preferences → Get Extensions → Install from Disk*. See the
@@ -83,6 +83,21 @@ later than the last committed frame.
 Output-only surface and material controls may change; changed Paper MCF
 settings require a surface-cache rebuild. Whitewater restarts after Resume,
 and animated obstacle motion is re-sampled.
+
+## 6. Switch to final/paper-facing settings
+
+After look-dev, press **Final / Paper Fidelity** in the Presets panel. This is
+a curated settings-only operation: it resets **Experiment Profile** to Custom,
+selects the paper-facing temporal controls and Appendix-B Paper MCF surface,
+but does not delete cache files. It does not set geometry, resolution, FPS,
+backend, pressure-solver choice, density, or other unlisted controls. If the
+committed simulation used different solver settings, rebake; if only Paper MCF
+settings changed, rebuild the derived surface cache.
+
+`Unit Scale` is a display conversion, not a second geometry transform. Mesh
+coordinates, velocity controls, and gravity pass to the solver in Blender
+units. Density and kinematic viscosity remain SI-authored controls and are
+converted at the solver boundary; see the [settings guide](settings-guide.md#scene-units-and-physical-controls).
 
 ## Next steps
 
