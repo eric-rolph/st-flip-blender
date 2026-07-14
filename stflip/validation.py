@@ -150,12 +150,17 @@ def _hash_initial_checkpoint(
     m0: float,
     *,
     include_dt_prev: bool = True,
+    include_sampling_identity: bool = False,
 ) -> str:
     """Hash trajectory state, including RNG/m0 and optionally prior dt.
 
     ``dt_prev`` is intentionally initialized from the target CFL, so it must
     remain in each case's full checkpoint fingerprint but is omitted from the
     shared-initialization fingerprint used across the matched CFL matrix.
+    ``include_sampling_identity`` folds particle ids and the substep counter
+    into the hash; low-discrepancy runs (temporal_sampling != "pseudo") key
+    deviates on them, so their fingerprints must too.  Pseudo-mode
+    fingerprints stay comparable across the SAMP-M1 upgrade by default.
     """
     digest = hashlib.sha256()
     digest.update(
@@ -163,7 +168,14 @@ def _hash_initial_checkpoint(
         if include_dt_prev
         else b"stflip-shared-initial-state-v1\0"
     )
-    for name in ("pos", "vel", "dt_resid"):
+    names = ("pos", "vel", "dt_resid")
+    if include_sampling_identity:
+        digest.update(b"sampling-identity\0")
+        digest.update(json.dumps(
+            {"substep_index": int(state.get("substep_index", 0))},
+            sort_keys=True, separators=(",", ":")).encode("ascii"))
+        names = ("pos", "vel", "dt_resid", "particle_id")
+    for name in names:
         value = np.ascontiguousarray(state[name])
         digest.update(name.encode("ascii") + b"\0")
         digest.update(json.dumps(

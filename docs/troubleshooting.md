@@ -78,6 +78,15 @@ paper-faithful legacy weighting for comparisons. Full-jitter runs are
 bit-identical either way. Upgrading invalidates resume of pre-0.29 bakes
 (any solver-parameter addition does); completed caches still play back.
 
+Since v0.36.0 the solver can draw its temporal jitter from a stateless
+Owen-scrambled low-discrepancy sequence instead of the pseudo-random
+stream (`Params.temporal_sampling = "sobol_owen"`; Python/experiments
+only, no UI yet). It is opt-in and experimental until the sampling A/B
+study passes; the default `"pseudo"` keeps trajectories byte-identical
+to earlier releases. Low-discrepancy bakes resume bit-exactly from their
+own checkpoints but refuse checkpoints older than the stable-particle-id
+schema.
+
 **Motion is too smooth / mushy.**
 The opposite: use **FLIP** with a high FLIP Fraction (0.95–0.98), and make sure
 Resolution is high enough to carry the detail.

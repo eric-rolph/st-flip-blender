@@ -126,3 +126,21 @@ def temporal_xi(xp, particle_id, substep_index, seed):
     scrambled = laine_karras_permutation(xp, shuffled, key_point)
     bits = reverse_bits32(xp, scrambled)
     return (bits.astype(xp.float64) * (2.0 ** -32) - 0.5).astype(xp.float32)
+
+
+def temporal_xi_cp_rot(xp, particle_id, substep_index, seed):
+    """Cranley-Patterson rotated van der Corput deviate in [-1/2, 1/2).
+
+    Experimental A/B comparison arm ONLY (roadmap SAMP): each particle's
+    offset is frozen for all steps, so pairwise phase relationships persist
+    across the whole bake and can surface as structured artifacts --
+    exactly why the Owen-scrambled sampler is the primary choice.  The
+    uint32 addition wraps, which IS the mod-1 rotation.
+    """
+
+    ids = xp.asarray(particle_id)
+    key = particle_keys(xp, ids, seed, _POINT_SALT)
+    index = _as_index_array(xp, substep_index, ids.shape)
+    rotated = reverse_bits32(xp, index) + key
+    return (rotated.astype(xp.float64) * (2.0 ** -32) - 0.5).astype(
+        xp.float32)
