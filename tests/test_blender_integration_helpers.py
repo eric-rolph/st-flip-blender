@@ -1728,6 +1728,54 @@ class _RecordingLayout:
         self.records.append(("separator", ""))
 
 
+def test_object_panel_allows_empty_force_guides(monkeypatch):
+    panels = _load_surface_panels(monkeypatch)
+    force = types.SimpleNamespace(
+        role="FORCE",
+        force_type="VORTEX",
+        force_strength=4.0,
+        force_radius=2.0,
+        force_scale=0.5,
+    )
+    context = types.SimpleNamespace(
+        active_object=types.SimpleNamespace(type="EMPTY", stflip=force),
+        scene=types.SimpleNamespace(
+            stflip=types.SimpleNamespace(bake_state="IDLE")),
+    )
+    panel = panels.STFLIP_PT_object()
+    layout = _RecordingLayout()
+    panel.layout = layout
+
+    panel.draw(context)
+
+    props = {value for kind, value in layout.records if kind == "prop"}
+    labels = [value for kind, value in layout.records if kind == "label"]
+    assert {"role", "force_type", "force_strength", "force_radius"} <= props
+    assert not any("Select a mesh" in label for label in labels)
+
+
+def test_object_panel_warns_when_empty_has_voxelized_role(monkeypatch):
+    panels = _load_surface_panels(monkeypatch)
+    context = types.SimpleNamespace(
+        active_object=types.SimpleNamespace(
+            type="EMPTY",
+            stflip=types.SimpleNamespace(role="LIQUID"),
+        ),
+        scene=types.SimpleNamespace(
+            stflip=types.SimpleNamespace(bake_state="IDLE")),
+    )
+    panel = panels.STFLIP_PT_object()
+    layout = _RecordingLayout()
+    panel.layout = layout
+
+    panel.draw(context)
+
+    props = {value for kind, value in layout.records if kind == "prop"}
+    labels = [value for kind, value in layout.records if kind == "label"]
+    assert props == {"role"}
+    assert "Empty objects support the Force Field role only." in labels
+
+
 def test_surface_panel_separates_preview_and_paper_controls(monkeypatch):
     panels = _load_surface_panels(monkeypatch)
     settings = types.SimpleNamespace(

@@ -35,25 +35,30 @@ force, throwing spray.
 Build it by hand:
 
 1. Domain box; a **Liquid** slab filling the lower third.
-2. Add an Empty or mesh as a **Force Field**, **Force Type = Turbulence**,
-   raise **Strength** (~8) and set a **Scale** for the eddy size.
+2. Add an Empty or mesh as a **Force Field**, set **Force Type = Turbulence**,
+   raise **Strength** (~8), and set a **Scale** for the eddy size.
 3. Enable **Whitewater** for spray/foam on the crests.
 4. A little **Sheeting** (~0.5) keeps thin splash sheets from tearing into
    blobs.
 
 ---
 
-## Two-Phase Glug (bottle emptying, bubbling)
+## Two-Phase Glug (air-entraining pour demo)
 
-**Preset:** *Two-Phase Glug*. Air is simulated as a second phase, so it can
-push back up through liquid as bubbles — the "glug-glug" of a draining bottle.
+**Preset:** *Two-Phase Glug*. The shipped scene is a falling liquid stream into
+a pool. Simulated air is entrained as bubbles; it is not a bottle-discharge
+reproduction.
 
 Build it by hand:
 
-1. Domain box; a **Liquid** volume with a downward **Inflow** or a narrow neck.
+1. Domain box, a **Liquid** pool, and a downward liquid **Inflow**.
 2. Enable **Two-Phase (Gas)** in the Solver panel. This fills the empty domain
    with gas particles.
-3. Optionally mark an **Inflow** as **Emit as gas** to inject air.
+3. Enable **Whitewater** if you want visible bubble/spray secondaries.
+
+A bottle-style glug additionally needs suitable container, neck and outlet
+geometry. **Emit as gas** can inject air, but it does not create that boundary
+geometry for you.
 
 Two-Phase does **not** combine with the Sparse grid (gas fills the whole
 domain, so there is no localized active region to crop to).
@@ -71,8 +76,8 @@ Build it by hand:
 2. A **Volume Outflow** around the base to recycle the water that falls back.
 3. Enable **Whitewater** for the spray plume.
 
-The drain is what keeps a continuous source from simply filling the box — any
-long-running inflow scene needs an outflow.
+The drain keeps this continuous source from filling the box. A finite scheduled
+inflow may not need an outflow if the Domain has enough unused capacity.
 
 ---
 

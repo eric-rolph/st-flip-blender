@@ -112,11 +112,17 @@ class STFLIP_PT_object(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         obj = context.active_object
-        if obj is None or obj.type != "MESH":
-            layout.label(text="Select a mesh object")
+        if obj is None or obj.type not in {"MESH", "EMPTY"}:
+            layout.label(text="Select a mesh or Empty force guide")
             return
         layout.enabled = context.scene.stflip.bake_state != "RUNNING"
         layout.prop(obj.stflip, "role", text="Role")
+        if obj.type == "EMPTY" and obj.stflip.role not in {"NONE", "FORCE"}:
+            layout.label(
+                text="Empty objects support the Force Field role only.",
+                icon="ERROR",
+            )
+            return
         if obj.stflip.role == "LIQUID":
             settings = obj.stflip
             layout.prop(settings, "initial_velocity_mode", text="Velocity")

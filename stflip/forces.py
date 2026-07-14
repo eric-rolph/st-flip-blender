@@ -13,7 +13,7 @@ Three field types:
   - TURBULENCE: curl of a smooth animated vector potential, so the force is
     divergence-free (adds swirly detail without fighting the pressure solve).
 
-World cell-centre coordinates are ``(index + 0.5 + origin) * dx`` where
+Solver-local cell-centre coordinates are ``(index + 0.5 + origin) * dx`` where
 ``origin`` is the sparse-window cell offset (0 for the dense solve).  Array-
 module agnostic (NumPy or CuPy); randomness for turbulence is drawn once on the
 host from the force seed so runs are reproducible.
@@ -26,7 +26,7 @@ import math
 import numpy as np
 
 
-def _world_coords(xp, shape, dx, origin):
+def _solver_local_coords(xp, shape, dx, origin):
     nx, ny, nz = shape
     ax = (xp.arange(nx, dtype=xp.float32) + 0.5 + float(origin[0])) * dx
     ay = (xp.arange(ny, dtype=xp.float32) + 0.5 + float(origin[1])) * dx
@@ -58,7 +58,7 @@ def vortex_accel(xp, shape, dx, center, axis, strength, radius, origin):
     if na < 1e-12 or strength == 0.0:
         return None
     ax_ = ax_ / na
-    X, Y, Z = _world_coords(xp, shape, dx, origin)
+    X, Y, Z = _solver_local_coords(xp, shape, dx, origin)
     rx = X - float(center[0])
     ry = Y - float(center[1])
     rz = Z - float(center[2])
@@ -91,7 +91,7 @@ def turbulence_accel(xp, shape, dx, strength, scale, time, seed, origin,
     acceleration whose magnitude is ~``strength``."""
     if strength == 0.0:
         return None
-    X, Y, Z = _world_coords(xp, shape, dx, origin)
+    X, Y, Z = _solver_local_coords(xp, shape, dx, origin)
     rng = np.random.default_rng(int(seed))
     psi = [xp.zeros(tuple(shape), dtype=xp.float32) for _ in range(3)]
     base_f = 2.0 * math.pi / max(float(scale), 1e-6)

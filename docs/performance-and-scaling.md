@@ -14,10 +14,13 @@ Everything below is about making those cheaper without lowering resolution.
 
 ## GPU acceleration
 
-Install GPU support from the **ST-FLIP → GPU** panel (NVIDIA + CuPy). The same
-solver runs on the GPU array backend, typically a large speed-up at production
-resolutions where there is enough work to saturate the device. Results are
-reproducible across CPU and GPU for the same seed and inputs.
+Install GPU support from **ST-FLIP → Solver**. When CUDA compute is unavailable,
+press **Install GPU Support (CUDA)**. GPU usually helps most at production
+resolutions where there is enough work to saturate the device.
+
+A fixed seed gives CPU and CUDA the same initial particle random state. Evolved
+results should be numerically close, not bitwise-identical across backends,
+hardware, drivers or numerical-library versions.
 
 GPU memory is the ceiling on resolution/particle count — a single consumer GPU
 cannot hold a billion-particle production scene, so scale resolution to fit VRAM
@@ -30,7 +33,8 @@ iteration count grows with resolution; the geometric multigrid V-cycle keeps it
 nearly flat (e.g. on a constant-coefficient 64³ Poisson, ~160 Jacobi iterations
 vs. ~8 with multigrid). On grids too small to coarsen it falls back to Jacobi
 automatically, so it is safe to leave enabled. It changes only convergence
-speed, never the solution.
+speed while solving the same discretized PPE to tolerance. Reduction order and
+iteration paths can still produce small roundoff-level differences.
 
 This holds for **two-phase** bakes too, even though the variable-density
 pressure system is severely ill-conditioned at the water/air density ratio
@@ -39,6 +43,17 @@ per solve while multigrid needs ~20, and the multigrid count stays
 grid-independent up to 800:1 and 10000:1 ratios — so multigrid is the
 recommended solver precisely when two-phase meets production resolution.
 
+## Automatic pressure crops
+
+Both pressure solvers use one or more tight active boxes when the projected
+reduction is worthwhile; otherwise they solve the full grid.
+
+Regions separated by complete empty lattice planes can use independent boxes
+even when the **Sparse Grid** toggle is off.
+
+This helps localized pours with drains or cut-cell obstacles. It is still dense
+inside each box, and a thin full-span sheet may see little benefit.
+
 ## The sparse grid
 
 Enable **Sparse Grid** when the fluid occupies a small fraction of a large
@@ -46,6 +61,8 @@ Domain (a splash in a big room, a stream across a wide floor). The solver crops
 each step to the active region plus a halo, cutting both time and memory. It
 disengages when it cannot safely help (outflows, cut-cell obstacles, or
 Two-Phase filling the domain).
+
+This is a dense active-window optimization, not fully tiled sparse storage.
 
 ## Resolution strategy
 
@@ -75,9 +92,9 @@ You do not have to tie up your workstation for a long bake or render:
 Because the cache is plain files, you can bake remotely and render locally, or
 vice-versa. Cost and wall-clock depend entirely on the instance and the scene;
 budget by baking a short frame range first to measure per-frame time, then
-extrapolate. Exact solver checkpoints are uncompressed and can be large at high
-particle counts — provision disk accordingly, or keep only the compressed
-playback frames if you do not need to resume.
+extrapolate. Primary-solver checkpoints are uncompressed and can be large at
+high particle counts. Provision disk accordingly, or keep only compressed
+playback frames if you do not need Resume.
 
 ## Quick checklist for a slow bake
 
