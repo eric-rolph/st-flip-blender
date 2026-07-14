@@ -17,7 +17,12 @@ import numpy as np
 
 
 METRICS_SCHEMA = "stflip.frame_metrics"
-SCHEMA_VERSION = 2
+# Version 3 (roadmap ENER-M0, the single deliberate frame-record bump):
+# adds the angular-momentum estimates and optional phase-weighted masses.
+# ``cache.read_metrics`` silently drops rows whose version differs, so
+# resumed pre-existing bakes lose their historical metric rows after this
+# upgrade -- an accepted, versioned decision (roadmap Decision 2).
+SCHEMA_VERSION = 3
 
 # This order is both the strict JSONL schema and the stable CSV column order.
 FRAME_FIELD_ORDER = (
@@ -51,6 +56,9 @@ FRAME_FIELD_ORDER = (
     "momentum_x_estimate",
     "momentum_y_estimate",
     "momentum_z_estimate",
+    "angular_momentum_x_estimate",
+    "angular_momentum_y_estimate",
+    "angular_momentum_z_estimate",
     "center_of_mass_local_x_solver_units",
     "center_of_mass_local_y_solver_units",
     "center_of_mass_local_z_solver_units",
@@ -211,12 +219,21 @@ def measure_frame(
     stats,
     positions_local: np.ndarray,
     velocities: np.ndarray,
+    phases: np.ndarray | None = None,
     compute_wall_s: float | None = None,
     mac_grids: Mapping[str, Any] | None = None,
     phase_threshold: float = 0.5,
     array_module=None,
 ) -> dict[str, Any]:
-    """Build one strict schema-v2 record from a cached particle snapshot."""
+    """Build one strict schema-v3 record from a cached particle snapshot.
+
+    Positions are expected to be the render-resynchronized snapshot
+    (``get_render_particles``), not raw jittered positions: temporal jitter
+    noise grows with CFL and would otherwise contaminate exactly the
+    energy/angular-momentum decay curves this schema exists to gate.  The
+    angular momentum is taken about the (mass-weighted, when ``phases`` is
+    given) particle centre so a drifting bulk does not read as spin.
+    """
     if isinstance(frame, bool) or not isinstance(frame, (int, np.integer)):
         raise TypeError("frame must be an integer")
     simulation_time = _finite_float(simulation_time_s, "simulation_time_s")
@@ -293,23 +310,63 @@ def measure_frame(
         pcg_residual_max = None
 
     count = int(positions.shape[0])
+    particle_volume = dx**3 / ppc
+    particle_mass = rho * particle_volume
+    # Optional per-particle phase tags (liquid > 0.5) make the mass-weighted
+    # estimates below correct for two-phase snapshots; without them every
+    # particle carries the uniform liquid mass, exactly as in schema v2.
+    masses = None
+    if phases is not None:
+        phase_values = np.asarray(phases)
+        if phase_values.shape != (count,):
+            raise ValueError("phases must have shape (N,)")
+        if not np.issubdtype(phase_values.dtype, np.number):
+            raise TypeError("phases must be numeric")
+        if count and not np.all(np.isfinite(phase_values)):
+            raise ValueError("phases must contain only finite values")
+        rho_gas = _finite_float(getattr(params, "rho_gas", 0.0), "params.rho_gas")
+        if rho_gas < 0.0:
+            raise ValueError("params.rho_gas must not be negative")
+        masses = particle_volume * np.where(
+            phase_values.astype(np.float64) > 0.5, rho, rho_gas)
     if count:
         speed_sq = np.einsum(
             "ij,ij->i", velocity, velocity, dtype=np.float64
         )
         speed_max = math.sqrt(float(speed_sq.max()))
         speed_rms = math.sqrt(float(speed_sq.mean(dtype=np.float64)))
-        velocity_sum = velocity.sum(axis=0, dtype=np.float64)
-        centre = positions.mean(axis=0, dtype=np.float64)
         speed_sq_sum = float(speed_sq.sum(dtype=np.float64))
+        if masses is None:
+            total_mass = count * particle_mass
+            momentum = particle_mass * velocity.sum(axis=0, dtype=np.float64)
+            kinetic_energy = 0.5 * particle_mass * speed_sq_sum
+            centre = positions.mean(axis=0, dtype=np.float64)
+        else:
+            total_mass = float(masses.sum(dtype=np.float64))
+            momentum = (masses[:, None] * velocity).sum(
+                axis=0, dtype=np.float64)
+            kinetic_energy = 0.5 * float(
+                (masses * speed_sq).sum(dtype=np.float64))
+            if total_mass > 0.0:
+                centre = (masses[:, None] * positions).sum(
+                    axis=0, dtype=np.float64) / total_mass
+            else:
+                centre = positions.mean(axis=0, dtype=np.float64)
+        relative = positions.astype(np.float64) - centre
+        weighted_velocity = (
+            particle_mass * velocity.astype(np.float64)
+            if masses is None
+            else masses[:, None] * velocity.astype(np.float64)
+        )
+        angular_momentum = np.cross(relative, weighted_velocity).sum(
+            axis=0, dtype=np.float64)
     else:
         speed_max = speed_rms = speed_sq_sum = 0.0
-        velocity_sum = np.zeros(3, dtype=np.float64)
+        total_mass = 0.0
+        kinetic_energy = 0.0
+        momentum = np.zeros(3, dtype=np.float64)
+        angular_momentum = np.zeros(3, dtype=np.float64)
         centre = (None, None, None)
-
-    particle_volume = dx**3 / ppc
-    particle_mass = rho * particle_volume
-    momentum = particle_mass * velocity_sum
     removed_counts = {
         name: int(getattr(stats, name, 0) if stats is not None else 0)
         for name in (
@@ -349,11 +406,14 @@ def measure_frame(
         "speed_max_solver_units_per_s": speed_max,
         "speed_rms_solver_units_per_s": speed_rms,
         "particle_volume_estimate_solver_units3": count * particle_volume,
-        "total_particle_mass_estimate": count * particle_mass,
-        "kinetic_energy_particle_estimate": 0.5 * particle_mass * speed_sq_sum,
+        "total_particle_mass_estimate": total_mass,
+        "kinetic_energy_particle_estimate": kinetic_energy,
         "momentum_x_estimate": float(momentum[0]),
         "momentum_y_estimate": float(momentum[1]),
         "momentum_z_estimate": float(momentum[2]),
+        "angular_momentum_x_estimate": float(angular_momentum[0]),
+        "angular_momentum_y_estimate": float(angular_momentum[1]),
+        "angular_momentum_z_estimate": float(angular_momentum[2]),
         "center_of_mass_local_x_solver_units": (
             None if centre[0] is None else float(centre[0])
         ),
