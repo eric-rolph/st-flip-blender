@@ -11,8 +11,8 @@ full settings table); the pages here walk you through *doing* things.
 2. **[Object roles](object-roles.md)** — how the Domain, Liquid, Inflow,
    Outflow, Obstacle, and Force roles fit together to define a scene.
 3. **[Recipes](recipes.md)** — the one-click Presets explained, plus
-   step-by-step builds for pours, fountains, glugs, viscous fluids, and
-   whirlpools.
+   step-by-step builds for pours, fountains, air entrainment, viscous fluids,
+   and whirlpools.
 
 ## Go deeper
 
@@ -30,15 +30,17 @@ full settings table); the pages here walk you through *doing* things.
 ## Design notes
 
 - **[Tiled sparse grid](design/tiled-sparse-grid.md)** — the architecture for
-  true (billion-cell) sparsity, and the shipped bounding-box crop that is its
-  safe first increment.
+  true tiled sparsity, plus the shipped active-box and axis-separable-region
+  pressure crops that are its safe first increments.
 
 ## One-paragraph mental model
 
 ST-FLIP is a FLIP fluid solver built to take **large time steps** (high CFL).
-You mark a box as the **Domain**, mark meshes with **roles**, pick a
+You mark a box as the **Domain**, assign scene objects their **roles**, pick a
 **Resolution** and **Target CFL**, and **Bake**. Each baked frame writes both a
-compressed playback frame and an exact solver checkpoint to the **Cache
-Directory**, so a bake can be cancelled and resumed. Playback is driven by a
-frame-change handler; rendering uses either a fast Geometry-Nodes preview
-surface or the paper's mean-curvature-flow reconstruction.
+compressed playback frame and a primary-solver checkpoint to the **Cache
+Directory**. Resume requires the same add-on version and matching simulation
+inputs; whitewater state is not checkpointed.
+
+Playback is driven by a frame-change handler. Rendering uses either a fast
+Geometry-Nodes preview or the paper's mean-curvature-flow reconstruction.

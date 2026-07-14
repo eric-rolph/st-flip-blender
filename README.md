@@ -43,9 +43,13 @@ The paper reports benchmark-dependent **2×–8×** wall-clock improvements at
 high effective resolutions and target CFL values through 30. Its often-quoted
 `≈ O(n⁴)` observation is a resolution-scaling argument for 3D CFL-conforming
 simulations—`n³` cells plus about `n` times as many steps—not a universal
-complexity guarantee. The authors' sparse/adaptive CPU implementation and
-multi-billion-particle scenes also do not directly predict this add-on's
-dense-grid CPU or CUDA performance.
+complexity guarantee.
+
+The authors' sparse/adaptive CPU implementation and multi-billion-particle
+scenes also do not directly predict this add-on's CPU or CUDA performance.
+
+This solver remains dense inside an optional active window. It does not yet
+have fully tiled sparse storage.
 
 The algorithm is lightweight, not free: the paper adds one particle-time
 attribute and changes advection/P2G/interface handling, while avoiding extra
@@ -89,31 +93,38 @@ Python/NumPy/backend environment, not bitwise-determinism claims across
 hardware or numerical-library versions.
 
 The checked [three-seed CPU evidence artifact](https://github.com/eric-rolph/st-flip-blender/blob/main/validation/stflip_matched_cpu.json)
-was regenerated from its embedded source hashes. Every run reached observed
-particle CFL above 10.6. Mean Eq. 13 phase RMSE was `0.07880` for ST-FLIP
-versus `0.08574` for the instantaneous ablation (ratio `0.9191`, ST better in
-3/3 seeds); mean threshold-interface IoU was `0.92829` versus `0.92175` (ST
-better in 3/3). Raw deposited-mass RMSE was `0.23379` versus `0.23034` (ratio
-`1.0150`, ST better in only 1/3), so the artifact reports that diagnostic as
-inconclusive rather than disguising Monte Carlo noise as a successful paper
-reproduction.
+was regenerated for v0.23.1 from clean implementation commit `84837bc`. Its
+embedded solver-source hashes match the release implementation. Every run
+reached observed particle CFL above 10.6. Mean Eq. 13 phase RMSE was `0.07880`
+for ST-FLIP versus `0.08574` for the instantaneous ablation (ratio `0.9191`,
+ST better in 3/3 seeds).
+
+Mean threshold-interface IoU was `0.92829` versus `0.92175` (ST better in 3/3).
+Raw deposited-mass RMSE was `0.23379` versus `0.23034` (ratio `1.0150`, ST
+better in only 1/3), so that diagnostic remains inconclusive.
 
 ## Install
 
+The current source and packaged release identify as v0.23.1.
+
 1. Download `st_flip-<version>.zip` from the
    [latest release](https://github.com/eric-rolph/st-flip-blender/releases/latest),
-   or build the same deterministic extension archive from a clone:
+   or clone the repository and build the same deterministic extension archive:
 
    ```bash
    python tools/build_extension.py
    ```
 
-   The archive is written to `dist/st_flip-<version>.zip`. Do not install a
-   GitHub source ZIP directly: its extra top-level folder and development files
-   are not a valid Blender extension package layout.
+   The archive is written to `dist/st_flip-<version>.zip`.
+
+   Do not install a GitHub source ZIP directly. Its extra top-level folder and
+   development files are not a valid Blender extension package layout.
 2. Blender → *Edit → Preferences → Get Extensions → Install from Disk…* and
    pick the ZIP.
 3. Enable **ST-FLIP Fluid**. Requires Blender **4.2+** (tested on 5.1).
+
+Finish resumable bakes before updating the extension. Blender Resume requires
+the same add-on version that created the checkpoint.
 
 ### GPU acceleration (optional, recommended)
 
@@ -138,12 +149,14 @@ custom build. A vendor-neutral wgpu backend is on the roadmap.
 2. *3D Viewport → Sidebar (N) → ST-FLIP* and choose **Dam Break**,
    **Whirlpool Preview**, or the approximate **High-CFL Jet Preview**;
    open the **Presets** sub-panel for one-click feature demos
-   (**Viscous Pour**, **Stormy Pool**, **Two-Phase Glug**, **Fountain**),
+   (**Viscous Pour**, **Stormy Pool**, **Two-Phase Glug** air-entrainment demo,
+   **Fountain**),
    each of which builds a ready-to-bake scene and configures the relevant
    solver features; **or** build a scene by hand:
    - Create a box, set it as the **Domain** (defines the grid).
    - Select any closed mesh and set its role to **Liquid**, **Inflow**
      (with a velocity), **Outflow**, or **Obstacle**.
+   - Use a mesh or Empty as a **Force Field** guide; it is not voxelized.
 3. Pick **Resolution** (cells along the longest domain axis) and
    **Target CFL** (8 is a good start; higher values may reduce global solves
    when the frame interval does not cap the step, while lower values generally
@@ -153,12 +166,20 @@ custom build. A vendor-neutral wgpu backend is on the roadmap.
    failed, or completed long bake, extend the scene's End frame and press
    **Resume**.
 
-Every committed frame has both a compressed playback frame and an atomic raw
-solver checkpoint. Resume re-voxelizes the scene and refuses to continue if
-trajectory-defining inputs, geometry, outlet modes, or the compute backend no
-longer match the checkpoint. Existing output and metric history are preserved.
-Raw checkpoints trade disk space for exact restart state, so plan cache storage
-accordingly for high particle counts and long frame ranges.
+Every committed frame has a compressed playback frame and an atomic primary-
+solver checkpoint. Resume requires a scene-owned cache, the same add-on
+version, checkpoint schema v2, the same backend and a matching simulation
+fingerprint.
+
+Scene End must be later than the latest committed frame.
+
+Output-only surface and material controls may change; changed Paper MCF
+settings require a surface-cache rebuild. Existing output and metric history
+are preserved.
+
+Whitewater secondary state is not checkpointed and restarts after Resume.
+Animated obstacle motion is re-sampled and may differ slightly from an
+uninterrupted bake. Raw checkpoints can be much larger than playback frames.
 
 Save the `.blend` before using the default relative cache. An unsaved file has
 no stable base directory, so Bake/Resume asks you to save first; an explicitly
@@ -197,7 +218,7 @@ configuration hash, frame number, and its own mesh hash.
 
 Surface reconstruction is not part of the authoritative solver transaction. A
 runtime OpenVDB, allocation, or derived-cache failure is recorded as a failed
-Paper cache while particle frames and exact resume checkpoints continue to
+Paper cache while particle frames and primary-solver checkpoints continue to
 commit. Resume follows the current Surface Method; it never revives an old
 Paper configuration after the user switches to Fast Preview or disables
 surfacing. A missing, failed, changed, or memory-unsafe Paper configuration is
@@ -228,16 +249,15 @@ by the paper's published dimensions and `0.1 rad/s` initial rotation.
 
 | Workflow | Practical support | Boundary |
 |---|---|---|
-| Cropped environment puddles and standing water | GPU/CPU bakes, static cut-cell obstacles, resumable caches, high global CFL, and Blender surfacing | Uniform dense grid and Python scene voxelization make full landscapes impractical; build a shot-sized interaction domain |
-| Rain, leaks, and jets | Static inflow volumes support uniform or solid-body velocity plus an optional inclusive evolved-output frame range; the High-CFL Jet Preview demonstrates a high-speed static collision | Refill is occupancy based, not a physical flow-rate or pressure/head boundary; no droplet distribution, viscosity, wetting, surface tension, or air coupling |
-| Vortex and sci-fi prop look development | Solid-body rotation can initialize liquid or drive a rotating inflow; the whirlpool setup reproduces the published rotation field and dimensions at preview scale | No torque model or rotating propeller boundary; this is a visual-effects flow field, not engineering validation |
-| Moving tire or mechanism interaction | A stationary proxy can be a fractional-aperture obstacle | Animated/deforming obstacles and moving-wall velocity are not implemented; a moving tire splash is therefore not a supported claim |
+| Cropped environment puddles and standing water | GPU/CPU bakes, cut-cell obstacles, resumable primary-fluid caches, high global CFL, and Blender surfacing | Dense storage inside the active window and Python scene voxelization make full landscapes impractical; build a shot-sized interaction domain |
+| Rain, leaks, and jets | Scheduled inflows support uniform or solid-body velocity; viscosity, CSF surface tension, and two-phase air are optional | Refill is occupancy based, not a prescribed flow-rate or pressure/head boundary; droplet distributions and wetting are not modeled |
+| Vortex and sci-fi prop look development | Initial rotation, force fields, and prescribed Animated Moving Wall obstacles can drive vortices, rotors, and mixers | No torque or two-way rigid-body/FSI solve; solid motion is authored, not solved from fluid forces |
+| Moving tire or mechanism interaction | Animated obstacles support rigid transforms and stable-topology deformation sampled at output frames | Combined transform-plus-deformation uses the rigid-velocity path; topology-changing deformation has no deformation velocity; Resume re-samples motion |
 | AI/procedural detail enhancement | A portable playback handoff exports committed world-space particle positions, velocities, settings, units, timing, hashes, and optional metrics | No stable particle IDs, foam/spray labels, training pairs, inference model, or generated microdetail; temporal AI consistency remains a downstream responsibility |
 
-This distinction is intentional. Re-voxelizing a moving tire without imposing
-its boundary velocity in collision response and pressure projection would be
-nonphysical, so the add-on does not present static-obstacle support as moving
-solid support.
+Moving walls are prescribed kinematic boundaries, not two-way rigid-body/FSI.
+They are sampled once per output frame; raise scene FPS when fast mechanisms
+need finer boundary-motion sampling.
 
 ### Solver settings
 
@@ -253,13 +273,13 @@ solid support.
 | FLIP Fraction | §4 | FLIP/PIC blend (default 0.98); FLIP transfer only |
 | Two-Phase (Gas) + Gas Density | §3.1, 3.6 | Couple a light gas so air drives splashes and rising bubbles (glugging) |
 | Surface Tension (σ) | §3.9 | CSF surface tension; small-scale, needs high resolution |
-| Sparse Grid | — | Crop the solver to the active fluid region each step |
+| Sparse Grid | — | Use a block-aligned dense active-window crop for localized flows; this is not tiled sparse storage |
 | Whitewater | §4.9 | Foam/spray/bubble secondaries; with Two-Phase, spray and bubbles ride the simulated air field |
-| Random Seed | §3.10 | Reproducible particle placement and temporal jitter; seed 0 is an add-on default, not a published paper value |
+| Random Seed | §3.10 | Reproducible particle placement, temporal jitter, and force randomness; seed 0 is an add-on default, not a published paper value |
 | Initial / Inflow Velocity | §4.8 | Liquid and inflow sources can use uniform or solid-body rotational fields; inflows can be limited to an inclusive scene-frame range |
 | Outflow Mode | §4.8 | Interior particle-removal volume or exterior half-cell `p=0` pressure outlet |
 | Advanced Solver | §3.3, §3.7 | Liquid density, local advection CFL, PCG tolerance/limit, and relative density floor |
-| Pressure Solver | §3.6–3.7 | PPE preconditioner: Jacobi-PCG (default) or a geometric multigrid V-cycle whose iteration count is nearly resolution-independent; multigrid falls back to Jacobi on grids too small to coarsen |
+| Pressure Solver | §3.6–3.7 | Jacobi-PCG (default) or geometric multigrid; both use one or more tight active boxes when the projected reduction is worthwhile, including splits at empty lattice planes; multigrid falls back to Jacobi on grids too small to coarsen |
 | Materials & Look | — | One-click fluid materials (water, clear, honey, juice, milk, lava) plus a Studio Look setup (EEVEE Next raytracing + sky world + sun) so a bake renders with real refraction immediately |
 | Paper MCF Surface | Appendix B | Fixed radius/voxel `0.5Δx`, Gaussian `σ=2Δx`, feature mask `θ=2, ζ=5`, and `0.5` isovalue; `kψ` defaults to 30 |
 
@@ -343,11 +363,11 @@ detail generator.
 
 ### Paper coverage
 
-Version 0.9 extends the free-surface ST-FLIP core with **two-phase gas
-coupling, APIC/PIC transfers, CSF surface tension, animated moving-wall
-boundaries, and a sparse active-block production grid** (see the table below);
-it is still not a full reproduction of every production example in the paper
-(billion-particle scale, exact scene geometry, GFM baselines).
+The current v0.23 series extends the free-surface ST-FLIP core with **two-phase
+gas coupling, APIC/PIC transfers, CSF surface tension, animated and deforming
+moving-wall boundaries, and a dense active-window crop**.
+
+It is still not a full reproduction of the paper's production examples.
 
 | Paper capability | Status in this add-on |
 |---|---|
@@ -357,12 +377,12 @@ it is still not a full reproduction of every production example in the paper
 | Single-phase liquid scenes with static mesh obstacles, inflows, and outflows | Implemented; inflows support uniform/rotational fields and active frame ranges; outflows support volume sinks and exterior atmospheric-pressure faces |
 | Fractional solid face apertures in Eq. 14–17 | Implemented; a moving-wall solid-velocity flux term `div((1-alpha) u_solid)` couples animated obstacles into the same projection |
 | Paper render reconstruction (`0.5Δx` spheres, 2× grid, feature mask, MCF, `0.5` iso) | Implemented as an opt-in, versioned derived mesh cache; the paper does not prescribe the subvoxel rasterizer, so this implementation records its linear one-voxel coverage ramp explicitly |
-| Two-phase liquid/gas coupling | Implemented (v0.9): liquid volume-fraction phase field `m_l/(m_l+m_g)`, variable-density projection over both phases, gas seeding (`fill_gas`/`add_gas_mask`) |
+| Two-phase liquid/gas coupling | Implemented (v0.9): deposited liquid-volume-fraction phase field, variable-density projection over both phases, gas seeding (`fill_gas`/`add_gas_mask`) |
 | APIC / PIC transfers | Implemented (v0.9): per-particle affine matrix with the same temporal weighting, MAC-grid `B·D⁻¹` reconstruction; implicit-density-projection comparison solver still not implemented |
 | Surface tension (CSF) | Implemented (v0.9): curvature from a cubic-B-spline-smoothed phase field, `σ·κ·∇φ` face acceleration |
-| Sparse/adaptive grids | Implemented (v0.9) as a block-aligned active-window crop (bitwise-identical to dense); billion-particle production scale still out of reach on a single workstation |
+| Sparse/adaptive grids | Partial: a block-aligned dense active-window crop matches the full-domain path for supported scenes, but fully tiled sparse storage and billion-particle scale are not implemented |
 | Appendix B mean-curvature-flow output reconstruction | Implemented with default `kψ=30`; OpenVDB extracts the render mesh and Fast Preview remains a separate approximation |
-| Animated/deforming obstacle boundary conditions | Implemented (v0.9) for rigid moving walls: per-object "Animated (Moving Wall)" toggle re-voxelizes each output frame with a differenced rigid velocity (`set_solid_sdf(..., solid_vel=...)`); walls push and separate from fluid without tunneling. Deforming solids remain unsupported |
+| Animated/deforming obstacle boundary conditions | Implemented for rigid transforms and stable-topology deformation: unchanged-transform deformation uses nearest evaluated-vertex displacement; combined transform/deformation uses rigid velocity, and topology changes are unsupported for deformation velocity |
 
 Experiment-level coverage is narrower than method-level coverage:
 
@@ -374,9 +394,9 @@ Experiment-level coverage is narrower than method-level coverage:
 | Kleefsman obstacle validation | Missing water-height gauges and experimental-data comparison |
 | MCF reconstruction study | MCF is implemented; the paper's reference surfaces and normal-RMSE evaluation dataset are unavailable |
 | Whirlpool, rotational fields, and outflow scenes | Partial: published rotation and pipe/domain dimensions are available in an approximate preview with a pressure outlet; exact fill height, timing, production scale, and rendering remain unpublished/unreproduced |
-| Two-phase glugging/discharge and production-scale scenes | Missing two-phase solver and sparse production grid |
+| Two-phase glugging/discharge and production-scale scenes | Partial: two-phase coupling and an air-entraining pour demo are implemented; exact discharge scenes/data and fully tiled production-scale sparsity are not reproduced |
 
-The Blender UI exposes these inputs for the implemented single-phase solver:
+The Blender UI exposes these inputs for the implemented solver:
 resolution, target CFL, particles/cell, `γ`, adaptive attenuation, `η`,
 FLIP/PIC blend, seed, backend, gravity, frame rate/range, per-source uniform
 or solid-body velocity (linear velocity, world center/axis, and signed angular
@@ -395,9 +415,9 @@ uses `ρ = 1000` and a 400-iteration PCG limit. Paper MCF defaults to `kψ=30`.
 The Solver panel additionally exposes the velocity transfer scheme
 (FLIP/APIC/PIC), two-phase gas coupling with gas density and gas particles/cell,
 the surface-tension coefficient, and the sparse-grid toggle; inflows gain an
-"Emit Gas" option in two-phase mode, and obstacles an "Animated (Moving Wall)"
-toggle that re-voxelizes them per output frame with a differenced rigid
-velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
+"Emit Gas" option in two-phase mode. Obstacles gain an "Animated (Moving Wall)"
+toggle for rigid motion and stable-topology deformation, also scriptable via
+`set_solid_sdf(..., solid_vel=...)`.
 
 ## What's implemented
 
@@ -407,6 +427,8 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
 - Variational variable-coefficient pressure projection, matrix-free
   Jacobi-PCG (Eq. 14–17), including node-SDF-derived fractional solid face
   apertures, `div(alpha * u)`, and aperture-weighted PPE coefficients
+- Gain-gated pressure-system crops: one or more tight active boxes when the
+  projected reduction is worthwhile, including splits at empty lattice planes
 - Temporal jitter with residual carryover and the Appendix A boundedness
   guarantee (tested), adaptive γ attenuation
 - Globally adaptive time stepping with even frame subdivision and strict
@@ -434,7 +456,8 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
 - **Surface tension** (v0.9, §3.9): CSF from a B-spline-smoothed phase field
 - **Animated moving-wall obstacles** (v0.9): per-cell solid velocity enters the
   projection as a `(1-alpha) u_solid` flux; near-wall particles shed only the
-  penetrating normal velocity, so walls push yet fluid still separates
+  penetrating normal velocity, so walls push yet fluid still separates.
+  Stable-topology deformation is supported when the object transform is fixed
 - **Whitewater** (v0.10): foam/spray/bubble secondary particles emitted from
   energetic interface regions; with Two-Phase on, spray and bubbles are driven
   by the simulated air velocity field -- the paper's stated purpose for
@@ -443,9 +466,9 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
 - **Vectorized voxelization** (v0.10): masks via NumPy ray-parity and obstacle
   SDFs exact in a narrow surface band (256³ masks in seconds instead of
   minutes); the BVH loop remains as an automatic fallback
-- **Sparse production grid** (v0.9): every step crops to a block-aligned active
-  window (fluid + extrapolation band), bitwise-identical to the dense solve;
-  disengages when outflows or cut-cell node-SDF solids are present
+- **Dense active-window crop** (v0.9): every step can crop to a block-aligned
+  window around fluid plus its extrapolation band; it disengages for outflows
+  or cut-cell node-SDF solids and is not tiled sparse storage
 - **Shading attributes** on the particle point cloud: `velocity`, `speed`,
   `age` (seconds since seeding), and `source` (per-source id) for age-fade,
   speed-driven effects, and per-source colouring in shaders/Geometry Nodes
@@ -457,9 +480,9 @@ velocity (also scriptable via `set_solid_sdf(..., solid_vel=...)`).
   per-particle velocity onto the topology-changing surface (Geometry Nodes)
   so the surface and point clouds motion-blur; surface deformation blur
   needs Cycles
-- **Force fields / guides** (v0.16): a `Force Field` object role adds
-  directional (wind), vortex, or divergence-free curl-noise turbulence body
-  forces for art-directable flow (object +Z = axis, origin = centre)
+- **Force fields / guides** (introduced v0.16; Empty guides in v0.23.1): a mesh
+  or Empty role adds directional, vortex, or curl-noise turbulence body forces.
+  Directional uses +Z, vortex uses origin/+Z, and turbulence is domain-wide
 - **Particle sheeting / anti-clumping** (v0.17): a position-only nudge that
   spreads genuinely over-dense clumps (density-gated so it never inflates
   the free surface) to keep thin splashes and sheets intact; adds no energy
@@ -475,28 +498,41 @@ Not (yet) implemented from the paper: the standard-FLIP/GFM and
 implicit-density-projection comparison baselines, and billion-particle
 production-scale scenes.
 
-Known limitations: two-phase and the sparse grid do not combine usefully (gas
-fills the domain, so the active window is the whole grid), and the sparse
-window also disengages when outflows or cut-cell node-SDF obstacles are present.
-The disk resume checkpoint (schema v2) persists the gas tag, APIC affine matrix,
-and shading attributes, so a resumed two-phase/APIC bake continues without a
-discontinuity; older v1 checkpoints still load and fall back to single-phase
-liquid with a fresh affine field. Obstacles marked
-"Animated (Moving Wall)" are re-voxelized every output frame with a differenced
-rigid velocity (slower; resume re-samples their motion from the current frame);
-source/outlet and static-obstacle geometry is still voxelized once at the
-first frame. Scene voxelization (mesh → grid masks/SDF) is vectorized in NumPy:
-ray-parity inside tests and the banded signed-distance field both walk a
-Morton (Z-order) curve so their per-chunk triangle bounding-box prefilters prune
-to nearby triangles (a ray or band cell only ever meets a handful), with the
-Blender BVH loop kept only as an automatic fallback; the residual per-frame cost
-for animated obstacles is the band point-to-triangle distance. Temporal jitter
-randoms are drawn on the host for cross-backend
-determinism, costing a small per-step transfer on GPU. Exact resume checkpoints
-are intentionally uncompressed and can be substantially larger than playback
-frames. Paper surfacing uses a dense cropped grid with `O(kψ V)` work and can
-also be memory-heavy; it is output-only, guarded by a field-size cap plus a
-conservative preflight, and does not change the solver trajectory.
+Known limitations: two-phase and the Sparse Grid toggle do not combine
+usefully because gas fills the domain. The active window also disengages for
+outflows or cut-cell node-SDF obstacles.
+
+Checkpoint schema v2 persists primary-fluid phase tags, APIC affine state and
+shading attributes. Blender Resume accepts only schema v2 from the same add-on
+version; the core cache reader's v1 fallback is not Blender-resume compatible.
+
+Whitewater positions, lifetimes and RNG state are not checkpointed. Whitewater
+therefore restarts after Resume even though primary two-phase/APIC state resumes
+continuously.
+
+Animated obstacles are re-voxelized every output frame. Rigid motion uses
+transform differencing; unchanged-transform, stable-topology deformation uses
+nearest evaluated-vertex displacement.
+
+Combined rigid and deforming velocity uses the rigid path, while topology
+changes have no deformation velocity. Resume re-samples animated motion from
+the current frame and may differ slightly from an uninterrupted bake.
+
+Source, outlet and static-obstacle geometry is voxelized once at the first
+frame. Vectorized ray-parity and banded SDF passes use Morton-ordered triangle
+prefilters, with Blender BVH as a fallback.
+
+Temporal-jitter randoms are drawn on the host, so seeded initial random state
+matches across CPU and CUDA. Evolved results are numerically close, not
+guaranteed bitwise-identical across backends.
+
+Playback and Paper-surface positions use float32 world coordinates. Very large
+world offsets can erase subcell detail, so keep high-resolution domains near
+the world origin.
+
+Primary-solver checkpoints are uncompressed and can be much larger than
+playback frames. Paper surfacing uses a dense cropped grid with `O(kψ V)` work;
+it is output-only and guarded by a field-size cap and memory preflight.
 
 ### Headless / scripted baking
 
@@ -514,8 +550,9 @@ partial records are ignored and exports include only frames with valid cache
 files.
 
 `bpy.ops.stflip.resume_bake()` is also synchronous in an EXEC context. It
-requires an owned v0.8 checkpoint, unchanged simulation inputs, and a scene End
-frame later than the latest committed frame.
+requires a scene-owned schema-v2 checkpoint from the same add-on version,
+unchanged simulation inputs and backend, and Scene End later than the latest
+committed frame.
 
 ## Development
 

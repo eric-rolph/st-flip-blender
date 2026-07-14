@@ -67,7 +67,13 @@ don't expect droplets to bead on a coarse grid.
   to leave on. Turn it on when your grid is large (roughly ≥ 64³) and the
   pressure solve dominates the step time.
 
-It changes only *how fast* the projection converges, never the result.
+Both choices solve the same discretized PPE to the configured tolerance.
+Different reduction order and iteration paths can produce small roundoff-level
+differences, which may eventually separate chaotic trajectories.
+
+Both use one or more tight active boxes when the projected reduction is
+worthwhile; otherwise they solve the full grid. Empty lattice planes may split
+independent boxes. This is separate from the **Sparse Grid** toggle.
 
 ## Faster localized flows — Sparse Grid
 
@@ -76,10 +82,13 @@ speed/memory win when the fluid occupies a small part of a large domain (a
 splash in a big room). It disengages automatically when it cannot help (outflows
 or cut-cell solids present, or Two-Phase filling the domain).
 
+This remains dense storage inside the active window, not a tiled sparse grid.
+
 ## Reproducibility — Random Seed
 
-**Random Seed** fixes particle placement and temporal jitter. The same seed and
-inputs reproduce a bake exactly (CPU and GPU included).
+**Random Seed** fixes particle placement, temporal jitter and force randomness.
+With the same backend and software environment, it supports comparable reruns.
+CPU and CUDA evolved results are close, not guaranteed bitwise-identical.
 
 ## A sensible starting point
 

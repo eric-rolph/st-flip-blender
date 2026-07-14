@@ -7,11 +7,17 @@ The default cache path is blend-relative, which needs a saved `.blend`. Either
 save the file, or set an absolute **Cache Directory** and bake without saving.
 
 **Resume refuses to continue ("inputs changed").**
-Resume compares the current scene against the checkpoint's fingerprint and
-refuses if a trajectory-defining input changed — Domain size, Resolution, scene
-FPS, outlet modes, geometry, or the compute backend (CPU↔GPU). To extend a
-bake, change *only* the scene End frame, then Resume. To change anything else,
-**Free** the cache and bake fresh.
+Resume requires a scene-owned schema-v2 checkpoint from the same add-on version,
+the same backend, a matching simulation fingerprint, and Scene End later than
+the last committed frame.
+
+Among simulation inputs, change only Scene End. Output-only surface, material
+and display controls may change; changed Paper MCF settings require a surface-
+cache rebuild. Otherwise **Free** the cache and bake fresh.
+
+Animated obstacle motion is re-sampled after Resume and may differ slightly.
+Whitewater state is not checkpointed, so whitewater restarts even though the
+primary fluid resumes from its committed state.
 
 **A source covers no cells / nothing emits.**
 The object must be a **closed mesh** that actually overlaps Domain cells at the
@@ -59,16 +65,17 @@ look-dev, install the **GPU**, enable **Multigrid-PCG** on large grids, enable
 **Sparse Grid** for localized flows, and raise **CFL**.
 
 **GPU not detected.**
-Reinstall from the **ST-FLIP → GPU** panel. The runtime needs a compatible
-NVIDIA GPU and driver; if detection still fails, the solver keeps running on
-CPU. (On some setups the CuPy runtime path must be short — the installer places
-it accordingly.)
+Open **ST-FLIP → Solver** and press **Install GPU Support (CUDA)** when CUDA is
+unavailable. A compatible NVIDIA GPU and driver are required; otherwise the
+solver keeps running on CPU.
+
+On some setups the CuPy runtime path must be short. The installer places it in
+a shallow per-user directory automatically.
 
 **Cache is enormous.**
-Exact solver checkpoints are uncompressed so a bake can resume exactly; they
-dominate cache size at high particle counts. If you do not need to resume, you
-can rely on the compressed playback frames. Plan disk for long, high-resolution
-bakes.
+Primary-solver checkpoints are uncompressed and dominate cache size at high
+particle counts. If you do not need Resume, compressed playback frames are
+enough for playback and re-surfacing. Plan disk for long, high-resolution bakes.
 
 ## Still stuck?
 

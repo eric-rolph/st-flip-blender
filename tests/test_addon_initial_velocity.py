@@ -108,6 +108,17 @@ def _settings(**overrides):
     return types.SimpleNamespace(**values)
 
 
+def _force_settings(**overrides):
+    values = {
+        "force_type": "VORTEX",
+        "force_strength": 4.5,
+        "force_scale": 0.5,
+        "force_radius": 2.0,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
 def _fingerprint_inputs():
     params = types.SimpleNamespace(
         resolution=(4, 3, 2),
@@ -125,6 +136,155 @@ def _fingerprint_inputs():
     }]
     solid = np.linspace(-1.0, 1.0, 24, dtype=np.float32).reshape(4, 3, 2)
     return params, sources, solid
+
+
+def test_force_object_discovery_accepts_meshes_and_empties_only(
+        monkeypatch, tmp_path):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+
+    def obj(object_type, role):
+        return types.SimpleNamespace(
+            type=object_type,
+            stflip=types.SimpleNamespace(role=role),
+        )
+
+    mesh_force = obj("MESH", "FORCE")
+    empty_force = obj("EMPTY", "FORCE")
+    camera_force = obj("CAMERA", "FORCE")
+    mesh_liquid = obj("MESH", "LIQUID")
+    empty_liquid = obj("EMPTY", "LIQUID")
+    scene = types.SimpleNamespace(objects=[
+        mesh_force, empty_force, camera_force, mesh_liquid, empty_liquid,
+    ])
+
+    assert operators._fluid_objects(scene, "FORCE") == [
+        mesh_force, empty_force]
+    assert operators._fluid_objects(scene, "LIQUID") == [mesh_liquid]
+
+
+def test_vortex_force_resolution_converts_world_center_to_solver_local(
+        monkeypatch, tmp_path):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+    matrix_world = np.eye(4, dtype=np.float64)
+    matrix_world[:3, 2] = (0.0, 0.0, 2.0)
+    matrix_world[:3, 3] = (11.0, 22.0, 33.0)
+
+    force, descriptor = operators.resolve_force_field(
+        _force_settings(), matrix_world, (10.0, 20.0, 30.0), 17,
+        "Vortex Guide")
+
+    assert force == {
+        "force_type": "VORTEX",
+        "strength": 4.5,
+        "axis": pytest.approx((0.0, 0.0, 1.0)),
+        "center": pytest.approx((1.0, 2.0, 3.0)),
+        "radius": 2.0,
+    }
+    assert descriptor == {
+        "name": "Vortex Guide",
+        "force_type": "VORTEX",
+        "strength": 4.5,
+        "axis_world_unit": pytest.approx([0.0, 0.0, 1.0]),
+        "center_world": [11.0, 22.0, 33.0],
+        "center_solver_local": pytest.approx([1.0, 2.0, 3.0]),
+        "radius": 2.0,
+    }
+
+
+def test_turbulence_force_seed_is_stable_when_python_hash_salt_changes(
+        monkeypatch, tmp_path):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+    settings = _force_settings(
+        force_type="TURBULENCE", force_strength=8.0, force_scale=0.75)
+
+    monkeypatch.setattr("builtins.hash", lambda _value: 1)
+    first, first_descriptor = operators.resolve_force_field(
+        settings, np.eye(4), (0.0, 0.0, 0.0), 17, "Storm Guide")
+    monkeypatch.setattr("builtins.hash", lambda _value: 999_999)
+    second, second_descriptor = operators.resolve_force_field(
+        settings, np.eye(4), (0.0, 0.0, 0.0), 17, "Storm Guide")
+
+    assert first == second
+    assert first_descriptor == second_descriptor
+    assert first["force_type"] == "TURBULENCE"
+    assert first["strength"] == 8.0
+    assert first["scale"] == 0.75
+    assert isinstance(first["seed"], int)
+    assert first["seed"] >= 0
+
+
+@pytest.mark.parametrize("scene_seed", [True, -1, 1.5, np.nan])
+def test_turbulence_force_rejects_invalid_scene_seed(
+        monkeypatch, tmp_path, scene_seed):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="Storm Guide: Random Seed"):
+        operators.resolve_force_field(
+            _force_settings(force_type="TURBULENCE"),
+            np.eye(4),
+            (0.0, 0.0, 0.0),
+            scene_seed,
+            "Storm Guide",
+        )
+
+
+def test_directional_force_resolution_preserves_normalized_world_direction(
+        monkeypatch, tmp_path):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+    matrix_world = np.eye(4, dtype=np.float64)
+    matrix_world[:3, 2] = (0.0, -3.0, 0.0)
+
+    force, descriptor = operators.resolve_force_field(
+        _force_settings(force_type="DIRECTIONAL", force_strength=-2.0),
+        matrix_world, (10.0, 20.0, 30.0), 17, "Wind Guide")
+
+    assert force == {
+        "force_type": "DIRECTIONAL",
+        "strength": -2.0,
+        "direction": pytest.approx((0.0, -1.0, 0.0)),
+    }
+    assert descriptor == {
+        "name": "Wind Guide",
+        "force_type": "DIRECTIONAL",
+        "strength": -2.0,
+        "direction_world_unit": pytest.approx([0.0, -1.0, 0.0]),
+    }
+
+
+@pytest.mark.parametrize(
+    ("settings", "matrix_world", "domain_origin", "expected_label"),
+    [
+        (_force_settings(force_type="MAGNET"), np.eye(4), (0.0, 0.0, 0.0),
+         "Force Type"),
+        (_force_settings(), np.eye(3), (0.0, 0.0, 0.0), "Transform"),
+        (_force_settings(), np.full((4, 4), np.nan), (0.0, 0.0, 0.0),
+         "Transform"),
+        (_force_settings(), np.zeros((4, 4)), (0.0, 0.0, 0.0),
+         "Force Axis"),
+        (_force_settings(force_strength=np.nan), np.eye(4), (0.0, 0.0, 0.0),
+         "Force Strength"),
+        (_force_settings(force_radius=0.0), np.eye(4), (0.0, 0.0, 0.0),
+         "Vortex Radius"),
+        (_force_settings(force_radius=np.inf), np.eye(4), (0.0, 0.0, 0.0),
+         "Vortex Radius"),
+        (_force_settings(force_type="TURBULENCE", force_scale=0.0), np.eye(4),
+         (0.0, 0.0, 0.0), "Turbulence Scale"),
+        (_force_settings(force_type="TURBULENCE", force_scale=np.inf),
+         np.eye(4), (0.0, 0.0, 0.0), "Turbulence Scale"),
+        (_force_settings(), np.eye(4), (np.nan, 0.0, 0.0), "Domain Origin"),
+    ],
+)
+def test_force_resolution_rejects_invalid_or_non_finite_inputs(
+        monkeypatch, tmp_path, settings, matrix_world, domain_origin,
+        expected_label):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        operators.resolve_force_field(
+            settings, matrix_world, domain_origin, 17, "Bad Guide")
+
+    assert "Bad Guide" in str(excinfo.value)
+    assert expected_label in str(excinfo.value)
 
 
 def test_uniform_resolution_preserves_legacy_world_vector(
@@ -520,6 +680,34 @@ def test_simulation_fingerprint_tracks_source_order_and_outflow_mode(
 
     assert baseline != reordered
     assert baseline != pressure
+
+
+def test_simulation_fingerprint_changes_with_normalized_force_inputs(
+        monkeypatch, tmp_path):
+    operators, _velocity = _load_operators(monkeypatch, tmp_path)
+    params, sources, solid = _fingerprint_inputs()
+    force = {
+        "name": "Vortex Guide",
+        "force_type": "VORTEX",
+        "strength": 4.5,
+        "axis_world_unit": [0.0, 0.0, 1.0],
+        "center_world": [11.0, 22.0, 33.0],
+        "center_solver_local": [1.0, 2.0, 3.0],
+        "radius": 2.0,
+    }
+
+    baseline = operators.simulation_fingerprint(
+        params, (4, 3, 2), 0.25, (10.0, 20.0, 30.0), "cpu",
+        sources, solid, forces=[force])
+    changed = operators.simulation_fingerprint(
+        params, (4, 3, 2), 0.25, (10.0, 20.0, 30.0), "cpu",
+        sources, solid, forces=[{**force, "strength": 5.0}])
+    renamed = operators.simulation_fingerprint(
+        params, (4, 3, 2), 0.25, (10.0, 20.0, 30.0), "cpu",
+        sources, solid, forces=[{**force, "name": "Display Name Only"}])
+
+    assert baseline != changed
+    assert baseline == renamed
 
 
 def test_inflow_fingerprint_uses_resolved_field_and_inclusive_schedule(

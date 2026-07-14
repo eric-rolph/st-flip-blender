@@ -336,7 +336,7 @@ class STFLIPSolver:
         self._grid_origin = None
         # Art-directable body forces (wind/vortex/turbulence); each is a spec
         # dict consumed in _step_core.  The frame origin is the sparse-window
-        # cell offset so world-space forces stay put when the window moves.
+        # cell offset so solver-local forces stay put when the window moves.
         self._forces: list[dict] = []
         self._frame_origin_cells = np.zeros(3, dtype=np.float64)
 
@@ -533,6 +533,8 @@ class STFLIPSolver:
         phase_restore = None
         if "phase" in state:
             phase_np = particle_array("phase", (count,))
+            if not bool(np.all((phase_np == 0.0) | (phase_np == 1.0))):
+                raise ValueError("checkpoint phase must contain 0 or 1")
             phase_restore = self.be.from_numpy(phase_np)
         affine_restore = None
         if "C" in state and self._use_apic:
@@ -723,10 +725,15 @@ class STFLIPSolver:
                     "inflow end_time must be finite and not precede start_time"
                 )
             end = float(end_time)
+        if (isinstance(phase, bool)
+                or not isinstance(phase, numbers.Real)
+                or float(phase) not in (0.0, 1.0)):
+            raise ValueError("inflow phase must be 0 or 1")
+        phase_value = float(phase)
         sid = self._next_source
         self._next_source += 1
         self._inflows.append(
-            (self.be.from_numpy(mask), field, start, end, float(phase), sid)
+            (self.be.from_numpy(mask), field, start, end, phase_value, sid)
         )
 
     def add_outflow(self, cell_mask: np.ndarray, mode: str = "VOLUME") -> None:
@@ -785,7 +792,8 @@ class STFLIPSolver:
         ``force_type`` is 'DIRECTIONAL' (wind along ``direction``), 'VORTEX'
         (swirl about ``axis`` through ``center`` with ``radius`` falloff), or
         'TURBULENCE' (divergence-free curl noise of wavelength ``scale``).
-        ``strength`` is the acceleration magnitude; centre/axis are world-space.
+        ``strength`` is the acceleration magnitude. ``center`` is solver-local;
+        ``direction`` and ``axis`` are normalized world-oriented vectors.
         """
         ft = str(force_type).strip().upper()
         if ft not in {"DIRECTIONAL", "VORTEX", "TURBULENCE"}:
@@ -803,7 +811,7 @@ class STFLIPSolver:
 
     def _apply_forces(self, grids, dt: float) -> None:
         """Add each registered body force to the face velocities (like gravity),
-        using world coordinates that respect the active sparse window."""
+        using solver-local coordinates that respect the active sparse window."""
         if not self._forces:
             return
         xp = self.be.xp
@@ -946,7 +954,12 @@ class STFLIPSolver:
         return float(self.p.particles_per_cell)
 
     def _p2g(self, dt_prev: float):
-        """4D->3D particle-to-grid transfer (Eq. 8-9). Returns face grids."""
+        """4D->3D particle-to-grid transfer (Eq. 8-9). Returns face grids.
+
+        In two-phase mode, ``*_m``/``*_ml`` remain volume-normalized sampling
+        support for validity, activity, and liquid volume fraction. Face
+        momentum and its denominator instead use phase-density mass weights.
+        """
         xp = self.be.xp
         p = self.p
         nx, ny, nz = self.shape
@@ -967,14 +980,30 @@ class STFLIPSolver:
         apic = self._use_apic
         two = p.two_phase
         phase = self.phase
+        if two:
+            # Normalize by one liquid particle's volume/mass. The omitted
+            # common factors (cell volume / liquid PPC, and liquid density)
+            # cancel in both volume fractions and velocity averages.
+            gas_volume_weight = (
+                float(p.particles_per_cell) / p.gas_particles_per_cell)
+            gas_density_ratio = p.rho_gas / p.rho
+            gas_mass_weight = gas_volume_weight * gas_density_ratio
+            particle_volume_weight = (
+                phase + (1.0 - phase) * gas_volume_weight)
+            particle_mass_weight = (
+                phase + (1.0 - phase) * gas_mass_weight)
 
         grids = {}
         for g, off in _OFFSETS.items():
             sh = shapes[g]
-            mass = xp.zeros(sh, dtype=xp.float32).ravel()
-            mass_l = (xp.zeros(sh, dtype=xp.float32).ravel() if two else None)
+            volume = xp.zeros(sh, dtype=xp.float32).ravel()
+            liquid_volume = (
+                xp.zeros(sh, dtype=xp.float32).ravel() if two else None)
             mom = (xp.zeros(sh, dtype=xp.float32).ravel()
                    if g != "c" else None)
+            face_mass = (
+                xp.zeros(sh, dtype=xp.float32).ravel()
+                if two and mom is not None else None)
             axis = vel_axis.get(g)
             xi = gp - self._offsets_dev[g]
             base = xp.floor(xi).astype(xp.int32)
@@ -992,9 +1021,11 @@ class STFLIPSolver:
                 flat = ((xp.clip(ii, 0, sh[0] - 1) * sh[1]
                          + xp.clip(jj, 0, sh[1] - 1)) * sh[2]
                         + xp.clip(kk, 0, sh[2] - 1))
-                self.be.scatter_add(mass, flat, w)
-                if mass_l is not None:
-                    self.be.scatter_add(mass_l, flat, w * phase)
+                weighted_volume = w * particle_volume_weight if two else w
+                self.be.scatter_add(volume, flat, weighted_volume)
+                if liquid_volume is not None:
+                    self.be.scatter_add(
+                        liquid_volume, flat, weighted_volume * phase)
                 if mom is not None:
                     vel_a = self.vel[:, axis]
                     if apic:
@@ -1006,34 +1037,65 @@ class STFLIPSolver:
                         vel_a = vel_a + p.dx * (self.C[:, axis, 0] * rx
                                                 + self.C[:, axis, 1] * ry
                                                 + self.C[:, axis, 2] * rz)
-                    self.be.scatter_add(mom, flat, w * vel_a)
-            grids[g + "_m"] = mass.reshape(sh)
-            if mass_l is not None:
-                grids[g + "_ml"] = mass_l.reshape(sh)
+                    momentum_weight = (
+                        w * particle_mass_weight if two else w)
+                    if face_mass is not None:
+                        self.be.scatter_add(face_mass, flat, momentum_weight)
+                    self.be.scatter_add(mom, flat, momentum_weight * vel_a)
+            grids[g + "_m"] = volume.reshape(sh)
+            if liquid_volume is not None:
+                grids[g + "_ml"] = liquid_volume.reshape(sh)
             if mom is not None:
                 grids[g + "_p"] = mom.reshape(sh)
-
-        for g in ("u", "v", "w"):
-            m = grids[g + "_m"]
-            valid = m > p.eps_m
-            grids[g] = xp.where(valid, grids[g + "_p"] / xp.maximum(m, p.eps_m), 0.0)
-            grids[g + "_valid"] = valid
-            if two:
-                # Liquid volume fraction (Braun et al. 2025, Eq. 7): m_l over
-                # total sampled mass.  m0 cancels, so no calibration is needed.
+            if face_mass is not None:
+                # Volume support controls validity; physical mass controls the
+                # velocity average. Finalize now so this transient accumulator
+                # can be reused for the next face grid instead of retaining
+                # three production-sized arrays.
+                valid = grids[g + "_m"] > p.eps_m
+                xp.maximum(
+                    face_mass, np.finfo(np.float32).tiny, out=face_mass)
+                grids[g] = xp.where(
+                    valid,
+                    grids[g + "_p"]
+                    / face_mass.reshape(sh),
+                    0.0,
+                )
+                grids[g + "_valid"] = valid
                 grids[g + "_phi"] = xp.clip(
-                    grids[g + "_ml"] / xp.maximum(m, p.eps_m), 0.0, 1.0)
-            else:
+                    grids[g + "_ml"]
+                    / xp.maximum(grids[g + "_m"], p.eps_m),
+                    0.0,
+                    1.0,
+                )
+                face_mass = None
+
+        if not two:
+            # Keep the historical free-surface transfer arithmetic isolated:
+            # its sampling weights serve as both momentum mass and phase mass.
+            for g in ("u", "v", "w"):
+                m = grids[g + "_m"]
+                valid = m > p.eps_m
+                grids[g] = xp.where(
+                    valid,
+                    grids[g + "_p"] / xp.maximum(m, p.eps_m),
+                    0.0,
+                )
+                grids[g + "_valid"] = valid
                 # Space-time phase field from the weight accumulators (Eq. 13):
                 # phi = C(m / (eta_phi * m0)), C(x) = min(sqrt(x), 1).
                 grids[g + "_phi"] = xp.minimum(
                     xp.sqrt(m / (p.eta_phi * self.m0)), 1.0)
-        if two:
-            grids["c_phi"] = xp.clip(
-                grids["c_ml"] / xp.maximum(grids["c_m"], p.eps_m), 0.0, 1.0)
-        else:
             grids["c_phi"] = xp.minimum(
                 xp.sqrt(grids["c_m"] / (p.eta_phi * self.m0)), 1.0)
+        else:
+            # Eq. 7: liquid volume support over total volume support. The
+            # common liquid-particle normalization cancels in this ratio.
+            grids["c_phi"] = xp.clip(
+                grids["c_ml"] / xp.maximum(grids["c_m"], p.eps_m),
+                0.0,
+                1.0,
+            )
         return grids
 
     # ------------------------------------------------------------- grid utils

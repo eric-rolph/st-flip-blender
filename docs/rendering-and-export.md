@@ -15,9 +15,9 @@ Set **Surface Method** (in the surface panel):
   reconstruction, mean-curvature-flow smoothing, then CPU OpenVDB meshing. This
   is the high-quality, feature-preserving surface for final frames. It is
   heavier (dense grid + OpenVDB), so it is output-only and guarded by size
-  caps — reserve it for the resolutions and frames you will actually render.
+  caps. A rebuild covers every committed frame, so plan the bake range first.
 
-Tuning knobs:
+**Fast Preview controls:**
 
 - **Particle Radius** — the surfacing sphere radius in cell widths. Larger =
   smoother, more "filled"; smaller = more detail and more gaps.
@@ -25,9 +25,18 @@ Tuning knobs:
   and more cost.
 - **Geometric Smoothing** — an optional Laplacian-smooth modifier pass on top.
 
-The Paper-MCF surface is cached per frame. Use **Rebuild Paper Surface Cache**
-to (re)generate it for the whole range, and **Refresh Surface** to update the
-current frame after changing settings.
+**Paper MCF controls:** sphere radius and voxel size stay fixed at `0.5Δx`.
+Tune MCF iterations, OpenVDB adaptivity and the reconstruction-voxel cap.
+
+Paper MCF is cached per frame. **Rebuild Paper Surface Cache** regenerates every
+committed frame after a Paper setting changes.
+
+**Refresh Surface** applies Fast Preview changes or reloads an already matching
+Paper cache; it does not rebuild.
+
+Playback and Paper surfaces use float32 world-space positions. Keep
+high-resolution domains near the world origin so large offsets do not erase
+subcell detail.
 
 ## Shading the water — the fast path
 

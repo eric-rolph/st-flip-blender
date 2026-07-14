@@ -501,6 +501,7 @@ def simulation_fingerprint(
     sources,
     solid_sdf=None,
     solid_node_sdf=None,
+    forces=None,
 ) -> str:
     """Hash every re-voxelized input that can change a resumed trajectory.
 
@@ -513,16 +514,18 @@ def simulation_fingerprint(
         for name in sorted(vars(params))
         if not name.startswith("_")
     }
+    forces = list(forces or ())
     digest = hashlib.sha256()
     digest.update(_canonical_json_bytes({
         "schema": "stflip-bake-fingerprint",
-        "version": 1,
+        "version": 2,
         "params": params_payload,
         "dims": [int(v) for v in dims],
         "dx": float(dx),
         "origin": [float(v) for v in origin],
         "backend": str(backend_name),
         "source_count": len(sources),
+        "force_count": len(forces),
     }))
     for index, source in enumerate(sources):
         descriptor = {
@@ -534,6 +537,14 @@ def simulation_fingerprint(
         }))
         _fingerprint_array(
             digest, f"source[{index}].mask", source["mask"], np.uint8)
+    for index, force in enumerate(forces):
+        descriptor = {
+            key: value for key, value in force.items() if key != "name"
+        }
+        digest.update(_canonical_json_bytes({
+            "force_index": index,
+            "descriptor": descriptor,
+        }))
     if solid_sdf is None:
         digest.update(b"solid_sdf:none")
     else:
@@ -1064,8 +1075,124 @@ def _refresh_animated_obstacles(scene, b) -> None:
 
 
 def _fluid_objects(scene, role: str):
+    object_types = {"MESH", "EMPTY"} if role == "FORCE" else {"MESH"}
     return [o for o in scene.objects
-            if o.type == "MESH" and o.stflip.role == role]
+            if o.type in object_types and o.stflip.role == role]
+
+
+def _stable_force_seed(scene_seed: int, source_name: str) -> int:
+    payload = _canonical_json_bytes({
+        "scene_seed": int(scene_seed),
+        "source_name": str(source_name),
+    })
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _force_scalar(value, label: str, source_name: str, *, positive=False):
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        qualifier = "finite and positive" if positive else "finite"
+        raise ValueError(
+            f"{source_name}: {label} must be {qualifier}"
+        ) from exc
+    if not math.isfinite(scalar) or (positive and scalar <= 0.0):
+        qualifier = "finite and positive" if positive else "finite"
+        raise ValueError(f"{source_name}: {label} must be {qualifier}")
+    return scalar
+
+
+def resolve_force_field(settings, matrix_world, domain_origin, scene_seed,
+                        source_name):
+    """Resolve Blender force controls into solver-local inputs and metadata."""
+    source_name = str(source_name)
+    force_type = str(settings.force_type).strip().upper()
+    if force_type not in {"DIRECTIONAL", "VORTEX", "TURBULENCE"}:
+        raise ValueError(
+            f"{source_name}: Force Type must be DIRECTIONAL, VORTEX, or "
+            "TURBULENCE"
+        )
+    strength = _force_scalar(
+        settings.force_strength, "Force Strength", source_name)
+
+    try:
+        matrix = np.asarray(matrix_world, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{source_name}: Transform must be a finite 4x4 matrix"
+        ) from exc
+    if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        raise ValueError(
+            f"{source_name}: Transform must be a finite 4x4 matrix")
+
+    if force_type == "TURBULENCE":
+        scale = _force_scalar(
+            settings.force_scale, "Turbulence Scale", source_name,
+            positive=True)
+        if (isinstance(scene_seed, bool)
+                or not isinstance(scene_seed, numbers.Integral)
+                or scene_seed < 0):
+            raise ValueError(
+                f"{source_name}: Random Seed must be a non-negative integer")
+        seed = _stable_force_seed(scene_seed, source_name)
+        force = {
+            "force_type": force_type,
+            "strength": strength,
+            "scale": scale,
+            "seed": seed,
+        }
+        return force, {
+            "name": source_name,
+            "force_type": force_type,
+            "strength": strength,
+            "scale": scale,
+            "seed": seed,
+        }
+
+    zaxis = matrix[:3, 2]
+    axis_length = float(np.linalg.norm(zaxis))
+    if not math.isfinite(axis_length) or axis_length <= 1e-12:
+        raise ValueError(f"{source_name}: Force Axis must be non-zero")
+    axis = zaxis / axis_length
+    if force_type == "DIRECTIONAL":
+        direction = tuple(float(value) for value in axis)
+        return {
+            "force_type": force_type,
+            "strength": strength,
+            "direction": direction,
+        }, {
+            "name": source_name,
+            "force_type": force_type,
+            "strength": strength,
+            "direction_world_unit": list(direction),
+        }
+
+    origin = _finite_vector3(domain_origin, "Domain Origin", source_name)
+    center_world = matrix[:3, 3]
+    center_solver = center_world - origin
+    if not np.all(np.isfinite(center_solver)):
+        raise ValueError(
+            f"{source_name}: Vortex Center must be finite in solver-local "
+            "coordinates")
+    radius = _force_scalar(
+        settings.force_radius, "Vortex Radius", source_name, positive=True)
+    force = {
+        "force_type": "VORTEX",
+        "strength": strength,
+        "axis": tuple(float(value) for value in axis),
+        "center": tuple(float(value) for value in center_solver),
+        "radius": radius,
+    }
+    descriptor = {
+        "name": source_name,
+        "force_type": "VORTEX",
+        "strength": strength,
+        "axis_world_unit": [float(value) for value in axis],
+        "center_world": [float(value) for value in center_world],
+        "center_solver_local": [float(value) for value in center_solver],
+        "radius": radius,
+    }
+    return force, descriptor
 
 
 def _finite_vector3(value, label: str, source_name: str) -> np.ndarray:
@@ -2534,22 +2661,20 @@ class STFLIP_OT_bake(bpy.types.Operator):
                 continue
             solver.add_outflow(mask, mode=mode)
 
-        # Art-directable force fields: the object's world +Z axis is the
-        # direction/vortex axis, its origin the vortex centre.
+        # Art-directable force fields: resolve Blender world transforms at the
+        # boundary so the solver receives its local-space vortex centre and
+        # normalized world-oriented axes.
+        force_records = []
         for obj in _fluid_objects(scene, "FORCE"):
-            fs = obj.stflip
-            mw = np.array(obj.matrix_world, dtype=np.float64).reshape(4, 4)
-            zaxis = mw[:3, 2]
-            norm = float(np.linalg.norm(zaxis))
-            if norm > 1e-9:
-                zaxis = zaxis / norm
-            center = tuple(float(v) for v in mw[:3, 3])
-            solver.add_force(
-                fs.force_type, float(fs.force_strength),
-                direction=tuple(float(v) for v in zaxis),
-                axis=tuple(float(v) for v in zaxis), center=center,
-                radius=float(fs.force_radius), scale=float(fs.force_scale),
-                seed=int(st.seed) + abs(hash(obj.name)) % 100000)
+            force, descriptor = resolve_force_field(
+                obj.stflip,
+                obj.matrix_world,
+                origin,
+                st.seed,
+                obj.name,
+            )
+            solver.add_force(**force)
+            force_records.append(descriptor)
 
         initial_outflow_cull = (
             solver.cull_outflows() if not is_resume else {})
@@ -2604,6 +2729,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
             fingerprint_sources,
             solid_sdf,
             solid_node_sdf,
+            forces=force_records,
         )
         existing_meta = cache.read_meta(cache_dir)
         if not is_resume:
@@ -2780,6 +2906,7 @@ class STFLIP_OT_bake(bpy.types.Operator):
             "liquid_sources": liquid_records,
             "inflow_sources": inflow_records,
             "outflow_sources": outflow_records,
+            "force_fields": force_records,
             "outflow": {
                 "source_count": len(outflow_records),
                 "initial_cull": initial_outflow_cull,

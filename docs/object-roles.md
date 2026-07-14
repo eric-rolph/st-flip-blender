@@ -1,8 +1,8 @@
 # Object roles
 
-A scene is defined by a **Domain** plus any number of meshes that each carry a
-**Role** (set in *ST-FLIP → Active Object → Role*). Roles are how you tell the
-solver what each object *is*.
+A scene is defined by a **Domain** plus objects carrying **Roles** in *ST-FLIP
+→ Active Object*. Domain, Liquid, Inflow, Outflow and Obstacle are mesh-only;
+Force Field accepts a mesh or Empty.
 
 ## Domain
 
@@ -59,24 +59,29 @@ A closed mesh the fluid **flows around**. Obstacles are voxelised into the grid
 as solids with cut-cell face apertures, so partially covered cells behave
 correctly rather than blocking a whole cell.
 
-- **Animated (Moving Wall)** — enable this for an obstacle that moves or
-  deforms during the bake. It is re-voxelised every output frame and its motion
-  enters the solve as a moving-wall boundary velocity (a paddle, a piston, a
-  rotating mixer). This is slower than a static obstacle, which is voxelised
-  once.
+- **Animated (Moving Wall)** — re-voxelizes the obstacle once per output frame.
+  Rigid transforms use transform differencing. Stable-topology deformation uses
+  nearest evaluated-vertex displacement when the object transform is unchanged.
+
+Combined transform-plus-deformation uses the rigid-velocity path. Topology
+changes have no deformation velocity. Resume re-samples animated motion and may
+differ slightly from an uninterrupted bake.
 
 ## Force Field
 
-An **art-directed body force** applied to the fluid — not physical, but useful
-for shaping motion. Set **Force Type**:
+An **art-directed body force** applied to the fluid. Use a mesh or Empty as the
+guide; its geometry is not voxelized. Set **Force Type**:
 
 - **Directional** — a constant push (wind) along the object's local +Z.
 - **Vortex** — swirl about the object's +Z axis, within a **radius**.
 - **Turbulence** — divergence-free curl-noise for chop and churn, with a
   spatial **scale**.
 
-The object's origin is the force centre and its local **+Z** is the
-direction/axis. **Strength** scales the effect. Forces are how the *Stormy
+Directional uses local **+Z**. Vortex uses the origin as its centre and local
+**+Z** as its axis. **Strength** scales the effect.
+
+Turbulence is domain-wide and uses **Strength**, **Scale**, and the simulation
+seed; the guide transform does not localize it. Forces are how the *Stormy
 Pool* preset gets its agitation.
 
 ## How roles combine

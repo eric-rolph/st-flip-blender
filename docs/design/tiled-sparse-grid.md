@@ -1,9 +1,8 @@
 # Design: tiled sparse grid
 
-Status: **design + first increment shipped.** This document specifies a fully
-tiled sparse grid for the ST-FLIP solver, explains why it is a large
-undertaking, and describes the small, safe increment that is already in the
-codebase (the pressure-solve active-region crop).
+Status: **design + two safe increments shipped.** This document specifies a
+fully tiled sparse grid and describes the active-box and axis-separable-region
+pressure crops already in the codebase.
 
 ## Motivation
 
@@ -20,11 +19,10 @@ Two mechanisms already reduce this waste:
    when it cannot be applied safely — outflows, cut-cell node-SDF obstacles, or
    Two-Phase filling the Domain — because those need the full grid.
 
-2. **Pressure-solve active crop** (`pressure.crop_to_active`, shipped here).
-   Independently of `sparse`, the pressure solve crops its own linear system to
-   the active bounding box before the CG runs. This helps in exactly the cases
-   where the whole-solver crop is disengaged but the *liquid* is still localized
-   (e.g. a localized pour into a Domain that also has a drain).
+2. **Pressure-system boxes** (`pressure.crop_boxes`, shipped here).
+   Independently of `sparse`, each pressure solver can use one tight active box
+   or independent boxes split at complete empty lattice planes. A gain test
+   keeps the full grid when cropping would not save enough work.
 
 Both are **bounding-box** strategies. Their weakness is the same: a bounding box
 is still dense. An active region that is thin or hollow — a sheet spanning the
@@ -33,17 +31,17 @@ as large as the Domain even though few cells are live. Grid-independent solves
 and billion-cell scenes need true sparsity: **store and compute only live
 cells.**
 
-## The bounding-box increment (shipped)
+## The pressure-box increment (shipped)
 
-`pressure.crop_to_active(xp, rhs, kx, ky, kz, liquid)` computes the tight active
-bounding box, pads it by a one-cell inactive halo (clamped at real Domain
-boundaries), slices the right-hand side, the three MAC face-coefficient arrays,
-and the mask to that box, and returns a `scatter` closure that writes the
-sub-solution back into a full-size zero array. Both `pressure.solve` and
-`multigrid.solve` call it first and, when the box is meaningfully smaller than
-the grid, solve the cropped system and scatter the result.
+`pressure.crop_boxes(xp, rhs, kx, ky, kz, liquid)` finds axis-separable
+components and builds one or more tight boxes. Each box gains a one-cell
+inactive halo, sliced coefficients, and a `scatter` closure for the full grid.
 
-**Why it is safe.** The halo cells are inactive, so the operator is unchanged:
+Both `pressure.solve` and `multigrid.solve` use these boxes when they pass the
+gain test (70% by default). Otherwise they solve the full grid. The older
+`crop_to_active` helper remains a single-box reference, not the live call path.
+
+**Why it is safe.** Halo cells are inactive, so the operator is unchanged:
 
 - Exterior Dirichlet terms in `apply_laplacian` fire on halo cells but multiply
   a zero pressure, contributing nothing.
@@ -106,14 +104,15 @@ rewrite wrong — a billion-cell shell/sheet is exactly the disconnected-footpri
 case — but it *deprioritizes* it: pursue it when a concrete production scene is
 bottlenecked on the dense grid in the disconnected regime, not speculatively.
 
-A cheaper, data-supported middle step also exists and is now **shipped**
-(`pressure.crop_boxes`, Phase 1.5 below): disconnected fluid regions are
-*independent* pressure systems (the Poisson operator has no cross-region
-coupling), so solving each region on its own tight box captures the
-disconnected-flow win without any tiling rewrite. Measured on two tiny blobs at
-opposite corners of a 96³ domain (0.4% active, bounding box spanning the whole
-grid), the pressure solve drops ~60× (Jacobi) and ~150× (multigrid) versus the
-single-box crop — bit-for-bit the same solution.
+A cheaper, data-supported middle step is now **shipped**
+(`pressure.crop_boxes`, Phase 1.5 below).
+
+Regions separated by complete empty lattice planes are independent pressure
+systems, so each can use its own tight box without a tiling rewrite.
+
+On two tiny blobs at opposite corners of a 96³ domain, this reduces the pressure
+solve by ~60× (Jacobi) and ~150× (multigrid) versus one domain-spanning box. The
+solutions agree within float32 rounding and the configured solver tolerance.
 
 ## Full tiled sparse grid (proposed)
 
@@ -194,15 +193,16 @@ dense path and each closed by equivalence tests against it — so risk decreases
 monotonically and the dense path stays the default until the tiled path proves
 parity.
 
-- **Phase 0 — bounding-box crop (shipped).** `pressure.crop_to_active`; covers
-  the compact/contiguous majority.
+- **Phase 0 — bounding-box crop (shipped).** `pressure.crop_boxes` returns one
+  gain-worthy active box for the compact/contiguous majority; `crop_to_active`
+  remains a single-box reference helper.
 - **Phase 1 — tiling data structure + telemetry.** A `tiles` module: the tile
   table, active-set from a cell mask, neighbour lookup, pack/unpack, and a
   diagnostic that reports the active-tile fraction (the measurement above,
   online). No solver change. Tests: pack/unpack round-trip, neighbour and
   boundary-tile correctness. *Deliverable on its own:* per-bake sparsity
   telemetry to decide when tiling would pay.
-- **Phase 1.5 — per-connected-component crop (shipped).** `pressure.crop_boxes`
+- **Phase 1.5 — per-axis-separable-region crop (shipped).** `pressure.crop_boxes`
   recursively splits the active box at *complete empty planes* (a lattice plane
   with no liquid) into axis-separable components, and `pressure.solve` /
   `multigrid.solve` solve each component on its own tight box. A connected region
@@ -241,9 +241,9 @@ transient for typical flows, so a speculative full rewrite is not justified —
 shipping it half-done would risk the reliability of the dense-plus-crop path for
 a benefit most shots do not see.
 
-The bounding-box crop and the per-component crop (Phase 1.5) already delivered
-capture the bulk of the available sparsity — compact/contiguous flows via the
-bounding box, disconnected flows via the component split — at negligible risk,
+The bounding-box crop and the axis-separable-region crop (Phase 1.5) already
+capture the bulk of the available sparsity — compact flows via one box and
+widely separated regions via multiple boxes — at negligible risk,
 and they establish the inactive-neighbour semantics the full tiling would reuse
 per tile. Together they are the correct first increments; the remaining phases
 above are the route to take *when a concrete production scene demands it*,
