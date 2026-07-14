@@ -1354,12 +1354,228 @@ def _calm_scene_summary(
 
 
 
+# --------------------------------------------------------------------------
+# Rotating-tank scenario (roadmap ENER-M0).
+#
+# A fully filled, closed cylindrical tank in zero gravity, seeded with rigid
+# rotation about z.  The inviscid exact solution is rigid rotation forever,
+# so the decay of angular momentum and kinetic energy isolates the
+# first-order splitting loss (limitation L2) plus the stair-step torque of
+# the Cartesian cut-cell wall.  The CFL-1 case IS that aperture-torque
+# floor: present retention at higher CFL relative to it, never as absolute
+# conservation.  Report-only.
+
+ROTATING_TANK_SCHEMA = "stflip.rotating_tank_validation"
+ROTATING_TANK_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class RotatingTankConfig:
+    """Configuration for the zero-g rotating closed-tank decay study."""
+
+    resolution: int = 32
+    frames: int = 48
+    particles_per_cell: int = 4
+    seed: int = 0
+    backend: str = "cpu"
+    frame_rate: float = 24.0
+    cfl_targets: tuple = (1.0, 4.0, 8.0, 16.0)
+    angular_speed: float = 24.0
+    tank_radius: float = 0.45
+
+    def __post_init__(self) -> None:
+        for name in ("resolution", "frames", "particles_per_cell", "seed"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+        if self.resolution < 8:
+            raise ValueError("resolution must be at least 8")
+        if self.frames < 1:
+            raise ValueError("frames must be positive")
+        if self.particles_per_cell < 1:
+            raise ValueError("particles_per_cell must be positive")
+        if self.seed < 0:
+            raise ValueError("seed must not be negative")
+        if self.backend not in {"cpu", "cuda"}:
+            raise ValueError("backend must be 'cpu' or 'cuda'")
+        if not math.isfinite(self.frame_rate) or self.frame_rate <= 0.0:
+            raise ValueError("frame_rate must be positive and finite")
+        if not self.cfl_targets:
+            raise ValueError("cfl_targets must not be empty")
+        for value in self.cfl_targets:
+            value = float(value)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError("cfl_targets entries must be positive")
+        if (not math.isfinite(self.angular_speed)
+                or self.angular_speed <= 0.0):
+            raise ValueError("angular_speed must be positive and finite")
+        if (not math.isfinite(self.tank_radius)
+                or not 0.1 <= self.tank_radius <= 0.5):
+            raise ValueError("tank_radius must lie in [0.1, 0.5]")
+
+
+def _rotating_tank_geometry(
+    config: RotatingTankConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cell SDF, node SDF, and liquid mask for the closed cylinder tank.
+
+    The solid is everything OUTSIDE the cylinder (sdf = radius - r_xy is
+    negative there), giving cut-cell apertures on the curved wall.  Liquid
+    fills the full column with a half-cell margin so seeds never start
+    inside the wall band.
+    """
+
+    n = config.resolution
+    dx = 1.0 / n
+    radius = config.tank_radius
+
+    centres = (np.arange(n) + 0.5) * dx
+    cx, cy = np.meshgrid(centres, centres, indexing="ij")
+    r_cells = np.hypot(cx - 0.5, cy - 0.5)
+    sdf_cells = np.repeat(
+        (radius - r_cells)[:, :, None], n, axis=2).astype(np.float32)
+
+    nodes = np.arange(n + 1) * dx
+    nx_grid, ny_grid = np.meshgrid(nodes, nodes, indexing="ij")
+    r_nodes = np.hypot(nx_grid - 0.5, ny_grid - 0.5)
+    sdf_nodes = np.repeat(
+        (radius - r_nodes)[:, :, None], n + 1, axis=2).astype(np.float32)
+
+    mask = np.repeat(
+        (r_cells <= radius - 0.5 * dx)[:, :, None], n, axis=2)
+    return sdf_cells, sdf_nodes, mask
+
+
+def run_rotating_tank_validation(
+    config: RotatingTankConfig | None = None,
+) -> dict:
+    """Run the rotating-tank decay study across the configured CFL targets.
+
+    Returns per-case frame metric records (schema v3, with the angular
+    momentum estimates) plus L_z and kinetic-energy retention series
+    relative to the seeded state.  The realizable per-frame CFL is capped by
+    ``angular_speed * tank_radius * frame_dt / dx``; targets above that
+    ceiling degenerate to one substep per frame and are reported at their
+    actual CFL.
+    """
+
+    config = config or RotatingTankConfig()
+    from .velocity import SolidBodyRotation
+
+    n = config.resolution
+    sdf_cells, sdf_nodes, mask = _rotating_tank_geometry(config)
+    rotation = SolidBodyRotation(
+        center=(0.5, 0.5, 0.5),
+        angular_velocity=(0.0, 0.0, config.angular_speed),
+    )
+    cfl_ceiling = (
+        config.angular_speed * config.tank_radius
+        / config.frame_rate * n
+    )
+
+    cases: dict[str, Any] = {}
+    for cfl_target in config.cfl_targets:
+        params = Params(
+            resolution=(n, n, n),
+            dx=1.0 / n,
+            gravity=(0.0, 0.0, 0.0),
+            frame_dt=1.0 / float(config.frame_rate),
+            cfl_target=float(cfl_target),
+            particles_per_cell=config.particles_per_cell,
+            st_enabled=True,
+            seed=config.seed,
+        )
+        backend = get_backend(config.backend)
+        solver = STFLIPSolver(params, backend)
+        solver.set_solid_sdf(sdf_cells, node_sdf=sdf_nodes)
+        solver.add_liquid_mask(mask, velocity=rotation)
+
+        baseline = measure_frame(
+            frame=0,
+            simulation_time_s=0.0,
+            params=params,
+            stats=None,
+            positions_local=solver.be.to_numpy(solver.pos),
+            velocities=solver.be.to_numpy(solver.vel),
+        )
+        records = [baseline]
+        for frame in range(1, config.frames + 1):
+            backend.synchronize()
+            started = time.perf_counter()
+            stats = solver.step_frame()
+            backend.synchronize()
+            step_wall_s = time.perf_counter() - started
+            positions, velocities = solver.get_render_particles()
+            records.append(measure_frame(
+                frame=frame,
+                simulation_time_s=float(solver.time),
+                params=params,
+                stats=stats,
+                positions_local=positions,
+                velocities=velocities,
+                compute_wall_s=step_wall_s,
+            ))
+
+        l0 = baseline["angular_momentum_z_estimate"]
+        ke0 = baseline["kinetic_energy_particle_estimate"]
+        cases[f"cfl_{cfl_target:g}"] = {
+            "cfl_target": float(cfl_target),
+            "frames": records,
+            "angular_momentum_z_retention": [
+                _safe_ratio(r["angular_momentum_z_estimate"], l0)
+                for r in records
+            ],
+            "kinetic_energy_retention": [
+                _safe_ratio(r["kinetic_energy_particle_estimate"], ke0)
+                for r in records
+            ],
+        }
+
+    summary: dict[str, Any] = {
+        "cfl_ceiling_estimate": float(cfl_ceiling),
+        "floor_note": (
+            "the CFL-1 case is the aperture-torque floor; interpret higher-"
+            "CFL retention relative to it, not as absolute conservation"),
+    }
+    floor = cases.get("cfl_1")
+    for name, case in cases.items():
+        final_l = case["angular_momentum_z_retention"][-1]
+        final_ke = case["kinetic_energy_retention"][-1]
+        entry: dict[str, Any] = {
+            "angular_momentum_z_retention_final": final_l,
+            "kinetic_energy_retention_final": final_ke,
+        }
+        if floor is not None and name != "cfl_1":
+            floor_l = floor["angular_momentum_z_retention"][-1]
+            floor_ke = floor["kinetic_energy_retention"][-1]
+            entry["angular_momentum_z_retention_vs_floor"] = (
+                _safe_ratio(final_l, floor_l)
+                if None not in (final_l, floor_l) else None)
+            entry["kinetic_energy_retention_vs_floor"] = (
+                _safe_ratio(final_ke, floor_ke)
+                if None not in (final_ke, floor_ke) else None)
+        summary[name] = entry
+
+    return {
+        "schema": ROTATING_TANK_SCHEMA,
+        "version": ROTATING_TANK_VERSION,
+        "library_version": __version__,
+        "config": asdict(config),
+        "cases": cases,
+        "summary": summary,
+    }
+
+
+
 __all__ = [
     "CALM_SURFACE_SCENES",
     "CALM_SURFACE_SCHEMA",
     "CALM_SURFACE_VERSION",
     "CalmSurfaceConfig",
     "MATCHED_CASES",
+    "ROTATING_TANK_SCHEMA",
+    "ROTATING_TANK_VERSION",
+    "RotatingTankConfig",
     "MULTI_SEED_SCHEMA",
     "MULTI_SEED_VERSION",
     "VALIDATION_SCHEMA",
@@ -1368,6 +1584,7 @@ __all__ = [
     "ValidationConfig",
     "detect_high_cfl",
     "run_calm_surface_validation",
+    "run_rotating_tank_validation",
     "run_matched_validation",
     "run_multi_seed_validation",
     "temporal_quadrature_coverage",
