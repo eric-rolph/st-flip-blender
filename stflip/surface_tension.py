@@ -71,15 +71,27 @@ def smooth_phase(xp, phi, iters):
     return s
 
 
+def smoothed_phase_gradient(xp, phi_c, dx, iters=2):
+    """Smoothed phase, its gradient, and the gradient magnitude.
+
+    Shared between the explicit CSF force below and the semi-implicit
+    capillary stabilizer (st_implicit), so both see the same interface
+    delta function |grad phi_s|.
+    """
+
+    phi_s = smooth_phase(xp, phi_c, iters)
+    gx, gy, gz = xp.gradient(phi_s, dx)
+    mag = xp.sqrt(gx * gx + gy * gy + gz * gz)
+    return phi_s, gx, gy, gz, mag
+
+
 def cell_force(xp, phi_c, dx, sigma, iters=2, eps=1e-6):
     """Cell-centred CSF body force F = sigma * kappa * grad(phi_s).
 
     ``phi_c`` is the cell-centred liquid fraction in [0, 1].  Returns an
     (nx, ny, nz, 3) force-density field (units sigma / length^2).
     """
-    phi_s = smooth_phase(xp, phi_c, iters)
-    gx, gy, gz = xp.gradient(phi_s, dx)
-    mag = xp.sqrt(gx * gx + gy * gy + gz * gz)
+    _phi_s, gx, gy, gz, mag = smoothed_phase_gradient(xp, phi_c, dx, iters)
     inv = 1.0 / xp.maximum(mag, eps)
     nx_, ny_, nz_ = gx * inv, gy * inv, gz * inv
     # kappa = -div(n_hat)
