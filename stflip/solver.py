@@ -312,6 +312,14 @@ class FrameStats:
     particles_removed: int = 0
     volume_outflow_removed: int = 0
     pressure_outflow_removed: int = 0
+    # ERR-M1 step-control diagnostics (populated only when the solver's
+    # internal _collect_step_diagnostics attribute is set; plain FrameStats
+    # payload, NOT the strict metrics frame-record schema).
+    clamp_bind_fractions: list = field(default_factory=list)
+    undersampled_marginal_fractions: list = field(default_factory=list)
+    undersampled_subthreshold_fractions: list = field(default_factory=list)
+    near_solid_fast_fractions: list = field(default_factory=list)
+    capillary_clamped_steps: list = field(default_factory=list)
 
 
 class STFLIPSolver:
@@ -2399,12 +2407,62 @@ class STFLIPSolver:
             self.pos = self._advect(grids, self.pos, dt_act)
         if p.sheeting > 0.0:
             self._apply_sheeting()
+        if getattr(self, "_collect_step_diagnostics", False):
+            # ERR-M1: read-only signal capture, away from the jitter block
+            # that SAMP-M3 / CALM-M3 / NORM-M1 own.  The clamp-bind test on
+            # dt_act is mathematically identical to testing the pre-clip
+            # operands.
+            self._capture_step_diagnostics(grids, dt, dt_act, stats)
         self._grids = grids
         self._dt_prev = dt
         self._substep_index += 1
         self.time += dt
         if self.age.shape[0] == self.pos.shape[0]:
             self.age = self.age + np.float32(dt)
+
+    def _capture_step_diagnostics(self, grids, dt: float, dt_act,
+                                  stats: FrameStats) -> None:
+        """Append the ERR-M1 step-control signals for this substep.
+
+        Gated behind the internal (non-Params) ``_collect_step_diagnostics``
+        attribute so the default path is bit-identical and pays nothing.
+        Fractions are normalised by valid-face counts, never by total face
+        count (window-shape dependent).
+        """
+
+        xp = self.be.xp
+        p = self.p
+        n = self.pos.shape[0]
+        if n:
+            bind = (dt_act <= 0.0) | (dt_act >= 2.0 * dt)
+            stats.clamp_bind_fractions.append(
+                float(bind.sum()) / float(n))
+        else:
+            stats.clamp_bind_fractions.append(0.0)
+
+        marginal = 0.0
+        subthreshold = 0.0
+        valid_total = 0.0
+        for g in ("u", "v", "w"):
+            m = grids[g + "_m"]
+            valid = grids[g + "_valid"]
+            count = float(valid.sum())
+            valid_total += count
+            marginal += float((valid & (m < 0.25 * self.m0)).sum())
+            subthreshold += float(((m > 0.0) & (m <= p.eps_m)).sum())
+        denom = max(valid_total, 1.0)
+        stats.undersampled_marginal_fractions.append(marginal / denom)
+        stats.undersampled_subthreshold_fractions.append(
+            subthreshold / denom)
+
+        if n and float(self.sdf.min()) < 1e8:
+            sdf_at = self._sample_cells(self.sdf, self.pos)
+            speed_cells = _norm_rows(xp, self.vel) * dt / p.dx
+            near_fast = (sdf_at < 2.0 * p.dx) & (speed_cells > 2.0)
+            stats.near_solid_fast_fractions.append(
+                float(near_fast.sum()) / float(n))
+        else:
+            stats.near_solid_fast_fractions.append(0.0)
 
     def step_frame(self) -> FrameStats:
         """Advance one video frame (Algorithm 1 outer loop)."""
@@ -2444,6 +2502,7 @@ class STFLIPSolver:
             dt = min(
                 p.cfl_target * p.dx / max(vmax, 1e-6), segment_rem
             )
+            dt_before_capillary = dt
             if p.surface_tension > 0.0:
                 # Capillary stability limit (Brackbill et al. 1992): surface
                 # tension caps dt at O(dx^{3/2}) independently of the velocity
@@ -2456,6 +2515,12 @@ class STFLIPSolver:
                 dt = min(dt, p.st_clamp_scale * math.sqrt(
                     rho_sum * p.dx ** 3
                     / (4.0 * math.pi * p.surface_tension)))
+            if getattr(self, "_collect_step_diagnostics", False):
+                # ERR signal 6: when the capillary clamp set dt, a CFL-side
+                # guard is inert by construction -- record which regime the
+                # substep ran in.
+                stats.capillary_clamped_steps.append(
+                    bool(dt < dt_before_capillary))
             # Subdivide the remaining frame time into even parts (Alg. 1 l.7).
             dt = segment_rem / math.ceil(segment_rem / dt)
             stats.particle_cfl_estimated_values.append(vmax * dt / p.dx)
