@@ -306,6 +306,15 @@ def _run_case(config: ValidationConfig, case: ValidationCase) -> _CaseOutput:
         if case.st_enabled:
             deposition_weights = kernels.w_temporal(np, theta)
             weight_mode = "one_sided_temporal_kernel"
+            if params.exact_temporal_norm:
+                # Mirror the solver's exact Sec 3.10 conditioning so the
+                # effective-sample diagnostics describe the weights actually
+                # deposited.  Uses the solver's own recompute path.
+                gamma = solver.be.to_numpy(
+                    solver._jitter_gamma(float(solver._dt_prev)))
+                deposition_weights = deposition_weights / (
+                    kernels.w_temporal_mean(np, gamma))
+                weight_mode = "one_sided_temporal_kernel_exact_norm"
         else:
             deposition_weights = np.ones_like(theta)
             weight_mode = "instantaneous_unit_weight"

@@ -103,6 +103,13 @@ class Params:
     st_enabled: bool = True
     jitter_strength: float = 1.0      # base gamma
     adaptive_gamma: bool = True       # attenuate jitter in calm regions (Sec 3.10)
+    # Divide each particle's temporal weight by the paper's closed-form mean
+    # weight mu(gamma_p) = (945 + 105 g^2 - 21 g^4 - 5 g^6) / 1024 so that
+    # E[w] = 1 at every gamma.  The paper (Sec 3.10) skips this and accepts a
+    # bounded error: up to 7.7 percent mean weight and 3.9 percent phi_st in
+    # attenuated regions.  False reproduces that paper-faithful legacy
+    # behavior.  gamma == 1 runs are bitwise identical either way.
+    exact_temporal_norm: bool = True
     eta_phi: float = 0.5              # phase-transition steepness
     eps_m: float = 1e-9               # under-sampled face threshold
     eps_rho_rel: float = 1e-3         # eps_rho = eps_rho_rel * rho
@@ -221,7 +228,7 @@ class Params:
             ):
                 raise ValueError(f"{name} must be a positive integer")
             setattr(self, name, int(value))
-        for name in ("st_enabled", "adaptive_gamma"):
+        for name in ("st_enabled", "adaptive_gamma", "exact_temporal_norm"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
         if isinstance(self.seed, bool) or not isinstance(self.seed, numbers.Integral):
@@ -1104,6 +1111,27 @@ class STFLIPSolver:
 
     # ------------------------------------------------------------- deposition
 
+    def _jitter_gamma(self, dt: float):
+        """Per-particle jitter strength gamma_p in [0, 1] (Eq. 10, Sec 3.10).
+
+        Called at the jitter draw (end of a substep, with that substep's dt)
+        and again during the next substep's P2G (with the committed dt_prev)
+        by the exact temporal-weight normalization.  Both calls see the same
+        velocities because nothing between the draw and the next deposit
+        modifies self.vel; freshly seeded particles that never drew get a
+        velocity-recomputed value for exactly one substep (bounded by the
+        legacy error, self-healing after their first draw).
+        """
+
+        xp = self.be.xp
+        p = self.p
+        gamma = p.jitter_strength * xp.ones(
+            (self.pos.shape[0],), dtype=xp.float32)
+        if p.adaptive_gamma:
+            local_cfl = _norm_rows(xp, self.vel) * dt / p.dx
+            gamma = gamma * kernels.smoothstep(xp, 0.0, 1.0, local_cfl)
+        return gamma
+
     def _calibrate_m0(self) -> float:
         """Reference mass: expected accumulator value for a uniformly filled
         patch with ppc particles per cell and tau ~ U(-1/2, 1/2) (Sec 3.6).
@@ -1134,7 +1162,19 @@ class STFLIPSolver:
         # correctly receive zero weight instead of the clipped peak weight.
         theta = -self.dt_resid / max(dt_prev, 1e-12)
         if p.st_enabled:
-            wt = kernels.w_temporal(xp, theta).astype(xp.float32)
+            wt = kernels.w_temporal(xp, theta)
+            if p.exact_temporal_norm:
+                # Exact Sec 3.10 conditioning (roadmap NORM-M1): dividing by
+                # each particle's own mean weight mu(gamma_p) restores
+                # E[wt] = 1 at every gamma.  This removes the paper's
+                # accepted mixed-gamma face-velocity bias (up to ~2 percent
+                # of the local velocity contrast toward fast particles) and
+                # the up-to-3.9-percent phi_st depression on attenuated calm
+                # surfaces.  gamma_p is recomputed from unmodified state; see
+                # the draw-site contract comment.
+                wt = wt / kernels.w_temporal_mean(
+                    xp, self._jitter_gamma(dt_prev))
+            wt = wt.astype(xp.float32)
         else:
             wt = xp.ones_like(theta)
 
@@ -2324,10 +2364,15 @@ class STFLIPSolver:
         # Temporal jitter with residual carryover (Eq. 10-11, Alg. 1 l.23-28).
         n = self.pos.shape[0]
         if p.st_enabled and p.jitter_strength > 0.0:
-            gamma = p.jitter_strength * xp.ones((n,), dtype=xp.float32)
-            if p.adaptive_gamma:
-                local_cfl = _norm_rows(xp, self.vel) * dt / p.dx
-                gamma = gamma * kernels.smoothstep(xp, 0.0, 1.0, local_cfl)
+            # Contract: self.vel is NOT modified between this draw and the
+            # next substep's P2G (sheeting is position-only, solid-velocity
+            # enforcement runs before the draw, compaction and appends keep
+            # all particle arrays consistent), so _jitter_gamma called with
+            # the committed dt reproduces this gamma exactly at deposit
+            # time.  The exact temporal normalization (Sec 3.10, roadmap
+            # NORM-M1) relies on that; changes to the step tail must
+            # preserve it or persist gamma instead.
+            gamma = self._jitter_gamma(dt)
             xi = self.be.from_numpy(
                 self._rng.random(n, dtype=np.float32)) - 0.5
             jit = gamma * xi * dt

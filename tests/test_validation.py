@@ -132,7 +132,7 @@ def test_temporal_ablation_and_st_residual_checks_are_explicit(artifact):
             frame["temporal_state"]["quadrature"]["deposition_weight_mode"]
             for frame in case["frames"]
         }
-        assert modes == ({"one_sided_temporal_kernel"}
+        assert modes == ({"one_sided_temporal_kernel_exact_norm"}
                          if identifier.startswith("st_")
                          else {"instantaneous_unit_weight"})
 

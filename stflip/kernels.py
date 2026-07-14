@@ -35,6 +35,22 @@ def w_temporal(xp, tau):
     return xp.where(tau <= 0.5, NORM_T * w6(xp, tau - 0.5), 0.0)
 
 
+def w_temporal_mean(xp, gamma):
+    """Mean W_T weight under jitter narrowed by ``gamma`` (paper Sec 3.10).
+
+    ``integral over tau in [-1/2, 1/2] of W_T(gamma * tau) dtau
+    = (945 + 105 g^2 - 21 g^4 - 5 g^6) / 1024``, which lies in
+    ``[945/1024, 1]``.  The extremes are exact: ``mu(1) == 1.0`` bitwise in
+    float32 (945 + 105 - 21 - 5 = 1024) so full-jitter runs are unchanged by
+    the exact normalization, and ``mu(0) == W_T(0) == 945/1024`` so the
+    ``gamma -> 0`` collapse to instantaneous deposition normalizes to unit
+    weight exactly.
+    """
+
+    g2 = gamma * gamma
+    return (((-5.0 * g2 - 21.0) * g2 + 105.0) * g2 + 945.0) / 1024.0
+
+
 def smoothstep(xp, a, b, x):
     """Standard cubic ramp used for adaptive jitter attenuation."""
     s = xp.clip((x - a) / (b - a), 0.0, 1.0)
