@@ -584,6 +584,7 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         surface_tension=0.02,
         st_clamp_scale=3.0,
         st_max_dv_cells=0.5,
+        st_implicit=True,
         sparse=True,
         viscosity=0.03,
         sheeting=0.4,
@@ -619,6 +620,7 @@ def test_solver_params_include_advanced_blender_controls(monkeypatch, tmp_path):
         "surface_tension": 0.02,
         "st_clamp_scale": 3.0,
         "st_max_dv_cells": 0.5,
+        "st_implicit": True,
         "sparse": True,
         "viscosity": 0.03,
         "sheeting": 0.4,
@@ -675,7 +677,7 @@ def test_solver_params_converts_si_only_at_scene_unit_boundary(
         pressure_solver="jacobi", density_floor_relative=1e-3,
         transfer="flip", two_phase=True, rho_gas=1.2,
         gas_particles_per_cell=8, surface_tension=0.072,
-        st_clamp_scale=1.0, st_max_dv_cells=0.0,
+        st_clamp_scale=1.0, st_max_dv_cells=0.0, st_implicit=False,
         viscosity=1e-6, sheeting=0.0, sparse=False,
     )
 

@@ -102,6 +102,14 @@ CFL alone would need. Two dials trade capillary accuracy for that time back:
   potential blow-up into bounded, grid-scale interface chatter — robustness
   insurance, not accuracy. If a calm surface shows persistent fine chatter
   with a relaxed clamp, lower the Clamp Scale rather than the limiter.
+- **Implicit Capillary Stabilizer** (v0.38+) is the principled companion to
+  the Clamp Scale: an interface-concentrated implicit solve that damps the
+  stiff capillary-wave feedback instead of merely clipping it. With it
+  enabled, Clamp Scale 4–16 is workable for droplet and glugging scenes
+  (measured: a droplet at scale 8 that blows up explicitly stays bounded
+  with the stabilizer, at three small extra CG solves per substep).
+  Expect some capillary overdamping at high scales — that is the
+  accuracy-for-speed trade, and the clamp is scaled, never removed.
 
 ## Pressure solver (speed at high resolution)
 

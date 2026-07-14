@@ -85,13 +85,13 @@ def smoothed_phase_gradient(xp, phi_c, dx, iters=2):
     return phi_s, gx, gy, gz, mag
 
 
-def cell_force(xp, phi_c, dx, sigma, iters=2, eps=1e-6):
-    """Cell-centred CSF body force F = sigma * kappa * grad(phi_s).
+def cell_force_from_gradient(xp, gx, gy, gz, mag, dx, sigma, eps=1e-6):
+    """CSF force from a precomputed smoothed-phase gradient.
 
-    ``phi_c`` is the cell-centred liquid fraction in [0, 1].  Returns an
-    (nx, ny, nz, 3) force-density field (units sigma / length^2).
+    Split out so the solver can compute ``smoothed_phase_gradient`` once
+    per substep and feed BOTH the explicit predictor here and the
+    semi-implicit stabilizer (st_implicit) the same interface delta.
     """
-    _phi_s, gx, gy, gz, mag = smoothed_phase_gradient(xp, phi_c, dx, iters)
     inv = 1.0 / xp.maximum(mag, eps)
     nx_, ny_, nz_ = gx * inv, gy * inv, gz * inv
     # kappa = -div(n_hat)
@@ -103,3 +103,13 @@ def cell_force(xp, phi_c, dx, sigma, iters=2, eps=1e-6):
     f = sigma * kappa
     F = xp.stack([f * gx, f * gy, f * gz], axis=-1)
     return F.astype(xp.float32)
+
+
+def cell_force(xp, phi_c, dx, sigma, iters=2, eps=1e-6):
+    """Cell-centred CSF body force F = sigma * kappa * grad(phi_s).
+
+    ``phi_c`` is the cell-centred liquid fraction in [0, 1].  Returns an
+    (nx, ny, nz, 3) force-density field (units sigma / length^2).
+    """
+    _phi_s, gx, gy, gz, mag = smoothed_phase_gradient(xp, phi_c, dx, iters)
+    return cell_force_from_gradient(xp, gx, gy, gz, mag, dx, sigma, eps)
