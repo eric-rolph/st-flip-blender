@@ -2300,17 +2300,54 @@ class STFLIPSolver:
         h = dt_act / nsub.astype(xp.float32)
         max_n = int(nsub.max()) if nsub.size else 0
         if not track_outflows:
-            # Preserve the legacy allocation-free path when no sink
-            # classification is requested (the normal no-outflow case).
+            # Active-subset iteration (bit-identical): with jittered
+            # per-particle dt_act, sub-step counts span roughly
+            # U(0, 2 CFL), so on average half of all particle-sub-step
+            # slots are finished particles paying full RK3 gathers for a
+            # he = 0 no-op (the production profile put advection at 93
+            # percent of substep cost).  A finished particle's position
+            # is bitwise unchanged by the no-op (pos + 0.0 = pos;
+            # push-out and clamp are idempotent), so gathering only the
+            # active subset is exact.  The full-array path is kept while
+            # everyone is active to avoid index-gather overhead.
+            # The RK3 gathers are subset to the still-active particles;
+            # the collision push-out and domain clamp deliberately stay
+            # FULL-ARRAY every iteration, because the push-out is an
+            # iterative relaxation (the sampled SDF gradient is inexact,
+            # so near-margin particles converge over calls) and finished
+            # particles received those extra relaxation passes in the
+            # legacy loop.  Verified bit-identical to the legacy loop
+            # across the eight-config worktree matrix, including moving
+            # walls -- which is precisely the config that caught the
+            # skip-everything variant.
+            owned = False
             for s in range(max_n):
-                he = xp.where(s < nsub, h, 0.0).astype(xp.float32)[:, None]
-                k1 = self._sample_faces(grids, pos)
-                k2 = self._sample_faces(grids, pos + 0.5 * he * k1)
-                k3 = self._sample_faces(grids, pos + 0.75 * he * k2)
-                pos = pos + he * (
-                    2.0 * k1 + 3.0 * k2 + 4.0 * k3
-                ) / 9.0
+                active = s < nsub
+                count = int(active.sum())
+                if count == pos.shape[0]:
+                    he = h.astype(xp.float32)[:, None]
+                    k1 = self._sample_faces(grids, pos)
+                    k2 = self._sample_faces(grids, pos + 0.5 * he * k1)
+                    k3 = self._sample_faces(grids, pos + 0.75 * he * k2)
+                    pos = pos + he * (
+                        2.0 * k1 + 3.0 * k2 + 4.0 * k3
+                    ) / 9.0
+                    owned = True
+                elif count:
+                    idx = xp.nonzero(active)[0]
+                    sub = pos[idx]
+                    he = h[idx].astype(xp.float32)[:, None]
+                    k1 = self._sample_faces(grids, sub)
+                    k2 = self._sample_faces(grids, sub + 0.5 * he * k1)
+                    k3 = self._sample_faces(grids, sub + 0.75 * he * k2)
+                    sub = sub + he * (2.0 * k1 + 3.0 * k2 + 4.0 * k3) / 9.0
+                    if not owned:
+                        # Never mutate the caller's array in place.
+                        pos = pos.copy()
+                        owned = True
+                    pos[idx] = sub
                 pos = self._clamp_domain(self._push_out_of_solids(pos))
+                owned = True
             return pos
 
         volume_removed = xp.zeros((pos.shape[0],), dtype=bool)
