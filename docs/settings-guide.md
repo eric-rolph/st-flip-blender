@@ -111,6 +111,18 @@ CFL alone would need. Two dials trade capillary accuracy for that time back:
   Expect some capillary overdamping at high scales — that is the
   accuracy-for-speed trade, and the clamp is scaled, never removed.
 
+Recommended Clamp Scale per scene class (with the stabilizer on; validated
+by the physics suite — Laplace jump within 25 percent at scale 8, Rayleigh
+droplet period within 30 percent at scale 4, parasitic currents at scale 8
+below the scale-1 reference):
+
+| scene class | Clamp Scale | note |
+| --- | --- | --- |
+| droplets, glugging | 8-16 | capillary dynamics overdamped but stable |
+| thin sheets | 4-8 | expect delayed breakup at the high end |
+| crown splashes | 2-4 | rim detail is period-sensitive; stay low |
+
+
 ## Pressure solver (speed at high resolution)
 
 **Pressure Solver** chooses the preconditioner for the pressure projection:

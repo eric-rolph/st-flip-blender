@@ -1,6 +1,6 @@
 [project]
 name = "st-flip-blender"
-version = "0.39.0"
+version = "0.40.0"
 description = "ST-FLIP large-time-step liquid simulation for Blender"
 requires-python = ">=3.11"
 dependencies = ["numpy>=1.24"]
@@ -14,5 +14,6 @@ dev = ["pytest>=8.0"]
 testpaths = ["tests"]
 markers = [
     "gpu: requires an NVIDIA GPU with CuPy installed",
+    "slow: multi-frame physics validation (seconds each; still run in CI)",
 ]
 addopts = "-m 'not gpu'"
