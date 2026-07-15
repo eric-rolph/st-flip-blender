@@ -142,10 +142,20 @@ extrapolation band loop, initially suspected, measured ~12 percent and
 has since been cropped to the dilated-valid bounding box with
 early-termination (bit-identical, worktree-verified), leaving it at
 0.2 percent.  The paper's "transfers and projection dominate" holds for
-its optimized C++ implementation, not this one.  The highest-leverage
-follow-up is PER-PARTICLE advection sub-step counts: the current count
-is a global maximum-speed bound, so slow particles pay the fastest
-particle's sub-step bill; per-particle counts keep the identical
-local-CFL-1 collision guarantee while advancing calm regions in far
-fewer sub-steps (not bit-identical -- slow particles today integrate
-with unnecessarily small steps -- but the same accuracy class).
+its optimized C++ implementation, not this one.  The first follow-up
+has landed: sub-step counts were ALREADY per-particle through the
+jittered dt_act (spanning roughly U(0, 2 CFL)), but finished particles
+kept paying full RK3 gathers for he = 0 no-ops -- the active-subset
+iteration gathers only particles with sub-steps remaining, while the
+collision push-out deliberately stays full-array every iteration
+(it is an iterative relaxation, not an idempotent projection: the
+moving-wall config in the eight-scene worktree matrix falsified the
+skip-everything variant, and the shipped form is verified
+bit-identical).  Measured at 128^3 CFL 16 on the 5090: plain 10.0 ->
+7.61 s/substep and reflection 8.97 -> 6.89 (~24 percent), CFL 1
+unchanged; cumulative with the band crop, plain CFL 16 fell 11.3 ->
+7.61 (33 percent).  The remaining linear term is the global
+maximum-speed bound inside nsub itself (slow particles still take the
+fast particle's COUNT, just with early exit); replacing it with a
+per-particle reachable-speed bound would cut deeper but changes
+trajectories, so it needs its own accuracy evidence.
