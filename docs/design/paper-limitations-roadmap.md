@@ -877,6 +877,17 @@ doc records this.
 Wording note: success "resolves the K=2 linear case of O2 for this repo;
 K > 2 remains open by declared non-goal" (not "closes O2").
 
+**RUN (2026-07-14): TIME-M2 shipped (bit-identical off, all structural
+guarantees tested); TIME-M3 verdict KEEP-EXPERIMENTAL** -- calm-pool
+noise reduction exactly null (-0.06 percent vs the 20 percent target;
+the fit removes phase lag, not per-frame noise), dam KE systematically
+shifted 11 percent at 38x seed spread, smooth-swirl late-KE ratio 2.09
+(the reviewers' predicted slope feedback, with a favorable sign -- less
+dissipation -- recorded as a LEAD, not a feature), wall overhead ~0 at
+accessible scale. The paper's own thin-4D-grid negative is replicated
+with numbers. Decision record and revival conditions:
+docs/design/temporal-levels.md.
+
 ---
 
 ## Initiative CALM: calm-surface noise suppression beyond Sec. 3.10 (Limitation L3)

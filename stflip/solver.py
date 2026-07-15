@@ -177,6 +177,17 @@ class Params:
     # Where temporal MC noise dominates (calm scenes) it can lose --
     # reflection reduces SPLITTING dissipation only.
     reflection: bool = False
+    # Two-time-level slab representation (roadmap TIME, GO-gated by the
+    # TIME-M1 estimator study): 2 retains first temporal moments during
+    # P2G and reconstructs velocities linearly in tau at the slab end,
+    # removing the one-sided kernel's ~0.27 dt phase lag at the cost of
+    # ~2x-2.5x scatter work.  Phase and validity keep their zeroth-moment
+    # recipes, so the pressure system is unchanged by construction.
+    # temporal_fit_reg is the dimensionless ridge lam (units of the
+    # reference tau variance 1/12); 0.1 is the TIME-M1 recommendation,
+    # and lam -> inf degrades exactly to the one-sided mean.
+    temporal_levels: int = 1
+    temporal_fit_reg: float = 0.1
     # Per-face limiter on the explicit CSF kick: the velocity change per
     # substep is clipped so it can displace at most this many cells per
     # step (dv_max = st_max_dv_cells * dx / dt).  0 disables the limiter.
@@ -287,6 +298,15 @@ class Params:
         if self.gamma_mode not in ("speed", "surface", "deformation"):
             raise ValueError(
                 "gamma_mode must be 'speed', 'surface', or 'deformation'")
+        if (isinstance(self.temporal_levels, bool)
+                or not isinstance(self.temporal_levels, numbers.Integral)
+                or self.temporal_levels not in (1, 2)):
+            raise ValueError("temporal_levels must be 1 or 2")
+        reg = float(self.temporal_fit_reg)
+        if not math.isfinite(reg) or reg < 0.0:
+            raise ValueError(
+                "temporal_fit_reg must be finite and non-negative")
+        self.temporal_fit_reg = reg
         for name in ("two_phase", "sparse"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
@@ -1326,6 +1346,27 @@ class STFLIPSolver:
         """
         return float(self.p.particles_per_cell)
 
+    def _temporal_fit_value(self, qbar, s1w, s2w, s1q, denom):
+        """Linear-in-tau reconstruction at the slab end (roadmap TIME-M2).
+
+        Ridge-regularised W_T-weighted fit of the deposited velocity
+        moments; ``temporal_fit_reg -> inf`` degrades EXACTLY to the
+        one-sided mean ``qbar`` (never to the symmetric kernel the paper
+        rejected for oscillatory artifacts).  Phase and validity fields
+        keep their zeroth-moment recipes, so the pressure system is
+        identical to ``temporal_levels = 1`` by construction; the known,
+        deliberate inconsistency (velocities at the slab end, densities at
+        the one-sided mean time ~0.227) is documented in the TIME design.
+        """
+
+        xp = self.be.xp
+        tbar = s1w / denom
+        var = xp.maximum(s2w / denom - tbar * tbar, 0.0)
+        cov = s1q / denom - qbar * tbar
+        lam = self.p.temporal_fit_reg * (1.0 / 12.0)
+        slope = cov / (var + lam + 1e-12)
+        return qbar + slope * (0.5 - tbar)
+
     def _p2g(self, dt_prev: float, force_instantaneous: bool = False):
         """4D->3D particle-to-grid transfer (Eq. 8-9). Returns face grids.
 
@@ -1384,6 +1425,11 @@ class STFLIPSolver:
         shapes = {"u": (nx + 1, ny, nz), "v": (nx, ny + 1, nz),
                   "w": (nx, ny, nz + 1), "c": (nx, ny, nz)}
         vel_axis = {"u": 0, "v": 1, "w": 2}
+        # TIME-M2: retain first temporal moments for the linear-in-tau
+        # reconstruction.  Inactive for instantaneous deposits, where tau
+        # carries no meaning.
+        fit = (p.temporal_levels == 2 and p.st_enabled
+               and not force_instantaneous)
         apic = self._use_apic
         two = p.two_phase
         phase = self.phase
@@ -1408,6 +1454,11 @@ class STFLIPSolver:
                 xp.zeros(sh, dtype=xp.float32).ravel() if two else None)
             mom = (xp.zeros(sh, dtype=xp.float32).ravel()
                    if g != "c" else None)
+            s1w = s2w = s1q = None
+            if fit and mom is not None:
+                s1w = xp.zeros(sh, dtype=xp.float32).ravel()
+                s2w = xp.zeros(sh, dtype=xp.float32).ravel()
+                s1q = xp.zeros(sh, dtype=xp.float32).ravel()
             face_mass = (
                 xp.zeros(sh, dtype=xp.float32).ravel()
                 if two and mom is not None else None)
@@ -1449,6 +1500,15 @@ class STFLIPSolver:
                     if face_mass is not None:
                         self.be.scatter_add(face_mass, flat, momentum_weight)
                     self.be.scatter_add(mom, flat, momentum_weight * vel_a)
+                    if s1w is not None:
+                        wtau = momentum_weight * theta
+                        self.be.scatter_add(s1w, flat, wtau)
+                        self.be.scatter_add(s2w, flat, wtau * theta)
+                        self.be.scatter_add(s1q, flat, wtau * vel_a)
+            if s1w is not None:
+                grids[g + "_s1w"] = s1w.reshape(sh)
+                grids[g + "_s2w"] = s2w.reshape(sh)
+                grids[g + "_s1q"] = s1q.reshape(sh)
             grids[g + "_m"] = volume.reshape(sh)
             if liquid_volume is not None:
                 grids[g + "_ml"] = liquid_volume.reshape(sh)
@@ -1462,12 +1522,12 @@ class STFLIPSolver:
                 valid = grids[g + "_m"] > p.eps_m
                 xp.maximum(
                     face_mass, np.finfo(np.float32).tiny, out=face_mass)
-                grids[g] = xp.where(
-                    valid,
-                    grids[g + "_p"]
-                    / face_mass.reshape(sh),
-                    0.0,
-                )
+                qbar = grids[g + "_p"] / face_mass.reshape(sh)
+                if s1w is not None:
+                    qbar = self._temporal_fit_value(
+                        qbar, s1w.reshape(sh), s2w.reshape(sh),
+                        s1q.reshape(sh), face_mass.reshape(sh))
+                grids[g] = xp.where(valid, qbar, 0.0)
                 grids[g + "_valid"] = valid
                 grids[g + "_phi"] = xp.clip(
                     grids[g + "_ml"]
@@ -1483,11 +1543,13 @@ class STFLIPSolver:
             for g in ("u", "v", "w"):
                 m = grids[g + "_m"]
                 valid = m > p.eps_m
-                grids[g] = xp.where(
-                    valid,
-                    grids[g + "_p"] / xp.maximum(m, p.eps_m),
-                    0.0,
-                )
+                denom = xp.maximum(m, p.eps_m)
+                qbar = grids[g + "_p"] / denom
+                if fit:
+                    qbar = self._temporal_fit_value(
+                        qbar, grids[g + "_s1w"], grids[g + "_s2w"],
+                        grids[g + "_s1q"], denom)
+                grids[g] = xp.where(valid, qbar, 0.0)
                 grids[g + "_valid"] = valid
                 # Space-time phase field from the weight accumulators (Eq. 13):
                 # phi = C(m / (eta_phi * m0)), C(x) = min(sqrt(x), 1).
@@ -1503,6 +1565,12 @@ class STFLIPSolver:
                 0.0,
                 1.0,
             )
+        if fit:
+            # The moment accumulators are transient (roadmap TIME-M2 memory
+            # budget): free them once the reconstruction has consumed them.
+            for g in ("u", "v", "w"):
+                for suffix in ("_s1w", "_s2w", "_s1q"):
+                    grids.pop(g + suffix, None)
         return grids
 
     # ------------------------------------------------------------- grid utils
