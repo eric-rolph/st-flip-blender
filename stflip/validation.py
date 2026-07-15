@@ -1403,6 +1403,8 @@ class RotatingTankConfig:
     cfl_targets: tuple = (1.0, 4.0, 8.0, 16.0)
     angular_speed: float = 24.0
     tank_radius: float = 0.45
+    reflection: bool = False
+    pressure_solver: str = "jacobi"
 
     def __post_init__(self) -> None:
         for name in ("resolution", "frames", "particles_per_cell", "seed"):
@@ -1505,6 +1507,8 @@ def run_rotating_tank_validation(
             particles_per_cell=config.particles_per_cell,
             st_enabled=True,
             seed=config.seed,
+            reflection=config.reflection,
+            pressure_solver=config.pressure_solver,
         )
         backend = get_backend(config.backend)
         solver = STFLIPSolver(params, backend)
