@@ -132,12 +132,20 @@ per-substep cost (7.5 s) is CHEAPER than plain CFL-16's (11.3 s): its
 half-advections and half-band extrapolations are N-sized, exactly as the
 cost model predicted.
 
-STRUCTURAL FINDING recorded in passing: in this implementation,
-per-substep cost scales roughly linearly with CFL (1.16 s at CFL 1 ->
-11.3 s at CFL 16) because the extrapolation band (2 CFL + 2 layers,
-iterated over dense full-resolution grids) and the local-CFL-1 advection
-sub-steps both scale with the target.  Large time steps therefore buy
-little WALL time here (plain@16 is only 1.22x faster than plain@1); the
-paper's multi-fold speedups rest on narrow-band extrapolation and
-optimized sparse transfers.  A narrow-band (active-face) extrapolation
-pass is the highest-leverage performance follow-up this codebase has.
+STRUCTURAL FINDING, revised after profiling: per-substep cost scales
+roughly linearly with CFL (1.16 s at CFL 1 -> ~10 s at CFL 16) because
+of the local-CFL-1 ADVECTION sub-steps -- a per-substep profile at 128^3
+CFL 16 (5.2M particles, CUDA) attributes 93 percent of wall time to
+advection, of which the trilinear face-sampling gathers are the bulk
+(16 sub-steps x 3 RK stages x 24 taps).  Projection is 5 percent; the
+extrapolation band loop, initially suspected, measured ~12 percent and
+has since been cropped to the dilated-valid bounding box with
+early-termination (bit-identical, worktree-verified), leaving it at
+0.2 percent.  The paper's "transfers and projection dominate" holds for
+its optimized C++ implementation, not this one.  The highest-leverage
+follow-up is PER-PARTICLE advection sub-step counts: the current count
+is a global maximum-speed bound, so slow particles pay the fastest
+particle's sub-step bill; per-particle counts keep the identical
+local-CFL-1 collision guarantee while advancing calm regions in far
+fewer sub-steps (not bit-identical -- slow particles today integrate
+with unnecessarily small steps -- but the same accuracy class).

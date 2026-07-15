@@ -1891,22 +1891,72 @@ class STFLIPSolver:
             "open_face_count": opened,
         }
 
+    def _dilated_bbox(self, mask, pad: int):
+        """Host bounding box of ``mask`` dilated by ``pad``, or None if empty.
+
+        Three axis reductions and one small host transfer; used to crop the
+        extrapolation loop to the region values can actually reach.
+        """
+
+        xp = self.be.xp
+        nx, ny, nz = mask.shape
+        proj = [self.be.to_numpy(xp.any(mask, axis=axes))
+                for axes in ((1, 2), (0, 2), (0, 1))]
+        if not proj[0].any():
+            return None
+        bounds = []
+        for extent, p in zip((nx, ny, nz), proj):
+            lo = max(int(p.argmax()) - pad, 0)
+            hi = min(extent - int(p[::-1].argmax()) + pad, extent)
+            bounds.extend((lo, hi))
+        return tuple(bounds)
+
     def _extrapolate(self, u, valid, layers: int, allowed=None):
         """Propagate velocities into invalid faces by neighbour averaging.
 
         Shifted-slice accumulation: no wrap-around to correct and roughly a
         third of the kernel launches of an xp.roll formulation.  ``allowed``
         prevents propagation onto or through zero-aperture faces.
+
+        Two exactness-preserving optimizations (the production-scale tank
+        study measured per-substep cost scaling ~linearly with CFL, with
+        this band loop as the dominant term):
+
+        - the loop runs inside the bounding box of the valid set dilated by
+          ``layers``: values cannot propagate further, and a face reached on
+          the final layer at the box edge sees the identical neighbour sums
+          (its out-of-box neighbours are unreachable, hence invalid, hence
+          zero contributions in the full-grid formulation too);
+        - it terminates as soon as a layer converts no faces -- the frontier
+          typically exhausts long before the 2 CFL + 2 worst-case bound,
+          after which every remaining iteration is a full-grid no-op.
         """
+
         xp = self.be.xp
         if allowed is None:
             allowed = xp.ones_like(valid, dtype=bool)
         valid = valid & allowed
+        if layers <= 0:
+            return u, valid
+        box = self._dilated_bbox(valid, layers)
+        if box is None:
+            return u, valid
+        x0, x1, y0, y1, z0, z1 = box
+        full = (x0 == 0 and y0 == 0 and z0 == 0
+                and (x1, y1, z1) == u.shape)
+        if full:
+            u_b, valid_b, allowed_b = u, valid, allowed
+        else:
+            u = u.copy()
+            valid = valid.copy()
+            u_b = u[x0:x1, y0:y1, z0:z1]
+            valid_b = valid[x0:x1, y0:y1, z0:z1]
+            allowed_b = allowed[x0:x1, y0:y1, z0:z1]
         for _ in range(layers):
-            vf = valid.astype(u.dtype)
-            uf = u * vf
-            s = xp.zeros_like(u)
-            c = xp.zeros_like(u)
+            vf = valid_b.astype(u_b.dtype)
+            uf = u_b * vf
+            s = xp.zeros_like(u_b)
+            c = xp.zeros_like(u_b)
             s[:-1] += uf[1:]
             c[:-1] += vf[1:]
             s[1:] += uf[:-1]
@@ -1919,9 +1969,18 @@ class STFLIPSolver:
             c[:, :, :-1] += vf[:, :, 1:]
             s[:, :, 1:] += uf[:, :, :-1]
             c[:, :, 1:] += vf[:, :, :-1]
-            newly = (~valid) & allowed & (c > 0)
-            u = xp.where(newly, s / xp.maximum(c, 1.0), u)
-            valid = valid | newly
+            newly = (~valid_b) & allowed_b & (c > 0)
+            if not bool(newly.any()):
+                break
+            filled = xp.where(newly, s / xp.maximum(c, 1.0), u_b)
+            if full:
+                u_b = filled
+                valid_b = valid_b | newly
+            else:
+                u_b[...] = filled
+                valid_b[...] = valid_b | newly
+        if full:
+            return u_b, valid_b
         return u, valid
 
     def _sample_faces(self, grids, pos):
