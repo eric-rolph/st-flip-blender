@@ -65,7 +65,14 @@ plain CFL-16 substep counts, versus plain CFL-16's 0.602.  The
 energy-retention lead is therefore REAL and replicates, but reflection
 dominates it outright (1.078 at the same CFL for ~9 percent less wall
 time), so the decision stands: keep experimental, prefer
-`Params.reflection`.  A future combination study (reflection +
-temporal_levels) is the one remaining untested cell; (b) a
-production-scale visual A/B is still required before any quality claim,
-per the paper's own negative.
+`Params.reflection`.  The combination cell (reflection +
+temporal_levels, same tank and scale) has now RUN and the mechanisms
+INTERFERE: floor-relative L_z 0.935 -- worse than reflection alone
+(1.078) -- at 487 substeps versus reflection's 285 (the fit's slope
+extrapolation amplifies velocity extremes, shrinking dt) and ~10
+percent more wall time.  The plausible mechanism: the reflected mirror
+u_hat = 2 u1 - u* DOUBLES whatever estimator noise the fit adds to the
+transport field.  Do not combine; the question is closed.  (b) a
+production-scale visual A/B is still required before any
+temporal-levels quality claim, per the paper's own negative --
+reflection's own visual A/B exists (Videos/stflip_reflection_ab.mp4).
