@@ -1,0 +1,71 @@
+{
+ "resolution": 128,
+ "frames": 48,
+ "backend": "cuda",
+ "cases": [
+  {
+   "label": "plain_cfl1",
+   "cfl": 1.0,
+   "flags": {},
+   "particles": 5238784,
+   "substeps": 2249,
+   "wall_s": 2602.412228400004,
+   "lz_retention": 0.5891981823160579,
+   "ke_retention": 0.22297791718651444,
+   "lz_vs_floor": 1.0,
+   "ke_vs_floor": 1.0
+  },
+  {
+   "label": "plain_cfl8",
+   "cfl": 8.0,
+   "flags": {},
+   "particles": 5238784,
+   "substeps": 349,
+   "wall_s": 2065.369873200005,
+   "lz_retention": 0.4323611802353355,
+   "ke_retention": 0.10880415176962818,
+   "lz_vs_floor": 0.7338128209014197,
+   "ke_vs_floor": 0.48795931517566704
+  },
+  {
+   "label": "plain_cfl16",
+   "cfl": 16.0,
+   "flags": {},
+   "particles": 5238784,
+   "substeps": 189,
+   "wall_s": 2133.0130795000005,
+   "lz_retention": 0.35478943428734755,
+   "ke_retention": 0.07188986998915234,
+   "lz_vs_floor": 0.6021563625548174,
+   "ke_vs_floor": 0.3224080254055768
+  },
+  {
+   "label": "reflect_cfl16",
+   "cfl": 16.0,
+   "flags": {
+    "reflection": "True"
+   },
+   "particles": 5238784,
+   "substeps": 285,
+   "wall_s": 2147.34319520001,
+   "lz_retention": 0.6350192981509353,
+   "ke_retention": 0.2791910703419904,
+   "lz_vs_floor": 1.0777685967304935,
+   "ke_vs_floor": 1.2521018846384475
+  },
+  {
+   "label": "level2_cfl16",
+   "cfl": 16.0,
+   "flags": {
+    "temporal_levels": "2"
+   },
+   "particles": 5238784,
+   "substeps": 202,
+   "wall_s": 2348.656431700001,
+   "lz_retention": 0.42928946626771164,
+   "ke_retention": 0.10699808540230552,
+   "lz_vs_floor": 0.7285994409898434,
+   "ke_vs_floor": 0.4798595607689921
+  }
+ ]
+}

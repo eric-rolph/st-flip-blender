@@ -57,11 +57,15 @@ with the flag on (tested; no new checkpoint keys).
 ## Decision and revival conditions
 
 KEEP-EXPERIMENTAL: the flag stays for research (it is clean, gated, and
-structurally safe), no promotion. Anyone revisiting should (a) test the
-energy-retention lead properly -- rotating-tank retention study, level 2
-vs level 1 vs reflection, floor-relative, to distinguish "useful
-anti-dissipation" from "estimator artifact"; (b) require a
-production-scale visual A/B before believing any quality claim, per the
-paper's own negative. Prefer `Params.reflection` for energy retention:
-it delivers more (CFL-16 retention above the plain CFL-1 floor) with a
-physical mechanism.
+structurally safe), no promotion. The prescribed follow-up (a) has now
+RUN at production scale (128^3, 5.2M particles, CUDA;
+validation/production_tank_128.json): level-2 at CFL 16 retains
+floor-relative L_z 0.729 -- essentially plain CFL-8 grade (0.734) at
+plain CFL-16 substep counts, versus plain CFL-16's 0.602.  The
+energy-retention lead is therefore REAL and replicates, but reflection
+dominates it outright (1.078 at the same CFL for ~9 percent less wall
+time), so the decision stands: keep experimental, prefer
+`Params.reflection`.  A future combination study (reflection +
+temporal_levels) is the one remaining untested cell; (b) a
+production-scale visual A/B is still required before any quality claim,
+per the paper's own negative.
