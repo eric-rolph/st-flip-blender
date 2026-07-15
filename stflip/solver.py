@@ -128,13 +128,17 @@ class Params:
     # (opt-in until the SAMP-M5 A/B passes); "cp_rot" is an experimental
     # Cranley-Patterson comparison arm, never a production choice.
     temporal_sampling: str = "pseudo"
-    # Jitter attenuation gate (roadmap CALM-M3).  "speed" is the paper's
-    # Sec 3.10 local-CFL gate, bit-exact with earlier releases.  "surface"
-    # ADDS an interiorness term (never subtracts) so deep-liquid and
-    # deep-gas particles keep full jitter; where local CFL ~ 0 the field
-    # is temporally constant and restored jitter has no aliasing to fight,
-    # so this tier is hygiene and uniform-stratification groundwork, not a
-    # quality claim -- a null visual result is expected and fine.
+    # Jitter attenuation gate (roadmap CALM-M3/M4).  "speed" is the
+    # paper's Sec 3.10 local-CFL gate, bit-exact with earlier releases.
+    # "surface" ADDS an interiorness term (never subtracts) so deep-liquid
+    # and deep-gas particles keep full jitter; where local CFL ~ 0 the
+    # field is temporally constant and restored jitter has no aliasing to
+    # fight, so that tier is hygiene and uniform-stratification
+    # groundwork.  "deformation" (CALM-M4, speculative) replaces the
+    # speed activity with max(normal-displacement CFL, normal strain
+    # rate, grid-frame unsteadiness) plus the interiorness term, so a
+    # calm surface above a MOVING bulk (stirred pool, river) can damp
+    # where the speed gate cannot; a measured miss ships default-off.
     gamma_mode: str = "speed"
     cfl_local: float = 1.0            # advection sub-step bound
     seed: int = 0
@@ -280,8 +284,9 @@ class Params:
             raise ValueError(
                 "temporal_sampling must be 'pseudo', 'sobol_owen', "
                 "or 'cp_rot'")
-        if self.gamma_mode not in ("speed", "surface"):
-            raise ValueError("gamma_mode must be 'speed' or 'surface'")
+        if self.gamma_mode not in ("speed", "surface", "deformation"):
+            raise ValueError(
+                "gamma_mode must be 'speed', 'surface', or 'deformation'")
         for name in ("two_phase", "sparse"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
@@ -554,7 +559,7 @@ class STFLIPSolver:
             "next_particle_id": int(self._next_particle_id),
             "substep_index": int(self._substep_index),
         }
-        if (self.p.gamma_mode == "surface" and self.p.exact_temporal_norm
+        if (self.p.gamma_mode != "speed" and self.p.exact_temporal_norm
                 and self._gamma_prev is not None
                 and self._gamma_prev.shape[0] == self.pos.shape[0]):
             # Surface-mode exact normalization keys on the draw-time gamma,
@@ -1226,6 +1231,88 @@ class STFLIPSolver:
             gamma = gamma * gate
         return gamma
 
+
+    def _deformation_gamma(self, dt: float, grids, solid_c):
+        """CALM-M4 deformation-aware jitter strength (speculative tier).
+
+        Activity per particle: max of the normal-displacement CFL
+        |v_p . n_hat| dt/dx, the normal strain rate |n . D . n| dt, and the
+        grid-frame unsteadiness ||u_now - u_prev|| dt/dx; the surface-mode
+        interiorness term is added and the gate clipped to one.  The
+        SYMMETRIC strain-rate tensor is load-bearing: the full
+        velocity-gradient norm reads sqrt(2) omega under solid-body
+        rotation, which would keep gamma high on exactly the stirred-pool
+        surface this mode exists to damp.  Unsteadiness compares against
+        the previous substep's committed grids; after a restore or a
+        sparse-window shape change the term is zero for one substep, so
+        deformation-mode resume is deterministic but not bit-exact for
+        that single substep (documented; default-off mode).
+        """
+
+        xp = self.be.xp
+        p = self.p
+        dx = p.dx
+        phi_gate = xp.where(solid_c, xp.float32(1.0), grids["c_phi"])
+        phi_s = surface_tension.smooth_phase(xp, phi_gate, 2)
+        gx, gy, gz = xp.gradient(phi_s, dx)
+        mag = xp.sqrt(gx * gx + gy * gy + gz * gz)
+        inv = 1.0 / xp.maximum(mag, 1e-12)
+        nx_, ny_, nz_ = gx * inv, gy * inv, gz * inv
+
+        uc = 0.5 * (grids["u"][1:, :, :] + grids["u"][:-1, :, :])
+        vc = 0.5 * (grids["v"][:, 1:, :] + grids["v"][:, :-1, :])
+        wc = 0.5 * (grids["w"][:, :, 1:] + grids["w"][:, :, :-1])
+        dux, duy, duz = xp.gradient(uc, dx)
+        dvx, dvy, dvz = xp.gradient(vc, dx)
+        dwx, dwy, dwz = xp.gradient(wc, dx)
+        ndn = xp.abs(
+            nx_ * nx_ * dux + ny_ * ny_ * dvy + nz_ * nz_ * dwz
+            + nx_ * ny_ * (duy + dvx)
+            + nx_ * nz_ * (duz + dwx)
+            + ny_ * nz_ * (dvz + dwy))
+
+        unsteady = xp.zeros_like(uc)
+        prev = self._grids
+        if (prev and prev.get("u") is not None
+                and prev["u"].shape == grids["u"].shape):
+            pu = 0.5 * (prev["u"][1:, :, :] + prev["u"][:-1, :, :])
+            pv = 0.5 * (prev["v"][:, 1:, :] + prev["v"][:, :-1, :])
+            pw = 0.5 * (prev["w"][:, :, 1:] + prev["w"][:, :, :-1])
+            unsteady = xp.sqrt(
+                (uc - pu) ** 2 + (vc - pv) ** 2 + (wc - pw) ** 2)
+
+        # Normal displacement measured as PHASE FLUX |v . grad phi_s| dt
+        # rather than v . n_hat: the normalized direction is noise where
+        # the gradient is small (jet-front caps measured gamma 0.59 from
+        # direction noise), while the unnormalized flux is zero for
+        # tangential flow (the river case), zero in the interior, and
+        # large exactly when a particle crosses phase contours.  PHI_STEP
+        # is the phase change per substep considered fully active.
+        phi_step = 0.25
+        ghx = self._sample_cells(gx.astype(xp.float32), self.pos)
+        ghy = self._sample_cells(gy.astype(xp.float32), self.pos)
+        ghz = self._sample_cells(gz.astype(xp.float32), self.pos)
+        term1 = xp.abs(
+            self.vel[:, 0] * ghx + self.vel[:, 1] * ghy
+            + self.vel[:, 2] * ghz) * (dt / phi_step)
+        term2 = self._sample_cells(ndn.astype(xp.float32), self.pos) * dt
+        term3 = self._sample_cells(
+            unsteady.astype(xp.float32), self.pos) * (dt / dx)
+        activity = xp.maximum(term1, xp.maximum(term2, term3))
+        # Interiorness reads the SMOOTHED phase: raw c_phi carries
+        # Monte-Carlo density holes (measured: 0.70 cells in the middle of
+        # a uniformly filled box at ppc 2) that the (0.85, 0.98) band on
+        # the raw field misreads as near-surface.  The smoothed field sits
+        # at 0.93+ in true interior and ~0.3-0.6 across a real interface,
+        # so a slightly lower band separates them cleanly.
+        interior = kernels.smoothstep(
+            xp, 0.80, 0.92,
+            self._sample_cells(phi_s.astype(xp.float32), self.pos))
+        gate = xp.clip(
+            kernels.smoothstep(xp, 0.0, 1.0, activity) + interior,
+            0.0, 1.0)
+        return (p.jitter_strength * gate).astype(xp.float32)
+
     def _calibrate_m0(self) -> float:
         """Reference mass: expected accumulator value for a uniformly filled
         patch with ppc particles per cell and tau ~ U(-1/2, 1/2) (Sec 3.6).
@@ -1266,9 +1353,9 @@ class STFLIPSolver:
                 # the up-to-3.9-percent phi_st depression on attenuated calm
                 # surfaces.  gamma_p is recomputed from unmodified state; see
                 # the draw-site contract comment.
-                if p.gamma_mode == "surface":
-                    # Surface-mode gamma was persisted at the draw (the
-                    # interiorness input no longer exists).  Fresh-seeded
+                if p.gamma_mode != "speed":
+                    # Surface/deformation gamma was persisted at the draw
+                    # (its grid inputs no longer exist).  Fresh-seeded
                     # particles that never drew get the full-jitter divisor
                     # for exactly one substep: bounded in [1, 1024/945],
                     # self-healing after their first draw.
@@ -2536,6 +2623,10 @@ class STFLIPSolver:
                 gamma = self._jitter_gamma(dt, phi_gate)
                 if p.exact_temporal_norm:
                     self._gamma_prev = gamma
+            elif p.gamma_mode == "deformation":
+                gamma = self._deformation_gamma(dt, grids, solid_c)
+                if p.exact_temporal_norm:
+                    self._gamma_prev = gamma
             else:
                 gamma = self._jitter_gamma(dt)
             if p.temporal_sampling == "sobol_owen":
@@ -2842,6 +2933,10 @@ class STFLIPSolver:
                 phi_gate = xp.where(
                     solid_c, xp.float32(1.0), grids2["c_phi"])
                 gamma = self._jitter_gamma(dt, phi_gate)
+                if p.exact_temporal_norm:
+                    self._gamma_prev = gamma
+            elif p.gamma_mode == "deformation":
+                gamma = self._deformation_gamma(dt, grids2, solid_c)
                 if p.exact_temporal_norm:
                     self._gamma_prev = gamma
             else:

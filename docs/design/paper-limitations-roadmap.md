@@ -1073,7 +1073,14 @@ gamma_p = jitter_strength * clip(smoothstep(0, 1, a_p) + interior_p, 0, 1)
 - Acceptance: S2 height_std_temporal reduced >= 30 percent vs the speed
   gate at equal settings; no S1 regression; S3 jet clean; dam-break
   matched RMSE within 2 percent. On a miss: ships default-off with the
-  measured negative result documented.
+  measured negative result documented. **RUN (2026-07-14): MISS on all
+  three gates** (river roughness -5 percent vs the +30 target; still
+  pool 3.9x WORSE; dam KE 5.2 percent) -- the mechanism verifies at unit
+  level (river skin damps while the speed gate pins, rotation reads zero
+  strain, resolved fronts keep jitter) but the payoff channel does not
+  exist at accessible scale and near-surface bulk-jitter leakage
+  regresses still pools. Ships default-off, contraindicated; decision
+  record and revival conditions: docs/design/calm-m4-deformation.md.
 
 Effort total for CALM: ~6-8 focused days across four independent PRs.
 
