@@ -66,6 +66,21 @@
    "ke_retention": 0.10699808540230552,
    "lz_vs_floor": 0.7285994409898434,
    "ke_vs_floor": 0.4798595607689921
+  },
+  {
+   "label": "reflect_level2_cfl16",
+   "cfl": 16.0,
+   "flags": {
+    "reflection": "True",
+    "temporal_levels": "2"
+   },
+   "particles": 5238784,
+   "substeps": 487,
+   "wall_s": 2361.7442868,
+   "lz_retention": 0.5504532217218627,
+   "ke_retention": 0.2913910210390881,
+   "lz_vs_floor": 0.9342412082096146,
+   "ke_vs_floor": 1.306815601812928
   }
  ]
 }
