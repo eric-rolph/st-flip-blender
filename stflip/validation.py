@@ -79,8 +79,16 @@ class ValidationConfig:
     high_cfl_threshold: float = 8.0
     frame_rate: float = 24.0
     gravity_z: float = -9.81
+    # TIME-M3 threading: the matched matrix can run with the two-level
+    # temporal reconstruction so its degradation numbers can be compared
+    # ACROSS artifacts (flag on vs off, same config and seeds).
+    temporal_levels: int = 1
 
     def __post_init__(self) -> None:
+        if (isinstance(self.temporal_levels, bool)
+                or not isinstance(self.temporal_levels, int)
+                or self.temporal_levels not in (1, 2)):
+            raise ValueError("temporal_levels must be 1 or 2")
         for name in ("resolution", "frames", "particles_per_cell", "seed"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -272,6 +280,7 @@ def _params(config: ValidationConfig, case: ValidationCase) -> Params:
         particles_per_cell=config.particles_per_cell,
         st_enabled=case.st_enabled,
         seed=config.seed,
+        temporal_levels=config.temporal_levels,
     )
 
 

@@ -1,0 +1,18 @@
+{
+ "dam_ke_dev_over_seed_spread_max": 38.14236812571237,
+ "dam_ke_rel_dev_max": 0.11405914987384214,
+ "swirl_late_ke_ratio_2_over_1": 2.089393923424863,
+ "swirl_growth_2": 0.13327332659706664,
+ "swirl_growth_1": 0.07408699720058164,
+ "calm_noise_mean_1": 0.013448653048335223,
+ "calm_noise_mean_2": 0.013456339362622872,
+ "calm_noise_reduction": -0.0005715304172115854,
+ "wall_overhead": -0.0016168557450310095,
+ "elapsed_s": 109.79563650000637,
+ "gates": {
+  "dam_within_seed_spread_3x": false,
+  "swirl_no_compounding": false,
+  "calm_noise_ge_20pct": false,
+  "wall_overhead_le_45pct": true
+ }
+}
