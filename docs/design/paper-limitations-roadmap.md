@@ -368,10 +368,19 @@ design tried to measure. The matrix therefore isolates the mechanism:
   5). SAMP contributes only the PSD/height-probe requirements to that spec.
 - **SAMP-M5 -- A/B experiment + decision gate** (1 day compute/writeup).
   Requires CALM-M1 and SAMP-M1..M3. Writes docs/temporal-sampling.md with
-  numbers and renders regardless of outcome.
+  numbers and renders regardless of outcome. **RUN (2026-07-14): verdict
+  KEEP EXPERIMENTAL** -- safety gates all pass (flatness, KE floor,
+  comparative spikes, dam non-regression, bitwise resume) but the 30
+  percent low-band PSD reduction is not demonstrable at accessible scale
+  (the mechanism shows an 86 percent early-time reduction on the
+  controlled arm, but that arm self-excites and cannot gate; the CFL axis
+  never binds at 24^3; chaos/advection swamp user arms). Decision record:
+  docs/design/sampling-ab.md.
 - **SAMP-M6 (conditional on M5)** -- addon toggle, docs, experiments.py
   ablation profiles (frozen profile provenance at experiments.py:246
-  untouched; defaults stay "pseudo") (0.5 day).
+  untouched; defaults stay "pseudo") (0.5 day). **BLOCKED by the SAMP-M5
+  verdict**: promotion reopens only on production-scale evidence (see
+  docs/design/sampling-ab.md).
 - **SAMP-M7 (optional)** -- spatial Owen-Sobol seeding at solver.py:873,
   subsuming the ppc==8-only 2x2x2 stratification (solver.py:876-880);
   own mini A/B on inflow scenes (1-2 days).
