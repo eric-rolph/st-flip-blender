@@ -163,6 +163,16 @@ class Params:
     # explicit CSF loop blowing up.  No unconditional-stability proof is
     # claimed; the Brackbill clamp is scaled, never removed.
     st_implicit: bool = False
+    # Advection-reflection (roadmap ENER-M2b, Zehnder et al. 2018 adapted
+    # to slab-integrated P2G): two half-advections through PROJECTED
+    # fields with a mid-step reflected momentum update, halving the
+    # first-order splitting's energy/angular-momentum loss per unit
+    # physical time at roughly the grid cost of two substeps.  Enable it
+    # when RAISING Target CFL (reflection at 2N costs about the same
+    # grid work as plain at N); pair with pressure_solver="multigrid".
+    # Where temporal MC noise dominates (calm scenes) it can lose --
+    # reflection reduces SPLITTING dissipation only.
+    reflection: bool = False
     # Per-face limiter on the explicit CSF kick: the velocity change per
     # substep is clipped so it can displace at most this many cells per
     # step (dv_max = st_max_dv_cells * dx / dt).  0 disables the limiter.
@@ -252,7 +262,7 @@ class Params:
                 raise ValueError(f"{name} must be a positive integer")
             setattr(self, name, int(value))
         for name in ("st_enabled", "adaptive_gamma", "exact_temporal_norm",
-                     "st_implicit"):
+                     "st_implicit", "reflection"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
         if isinstance(self.seed, bool) or not isinstance(self.seed, numbers.Integral):
@@ -1229,7 +1239,7 @@ class STFLIPSolver:
         """
         return float(self.p.particles_per_cell)
 
-    def _p2g(self, dt_prev: float):
+    def _p2g(self, dt_prev: float, force_instantaneous: bool = False):
         """4D->3D particle-to-grid transfer (Eq. 8-9). Returns face grids.
 
         In two-phase mode, ``*_m``/``*_ml`` remain volume-normalized sampling
@@ -1245,7 +1255,7 @@ class STFLIPSolver:
         # out-of-slab samples (possible after abrupt adaptive-dt changes)
         # correctly receive zero weight instead of the clipped peak weight.
         theta = -self.dt_resid / max(dt_prev, 1e-12)
-        if p.st_enabled:
+        if p.st_enabled and not force_instantaneous:
             wt = kernels.w_temporal(xp, theta)
             if p.exact_temporal_norm:
                 # Exact Sec 3.10 conditioning (roadmap NORM-M1): dividing by
@@ -1278,6 +1288,10 @@ class STFLIPSolver:
                 wt = wt / kernels.w_temporal_mean(xp, gamma)
             wt = wt.astype(xp.float32)
         else:
+            # Instantaneous deposition (st_enabled off, or the reflected
+            # scheme's mid-step P2G): wt = 1 is m0-consistent because m0
+            # is calibrated to E[m] with E[W_T] = 1 under uniform tau, and
+            # has strictly less temporal variance -- no recalibration.
             wt = xp.ones_like(theta)
 
         shapes = {"u": (nx + 1, ny, nz), "v": (nx, ny + 1, nz),
@@ -2347,6 +2361,9 @@ class STFLIPSolver:
             self._step_core(dt, stats)
 
     def _step_core(self, dt: float, stats: FrameStats) -> None:
+        if self.p.reflection:
+            self._step_core_reflected(dt, stats)
+            return
         xp = self.be.xp
         p = self.p
         dt_prev = self._dt_prev
@@ -2555,6 +2572,308 @@ class STFLIPSolver:
             # operands.
             self._capture_step_diagnostics(grids, dt, dt_act, stats)
         self._grids = grids
+        self._dt_prev = dt
+        self._substep_index += 1
+        self.time += dt
+        if self.age.shape[0] == self.pos.shape[0]:
+            self.age = self.age + np.float32(dt)
+
+    def _step_core_reflected(self, dt: float, stats: FrameStats) -> None:
+        """Advection-reflection substep (roadmap ENER-M2b).
+
+        The corrected scheme of record from the roadmap review: forces
+        enter particle momentum exactly once (via the mid-step reflected
+        G2P), transport ALWAYS uses a projected field (never the
+        non-solenoidal reflected field), and each half-advection travels at
+        most dt so the half-band extrapolation contract is honest.  The
+        residual-carryover induction for the composed half-clips is written
+        out in docs/design/advection-reflection.md; the randomized
+        adaptive-dt stress test in tests/test_reflection.py exercises it.
+
+        Deliberate duplication: the force/density block mirrors
+        _step_core so the default path stays byte-identical with
+        reflection off.
+        """
+
+        xp = self.be.xp
+        p = self.p
+        dt_prev = self._dt_prev
+        flip = (p.transfer == "flip")
+        self._reconcile_particle_attrs()
+
+        # (1) Slab-integrated first P2G; FLIP baseline snapshot.
+        grids = self._p2g(dt_prev)
+        alpha_u, alpha_v, alpha_w, solid_c = self._active_face_apertures()
+        open_u = alpha_u > 0.0
+        open_v = alpha_v > 0.0
+        open_w = alpha_w > 0.0
+        us_sol, vs_sol, ws_sol = self._solid_face_vel()
+        old = ({g_: grids[g_].copy() for g_ in ("u", "v", "w")}
+               if flip else None)
+
+        # (2) Forces, densities, surface tension, viscosity, no-through --
+        # the _step_core block, then a u_star snapshot for the mirror.
+        g = p.gravity
+        grids["u"] = grids["u"] + g[0] * dt
+        grids["v"] = grids["v"] + g[1] * dt
+        grids["w"] = grids["w"] + g[2] * dt
+        self._apply_forces(grids, dt)
+
+        eps_rho = p.eps_rho_rel * p.rho
+        if p.two_phase:
+            rho_u = p.rho * grids["u_phi"] + p.rho_gas * (
+                1.0 - grids["u_phi"])
+            rho_v = p.rho * grids["v_phi"] + p.rho_gas * (
+                1.0 - grids["v_phi"])
+            rho_w = p.rho * grids["w_phi"] + p.rho_gas * (
+                1.0 - grids["w_phi"])
+            active = (grids["c_m"] > p.eps_m) & (~solid_c)
+        else:
+            rho_u = p.rho * grids["u_phi"]
+            rho_v = p.rho * grids["v_phi"]
+            rho_w = p.rho * grids["w_phi"]
+            active = (grids["c_phi"] >= 0.5) & (~solid_c)
+        inv_rho_u = 1.0 / xp.maximum(rho_u, eps_rho)
+        inv_rho_v = 1.0 / xp.maximum(rho_v, eps_rho)
+        inv_rho_w = 1.0 / xp.maximum(rho_w, eps_rho)
+
+        if p.surface_tension > 0.0:
+            _phi_s, st_gx, st_gy, st_gz, st_mag = (
+                surface_tension.smoothed_phase_gradient(
+                    xp, grids["c_phi"], p.dx, p.st_smooth_iters))
+            F = surface_tension.cell_force_from_gradient(
+                xp, st_gx, st_gy, st_gz, st_mag, p.dx, p.surface_tension)
+            fu = xp.zeros_like(grids["u"])
+            fu[1:-1] = 0.5 * (F[1:, :, :, 0] + F[:-1, :, :, 0])
+            fv = xp.zeros_like(grids["v"])
+            fv[:, 1:-1] = 0.5 * (F[:, 1:, :, 1] + F[:, :-1, :, 1])
+            fw = xp.zeros_like(grids["w"])
+            fw[:, :, 1:-1] = 0.5 * (F[:, :, 1:, 2] + F[:, :, :-1, 2])
+            ku = dt * fu * inv_rho_u
+            kv = dt * fv * inv_rho_v
+            kw = dt * fw * inv_rho_w
+            if p.st_max_dv_cells > 0.0:
+                dv_max = p.st_max_dv_cells * p.dx / dt
+                ku = xp.clip(ku, -dv_max, dv_max)
+                kv = xp.clip(kv, -dv_max, dv_max)
+                kw = xp.clip(kw, -dv_max, dv_max)
+            grids["u"] = grids["u"] + ku
+            grids["v"] = grids["v"] + kv
+            grids["w"] = grids["w"] + kw
+            if p.st_implicit:
+                for axis, gname, rho_f, open_f in (
+                    (0, "u", rho_u, open_u),
+                    (1, "v", rho_v, open_v),
+                    (2, "w", rho_w, open_w),
+                ):
+                    delta = st_implicit.face_delta(xp, st_mag, axis)
+                    dof = grids[gname + "_valid"] & open_f
+                    ekx, eky, ekz = st_implicit.edge_coefficients(
+                        xp, delta, dof, dt, p.surface_tension, p.dx)
+                    grids[gname], st_iters, st_rel = (
+                        st_implicit.stabilize_component(
+                            xp, grids[gname],
+                            xp.maximum(rho_f, eps_rho), ekx, eky, ekz,
+                            dof, tol=p.pcg_tol,
+                            max_iter=p.pcg_max_iter))
+                    stats.st_cg_iters.append(st_iters)
+                    stats.st_cg_rel_residuals.append(st_rel)
+
+        if p.viscosity > 0.0:
+            coef = dt * p.viscosity / (p.dx * p.dx)
+            grids["u"] = viscosity.diffuse_component(
+                xp, grids["u"], coef, ~open_u, us_sol,
+                tol=p.visc_tol, max_iter=p.visc_max_iter)
+            grids["v"] = viscosity.diffuse_component(
+                xp, grids["v"], coef, ~open_v, vs_sol,
+                tol=p.visc_tol, max_iter=p.visc_max_iter)
+            grids["w"] = viscosity.diffuse_component(
+                xp, grids["w"], coef, ~open_w, ws_sol,
+                tol=p.visc_tol, max_iter=p.visc_max_iter)
+
+        grids["u"] = xp.where(open_u, grids["u"], us_sol)
+        grids["v"] = xp.where(open_v, grids["v"], vs_sol)
+        grids["w"] = xp.where(open_w, grids["w"], ws_sol)
+        u_star = {g_: grids[g_].copy() for g_ in ("u", "v", "w")}
+
+        # (3) First projection: u1, the (solenoidal) transport field.
+        self._project(
+            grids, dt, stats,
+            (alpha_u, alpha_v, alpha_w),
+            (open_u, open_v, open_w),
+            (us_sol, vs_sol, ws_sol),
+            (inv_rho_u, inv_rho_v, inv_rho_w),
+            active,
+        )
+
+        # (4) Reflected field u_hat = 2 u1 - u_star ONLY on open faces
+        # that were valid in the first P2G AND carry meaningful phase
+        # support; eps_rho-clamped near-interface faces must not get
+        # their projection residual doubled.  Never used for transport.
+        u_hat = {}
+        for gname, open_f, sfv in (
+            ("u", open_u, us_sol), ("v", open_v, vs_sol),
+            ("w", open_w, ws_sol),
+        ):
+            mirror = (open_f & grids[gname + "_valid"]
+                      & (grids[gname + "_phi"] >= 0.5))
+            u_hat[gname] = xp.where(
+                mirror, 2.0 * grids[gname] - u_star[gname], grids[gname])
+            u_hat[gname] = xp.where(open_f, u_hat[gname], sfv)
+
+        # (5) Half-band extrapolation with the SAME valid masks for the
+        # transport field, the reflected field, and the FLIP baseline.
+        half_layers = int(math.ceil(p.cfl_target)) + 2
+        for gname, face_open, sfv in (
+            ("u", open_u, us_sol), ("v", open_v, vs_sol),
+            ("w", open_w, ws_sol),
+        ):
+            valid = grids[gname + "_valid"] & face_open
+            grids[gname], _ = self._extrapolate(
+                grids[gname], valid, half_layers, allowed=face_open)
+            grids[gname] = xp.where(face_open, grids[gname], sfv)
+            u_hat[gname], _ = self._extrapolate(
+                u_hat[gname], valid, half_layers, allowed=face_open)
+            u_hat[gname] = xp.where(face_open, u_hat[gname], sfv)
+            if flip:
+                old[gname], _ = self._extrapolate(
+                    old[gname], valid, half_layers, allowed=face_open)
+                old[gname] = xp.where(face_open, old[gname], sfv)
+
+        # (6) Mid-step reflection G2P: forces and the reflected pressure
+        # impulse enter particle momentum exactly once.  FLIP takes the
+        # pure delta interp(u_hat - old), which equals the plain delta
+        # interp(u1 - old) plus the reflected impulse interp(u1 - u_star);
+        # PIC and APIC are replacement transfers and read u_hat directly.
+        u_hat_p = self._sample_faces(u_hat, self.pos)
+        if p.transfer == "apic":
+            self.vel, self.C = self._g2p_apic(u_hat, self.pos, u_hat_p)
+        elif p.transfer == "pic":
+            self.vel = u_hat_p
+        else:
+            u_old_p = self._sample_faces(old, self.pos)
+            self.vel = self.vel + (u_hat_p - u_old_p)
+        if self.solid_vel is not None:
+            self._enforce_solid_velocity()
+
+        # (7) First half-advection through u1.  The clip upper bound dt
+        # keeps each half within cfl_target cells (the half band above)
+        # and total per-substep travel <= 2 dt (the _band contract).
+        dt_act1 = xp.clip(dt / 2.0 + self.dt_resid, 0.0, dt)
+        r1 = (dt / 2.0 + self.dt_resid - dt_act1).astype(xp.float32)
+        has_outflows = (
+            self._has_volume_outflow or self._has_pressure_outflow)
+        if has_outflows and self.pos.shape[0]:
+            advected, volume_removed, pressure_removed = self._advect(
+                grids, self.pos, dt_act1, track_outflows=True)
+            keep = ~(volume_removed | pressure_removed)
+            self._apply_outflow_filter(
+                advected, volume_removed, pressure_removed, stats)
+            r1 = r1[keep]
+        else:
+            self.pos = self._advect(grids, self.pos, dt_act1)
+
+        # (8) Instantaneous second P2G (wt = 1) + its FLIP baseline.
+        grids2 = self._p2g(dt, force_instantaneous=True)
+        old2 = ({g_: grids2[g_].copy() for g_ in ("u", "v", "w")}
+                if flip else None)
+
+        # (9) Face densities and the active mask from the second deposit.
+        # Do NOT re-apply forces: they already reached particle momentum
+        # in (6) and are inside this deposit.  Step-start apertures and
+        # wall velocities are reused (walls at t^n, O(dt) consistent).
+        if p.two_phase:
+            rho_u2 = p.rho * grids2["u_phi"] + p.rho_gas * (
+                1.0 - grids2["u_phi"])
+            rho_v2 = p.rho * grids2["v_phi"] + p.rho_gas * (
+                1.0 - grids2["v_phi"])
+            rho_w2 = p.rho * grids2["w_phi"] + p.rho_gas * (
+                1.0 - grids2["w_phi"])
+            active2 = (grids2["c_m"] > p.eps_m) & (~solid_c)
+        else:
+            rho_u2 = p.rho * grids2["u_phi"]
+            rho_v2 = p.rho * grids2["v_phi"]
+            rho_w2 = p.rho * grids2["w_phi"]
+            active2 = (grids2["c_phi"] >= 0.5) & (~solid_c)
+        inv_rho2 = (
+            1.0 / xp.maximum(rho_u2, eps_rho),
+            1.0 / xp.maximum(rho_v2, eps_rho),
+            1.0 / xp.maximum(rho_w2, eps_rho),
+        )
+        grids2["u"] = xp.where(open_u, grids2["u"], us_sol)
+        grids2["v"] = xp.where(open_v, grids2["v"], vs_sol)
+        grids2["w"] = xp.where(open_w, grids2["w"], ws_sol)
+
+        # (10) Second projection, extrapolation, final G2P.
+        self._project(
+            grids2, dt, stats,
+            (alpha_u, alpha_v, alpha_w),
+            (open_u, open_v, open_w),
+            (us_sol, vs_sol, ws_sol),
+            inv_rho2,
+            active2,
+        )
+        self._extrapolate_valid_faces(
+            grids2, old2,
+            (open_u, open_v, open_w),
+            (us_sol, vs_sol, ws_sol),
+            half_layers,
+        )
+        u_new = self._sample_faces(grids2, self.pos)
+        if p.transfer == "apic":
+            self.vel, self.C = self._g2p_apic(grids2, self.pos, u_new)
+        elif p.transfer == "pic":
+            self.vel = u_new
+        else:
+            u_old2 = self._sample_faces(old2, self.pos)
+            a = p.flip_blend
+            self.vel = (a * (self.vel + (u_new - u_old2))
+                        + (1.0 - a) * u_new)
+        if self.solid_vel is not None:
+            self._enforce_solid_velocity()
+
+        # (11) Second-half jitter with fresh velocities.  Unclamped, this
+        # gives dt_resid = -gamma xi dt, the paper's stationary
+        # distribution; the NORM vel-immutability contract holds because
+        # only positions change after this draw.
+        n = self.pos.shape[0]
+        if p.st_enabled and p.jitter_strength > 0.0:
+            if p.gamma_mode == "surface":
+                phi_gate = xp.where(
+                    solid_c, xp.float32(1.0), grids2["c_phi"])
+                gamma = self._jitter_gamma(dt, phi_gate)
+                if p.exact_temporal_norm:
+                    self._gamma_prev = gamma
+            else:
+                gamma = self._jitter_gamma(dt)
+            if p.temporal_sampling == "sobol_owen":
+                xi = sampling.temporal_xi(
+                    xp, self.particle_id, self._substep_index, p.seed)
+            elif p.temporal_sampling == "cp_rot":
+                xi = sampling.temporal_xi_cp_rot(
+                    xp, self.particle_id, self._substep_index, p.seed)
+            else:
+                xi = self.be.from_numpy(
+                    self._rng.random(n, dtype=np.float32)) - 0.5
+            jit = gamma * xi * dt
+        else:
+            jit = xp.zeros((n,), dtype=xp.float32)
+        dt_act2 = xp.clip(dt / 2.0 + r1 + jit, 0.0, dt)
+        self.dt_resid = (dt / 2.0 + r1 - dt_act2).astype(xp.float32)
+
+        # (12) Second half-advection through grids2; commit.
+        if has_outflows and self.pos.shape[0]:
+            advected, volume_removed, pressure_removed = self._advect(
+                grids2, self.pos, dt_act2, track_outflows=True)
+            self._apply_outflow_filter(
+                advected, volume_removed, pressure_removed, stats)
+        else:
+            self.pos = self._advect(grids2, self.pos, dt_act2)
+        if p.sheeting > 0.0:
+            self._apply_sheeting()
+        if getattr(self, "_collect_step_diagnostics", False):
+            self._capture_step_diagnostics(grids2, dt, dt_act2, stats)
+        self._grids = grids2
         self._dt_prev = dt
         self._substep_index += 1
         self.time += dt
