@@ -113,15 +113,31 @@ retention tells the same story (0.262 at reflection-16 vs 0.043 at
 plain-8).  Hydrostatic still pool stays calm, the dam still falls,
 two-phase/APIC/PIC/outflow/resume all pass in tests/test_reflection.py.
 
-Wall-clock gate -- honestly failed at study scale: the roadmap asked
-reflection@16 within 1.1x of plain@8; measured 1.31x (jacobi AND
-multigrid identically).  The mechanism: at 32^3 wall time is dominated by
-CFL-independent per-frame work (plain@16 with HALF the substeps of
-plain@8 runs only 9 percent faster), so halving substeps cannot pay for
-doubled transfers.  The per-substep grid-cost ratio is 1.43x -- BETTER
-than the design's predicted 1.9-2.0x -- so the cost model holds; the
-scene scale does not exercise it.  Production-scale wall-clock evaluation
-(where substeps dominate) is the remaining open item; until then the
-product framing is: an opt-in QUALITY control for raised Target CFL at
-~1.3-1.4x small-scale cost, delivering angular-momentum retention that no
-amount of plain sub-stepping reaches.
+Wall-clock gate -- failed at study scale (1.31x at 32^3, where
+CFL-independent per-frame work dominates), then **PASSED at production
+scale**: 128^3, 5.2M particles, 48 frames, RTX 5090 CUDA
+(validation/production_tank_128.json):
+
+| case | substeps | wall | L_z vs floor | KE vs floor |
+| --- | --- | --- | --- | --- |
+| plain CFL 1 (floor) | 2249 | 2602 s | 1.000 | 1.000 |
+| plain CFL 8 | 349 | 2065 s | 0.734 | 0.488 |
+| plain CFL 16 | 189 | 2133 s | 0.602 | 0.322 |
+| **reflection CFL 16** | 285 | **2147 s** | **1.078** | **1.252** |
+
+Reflection at CFL 16 costs 1.04x plain at CFL 8 (gate <= 1.1x) while
+retaining MORE angular momentum and kinetic energy than the CFL-1 floor
+-- the 32^3 headline replicates at production scale.  Reflection's
+per-substep cost (7.5 s) is CHEAPER than plain CFL-16's (11.3 s): its
+half-advections and half-band extrapolations are N-sized, exactly as the
+cost model predicted.
+
+STRUCTURAL FINDING recorded in passing: in this implementation,
+per-substep cost scales roughly linearly with CFL (1.16 s at CFL 1 ->
+11.3 s at CFL 16) because the extrapolation band (2 CFL + 2 layers,
+iterated over dense full-resolution grids) and the local-CFL-1 advection
+sub-steps both scale with the target.  Large time steps therefore buy
+little WALL time here (plain@16 is only 1.22x faster than plain@1); the
+paper's multi-fold speedups rest on narrow-band extrapolation and
+optimized sparse transfers.  A narrow-band (active-face) extrapolation
+pass is the highest-leverage performance follow-up this codebase has.
