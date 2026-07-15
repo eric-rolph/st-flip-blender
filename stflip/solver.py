@@ -2239,6 +2239,11 @@ class STFLIPSolver:
             raise pressure.PressureSolveError(iters, rel, p.pcg_tol)
 
         pm = pr * active
+        if getattr(self, "_collect_step_diagnostics", False):
+            # Physics-validation capture (CAP-M3): the Laplace-jump test
+            # reads the solved pressure directly.  Diagnostics-gated, so
+            # the default path allocates nothing.
+            self._last_pressure = pm
         gradx = (pm[1:, :, :] - pm[:-1, :, :]) / p.dx
         correction = dt * inv_rho_u[1:-1, :, :] * gradx
         grids["u"][1:-1, :, :] -= xp.where(
