@@ -52,3 +52,31 @@ resolution >= 128) showing a visible or measured low-band improvement.
 The samplers, the metric, and this tool all exist; the experiment is one
 command on a bigger machine budget. Until then: opt-in, experimental,
 safe.
+
+## Production-scale revival: RUN, and the gate failed -- KILL promotion
+
+Measured 2026-07-16 (validation/samp_scale_128.json): the gated L3 arm
+(drop into a quiescent pool) at 128^3, CFL 8, 48 frames, CUDA,
+2 samplers x 8 seeds, the probe/PSD machinery above verbatim.
+Sampler-neutral overrides for production scale only:
+pressure_solver="multigrid", pcg_max_iter=1600 (the 24^3 Jacobi budget
+stalls at 128^3).
+
+The reopening condition was genuinely met this time: the CFL target
+BOUND on 44 of 48 frames (mean 3.17 substeps/frame) -- the large
+binding steps over calm water that the 24^3 study could never reach.
+And the answer is now definitive:
+
+| gate | outcome |
+| --- | --- |
+| low-band PSD reduction >= 30 percent | **fail** -- +10.6 percent +/- 16.6 (SE exceeds the mean; seed-dominated) |
+| spatial flatness no worse | pass (ratio 1.02) |
+| spurious-KE floor no worse | pass (ratio 0.97) |
+| no sampler-specific spectral spikes | pass (3.03 pseudo vs 3.52 sobol, same regime) |
+
+The mechanism the controlled arm isolated at early times simply does
+not survive contact with a chaotic splash even at production scale and
+binding CFL. The promotion question is CLOSED as a kill:
+`temporal_sampling = "sobol_owen"` remains a safe, documented,
+experimental opt-in; SAMP-M6 (default promotion / addon toggle) will
+not proceed, and no further budget should be spent on it.
