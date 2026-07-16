@@ -1065,7 +1065,8 @@ class STFLIPSolver:
     def add_force(self, force_type: str, strength: float, *,
                   direction=(0.0, 0.0, 1.0), center=(0.0, 0.0, 0.0),
                   axis=(0.0, 0.0, 1.0), radius: float = 1e9,
-                  scale: float = 1.0, seed: int = 0) -> None:
+                  scale: float = 1.0, seed: int = 0,
+                  t_start: float = 0.0, t_end: float = math.inf) -> None:
         """Register an art-directable body force applied like gravity.
 
         ``force_type`` is 'DIRECTIONAL' (wind along ``direction``), 'VORTEX'
@@ -1075,6 +1076,10 @@ class STFLIPSolver:
         from the flow's own vorticity; a look control that injects energy).
         ``strength`` is the acceleration magnitude. ``center`` is solver-local;
         ``direction`` and ``axis`` are normalized world-oriented vectors.
+        ``t_start``/``t_end`` bound the force's active window in solver
+        time (defaults keep it always on, bit-identical to the
+        unwindowed behavior); a force applies to a substep when the
+        substep's START time lies in [t_start, t_end).
         """
         ft = str(force_type).strip().upper()
         if ft not in {"DIRECTIONAL", "VORTEX", "TURBULENCE", "CONFINEMENT"}:
@@ -1083,12 +1088,16 @@ class STFLIPSolver:
                 "or CONFINEMENT")
         if not math.isfinite(float(strength)):
             raise ValueError("force strength must be finite")
+        t0, t1 = float(t_start), float(t_end)
+        if math.isnan(t0) or math.isnan(t1) or t1 <= t0:
+            raise ValueError("force window requires t_start < t_end")
         self._forces.append({
             "type": ft, "strength": float(strength),
             "direction": tuple(float(v) for v in direction),
             "center": tuple(float(v) for v in center),
             "axis": tuple(float(v) for v in axis),
             "radius": float(radius), "scale": float(scale), "seed": int(seed),
+            "t_start": t0, "t_end": t1,
         })
 
     def _apply_forces(self, grids, dt: float) -> None:
@@ -1100,6 +1109,8 @@ class STFLIPSolver:
         origin = self._frame_origin_cells
         accel = None
         for f in self._forces:
+            if not (f["t_start"] <= self.time < f["t_end"]):
+                continue
             ft = f["type"]
             if ft == "DIRECTIONAL":
                 a = forces.directional_accel(
