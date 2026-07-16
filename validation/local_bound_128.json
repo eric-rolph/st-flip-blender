@@ -1,0 +1,51 @@
+{
+ "resolution": 128,
+ "frames": 48,
+ "cfl": 16.0,
+ "cases": [
+  {
+   "label": "plain_global_cfl16",
+   "bound": "global",
+   "reflection": false,
+   "particles": 5238784,
+   "substeps": 187,
+   "wall_s": 1530.2,
+   "s_per_substep": 8.183,
+   "lz_retention": 0.3550726853711821,
+   "ke_retention": 0.07203736401385336
+  },
+  {
+   "label": "plain_local_cfl16",
+   "bound": "local",
+   "reflection": false,
+   "particles": 5238784,
+   "substeps": 177,
+   "wall_s": 974.2,
+   "s_per_substep": 5.504,
+   "lz_retention": 0.34753541325626064,
+   "ke_retention": 0.06897740870047793
+  },
+  {
+   "label": "reflect_global_cfl16",
+   "bound": "global",
+   "reflection": true,
+   "particles": 5238784,
+   "substeps": 282,
+   "wall_s": 1651.0,
+   "s_per_substep": 5.855,
+   "lz_retention": 0.631552027055388,
+   "ke_retention": 0.2782241227974084
+  },
+  {
+   "label": "reflect_local_cfl16",
+   "bound": "local",
+   "reflection": true,
+   "particles": 5238784,
+   "substeps": 285,
+   "wall_s": 1220.2,
+   "s_per_substep": 4.281,
+   "lz_retention": 0.6320909961283772,
+   "ke_retention": 0.2772040567414727
+  }
+ ]
+}

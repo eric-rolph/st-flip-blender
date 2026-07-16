@@ -158,4 +158,8 @@ unchanged; cumulative with the band crop, plain CFL 16 fell 11.3 ->
 maximum-speed bound inside nsub itself (slow particles still take the
 fast particle's COUNT, just with early exit); replacing it with a
 per-particle reachable-speed bound would cut deeper but changes
-trajectories, so it needs its own accuracy evidence.
+trajectories, so it needs its own accuracy evidence.  That follow-up
+has since LANDED behind `Params.advection_bound="local"` (PERF-M1):
+per-substep cost fell a further 0.67x (plain) / 0.73x (reflection) at
+128^3 CFL 16 with the accuracy gates passed -- see
+[local-speed-advection.md](local-speed-advection.md).
