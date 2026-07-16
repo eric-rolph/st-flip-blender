@@ -337,6 +337,33 @@ class STFLIPSettings(bpy.types.PropertyGroup):
                     "Large speed/memory win for localized free-surface flows; "
                     "disengages when outflows or cut-cell solids are present",
     )
+    reflection: BoolProperty(
+        name="Advection Reflection", default=False,
+        description="Advect through freshly projected fields with a "
+                    "mid-step reflected momentum update, roughly halving "
+                    "the splitting scheme's energy loss. Enable Reflection "
+                    "when raising Target CFL: reflection at double the CFL "
+                    "costs about the same grid work as plain stepping; "
+                    "pairs well with the Multigrid pressure solver",
+    )
+    advection_bound: EnumProperty(
+        name="Advection Bound",
+        items=[
+            ("global", "Global",
+             "Size every particle's advection sub-steps from the "
+             "domain-wide maximum speed (matches earlier releases "
+             "bit-for-bit)"),
+            ("local", "Local",
+             "Local per-particle sub-step bound: faster in mixed "
+             "calm/fast scenes because calm regions stop paying the "
+             "splash region's sub-step count, under the same strict "
+             "local-CFL displacement contract"),
+        ],
+        default="global",
+        description="Speed bound used to size sub-stepped particle "
+                    "advection; Local is recommended alongside high "
+                    "Target CFL",
+    )
     whitewater: BoolProperty(
         name="Whitewater", default=False,
         description="Emit foam/spray/bubble secondary particles from "

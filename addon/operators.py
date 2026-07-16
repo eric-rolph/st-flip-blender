@@ -884,6 +884,8 @@ def _solver_params(settings, dims, dx, gravity, fps, unit_boundary=None):
         viscosity=units.kinematic_viscosity_si_to_solver(settings.viscosity),
         sheeting=settings.sheeting,
         sparse=settings.sparse,
+        reflection=settings.reflection,
+        advection_bound=settings.advection_bound,
     )
 
 
