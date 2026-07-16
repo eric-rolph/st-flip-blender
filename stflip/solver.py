@@ -141,6 +141,15 @@ class Params:
     # where the speed gate cannot; a measured miss ships default-off.
     gamma_mode: str = "speed"
     cfl_local: float = 1.0            # advection sub-step bound
+    # Advection sub-step bound source (roadmap PERF-M1).  "global" derives
+    # every particle's sub-step count from the domain-wide speed maximum
+    # (bit-exact with earlier releases); "local" re-bounds each sub-step
+    # from a dilated per-cell speed field so calm-region particles stop
+    # paying the splash region's sub-step count.  Same strict local-CFL
+    # displacement contract; trajectories differ (fewer, larger-in-time
+    # sub-steps where the field is slow), so it ships default-off behind
+    # the gates in docs/design/local-speed-advection.md.
+    advection_bound: str = "global"
     seed: int = 0
 
     # --- Velocity transfer (Sec 3.9) -------------------------------------
@@ -298,6 +307,8 @@ class Params:
         if self.gamma_mode not in ("speed", "surface", "deformation"):
             raise ValueError(
                 "gamma_mode must be 'speed', 'surface', or 'deformation'")
+        if self.advection_bound not in ("global", "local"):
+            raise ValueError("advection_bound must be 'global' or 'local'")
         if (isinstance(self.temporal_levels, bool)
                 or not isinstance(self.temporal_levels, numbers.Integral)
                 or self.temporal_levels not in (1, 2)):
@@ -2174,6 +2185,47 @@ class STFLIPSolver:
         maxima = [xp.max(xp.abs(grids[name])) for name in ("u", "v", "w")]
         return xp.sqrt(sum(value * value for value in maxima))
 
+    def _advection_speed_bound_grid(self, grids):
+        """Cell-centred strict bound on the sampled speed reachable from a
+        cell within one local-CFL sub-step (PERF-M1,
+        docs/design/local-speed-advection.md).
+
+        Per component the two faces bounding a cell along the component's
+        own axis are maxed; the Euclidean norm of the component maxima
+        bounds any trilinear sample whose stencil lies in the cell
+        (interpolation is a convex combination per component).  An
+        edge-clamped Chebyshev dilation of ``ceil(cfl_local) + 1`` cells
+        then covers every point an RK3 stage can evaluate during one
+        sub-step plus the one-cell staggering spill of its stencil.
+        """
+        xp = self.be.xp
+        u, v, w = grids["u"], grids["v"], grids["w"]
+        su = xp.maximum(xp.abs(u[:-1, :, :]), xp.abs(u[1:, :, :]))
+        sv = xp.maximum(xp.abs(v[:, :-1, :]), xp.abs(v[:, 1:, :]))
+        sw = xp.maximum(xp.abs(w[:, :, :-1]), xp.abs(w[:, :, 1:]))
+        radius = int(math.ceil(self.p.cfl_local)) + 1
+
+        def dilate(field):
+            for _ in range(radius):
+                for axis in range(3):
+                    lo = [slice(None)] * 3
+                    hi = [slice(None)] * 3
+                    lo[axis] = slice(None, -1)
+                    hi[axis] = slice(1, None)
+                    lo, hi = tuple(lo), tuple(hi)
+                    grown = field.copy()
+                    grown[lo] = xp.maximum(grown[lo], field[hi])
+                    grown[hi] = xp.maximum(grown[hi], field[lo])
+                    field = grown
+            return field
+
+        # Dilate each component BEFORE combining: the norm of the
+        # component-wise neighborhood maxima is what the written lemma
+        # proves (adversarial review found the tighter dilate-after-norm
+        # variant holds empirically but is not covered by the proof).
+        su, sv, sw = dilate(su), dilate(sv), dilate(sw)
+        return xp.sqrt(su * su + sv * sv + sw * sw)
+
     def _positions_in_mask(self, mask, pos):
         xp = self.be.xp
         in_domain = xp.all((pos >= 0.0) & (pos < self._domain_size_dev), axis=1)
@@ -2299,7 +2351,82 @@ class STFLIPSolver:
         nsub = xp.maximum(nsub, 1)
         h = dt_act / nsub.astype(xp.float32)
         max_n = int(nsub.max()) if nsub.size else 0
+        local_mode = p.advection_bound == "local"
+        if local_mode:
+            # Adaptive per-sub-step h (PERF-M1): each sub-step is bounded
+            # by a dilated per-cell speed field gathered at the particle's
+            # current cell, so calm-region particles finish in a few large
+            # sub-steps instead of inheriting the global count.  The
+            # global nsub above still bounds the iteration count (the
+            # local bound never exceeds the global one).  The remaining-
+            # time ledger is float64 so repeated cap-sized subtractions
+            # cannot drift past the iteration budget (adversarial review
+            # showed a float32 ledger overruns +2 headroom from ~1.2e4
+            # sub-steps); +2 headroom is kept anyway.  Contract and
+            # lemma: docs/design/local-speed-advection.md.
+            bound_grid = self._advection_speed_bound_grid(grids)
+            cell_hi = xp.asarray(
+                [extent - 1 for extent in bound_grid.shape],
+                dtype=xp.int32)
+            cap = float(p.dx) * float(p.cfl_local)
+            tiny = 1e-30
+            rem = xp.abs(dt_act).astype(xp.float64)
+            sgn = xp.where(dt_act < 0.0, -1.0, 1.0).astype(xp.float64)
+
+            def _local_cap(where):
+                cell = xp.clip(
+                    xp.floor(where / p.dx).astype(xp.int32), 0, cell_hi)
+                bound = bound_grid[cell[:, 0], cell[:, 1], cell[:, 2]]
+                return cap / xp.maximum(
+                    bound.astype(xp.float64), tiny)
+
         if not track_outflows:
+            if local_mode:
+                owned = False
+                for _ in range(max_n + 2):
+                    active = rem > 0.0
+                    count = int(active.sum())
+                    if count == 0:
+                        break
+                    if count == pos.shape[0]:
+                        hmag = xp.minimum(rem, _local_cap(pos))
+                        he = (sgn * hmag).astype(xp.float32)[:, None]
+                        k1 = self._sample_faces(grids, pos)
+                        k2 = self._sample_faces(grids, pos + 0.5 * he * k1)
+                        k3 = self._sample_faces(grids, pos + 0.75 * he * k2)
+                        pos = pos + he * (
+                            2.0 * k1 + 3.0 * k2 + 4.0 * k3
+                        ) / 9.0
+                        rem = rem - hmag
+                    else:
+                        idx = xp.nonzero(active)[0]
+                        sub = pos[idx]
+                        rem_sub = rem[idx]
+                        hmag = xp.minimum(rem_sub, _local_cap(sub))
+                        he = (sgn[idx] * hmag).astype(xp.float32)[:, None]
+                        k1 = self._sample_faces(grids, sub)
+                        k2 = self._sample_faces(grids, sub + 0.5 * he * k1)
+                        k3 = self._sample_faces(grids, sub + 0.75 * he * k2)
+                        sub = sub + he * (
+                            2.0 * k1 + 3.0 * k2 + 4.0 * k3
+                        ) / 9.0
+                        if not owned:
+                            # Never mutate the caller's array in place.
+                            pos = pos.copy()
+                        pos[idx] = sub
+                        rem[idx] = rem_sub - hmag
+                    # Push-out and clamp stay full-array (see the global
+                    # branch's rationale: the push-out is an iterative
+                    # relaxation, not an idempotent projection).
+                    pos = self._clamp_domain(self._push_out_of_solids(pos))
+                    owned = True
+                if not owned and pos.shape[0]:
+                    # No sub-step ran (every dt_act was exactly zero):
+                    # match the global branch, which still applies one
+                    # relaxation+clamp pass, and never hand the caller's
+                    # array back aliased.
+                    pos = self._clamp_domain(self._push_out_of_solids(pos))
+                return pos
             # Active-subset iteration (bit-identical): with jittered
             # per-particle dt_act, sub-step counts span roughly
             # U(0, 2 CFL), so on average half of all particle-sub-step
@@ -2358,8 +2485,24 @@ class STFLIPSolver:
                 self._volume_outflow, pos
             )
             alive = ~volume_removed
-        for s in range(max_n):
-            he = xp.where((s < nsub) & alive, h, 0.0).astype(xp.float32)[:, None]
+        for s in range(max_n + 2 if local_mode else max_n):
+            if local_mode:
+                # This path keeps its full-array structure (it never had
+                # the fast path's active-subset gathers), so local mode
+                # buys trajectory CONSISTENCY here, not speed.  The
+                # early-out host sync is amortized to every 8th
+                # iteration; in between, finished particles run he = 0
+                # no-ops exactly like the global branch.
+                stepping = alive & (rem > 0.0)
+                if s % 8 == 0 and not bool(stepping.any()):
+                    break
+                hmag = xp.where(
+                    stepping, xp.minimum(rem, _local_cap(pos)), 0.0)
+                he = (sgn * hmag).astype(xp.float32)[:, None]
+            else:
+                he = xp.where(
+                    (s < nsub) & alive, h, 0.0
+                ).astype(xp.float32)[:, None]
             k1 = self._sample_faces(grids, pos)
             k2 = self._sample_faces(grids, pos + 0.5 * he * k1)
             k3 = self._sample_faces(grids, pos + 0.75 * he * k2)
@@ -2379,6 +2522,8 @@ class STFLIPSolver:
                 alive = alive & (~exited)
             constrained = self._clamp_domain(collision_adjusted)
             pos = xp.where(alive[:, None], constrained, collision_adjusted)
+            if local_mode:
+                rem = rem - hmag
         return pos, volume_removed, pressure_removed
 
     # -------------------------------------------------- sparse active window
