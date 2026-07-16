@@ -236,6 +236,8 @@ class STFLIP_PT_solver(bpy.types.Panel):
         layout.prop(st, "viscosity")
         layout.prop(st, "sheeting")
         layout.prop(st, "sparse")
+        layout.prop(st, "reflection")
+        layout.prop(st, "advection_bound")
 
         layout.prop(st, "whitewater")
         ww = layout.column(align=True)

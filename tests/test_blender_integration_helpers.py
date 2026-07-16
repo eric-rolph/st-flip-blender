@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from stflip import cache as core_cache
+from stflip.solver import Params as SolverParams
 
 
 ROOT = Path(__file__).parents[1]
@@ -1860,6 +1861,25 @@ def test_paper_surface_properties_have_safe_defaults_and_ranges(monkeypatch):
     assert voxel_cap["min"] < voxel_cap["default"] < voxel_cap["max"]
 
 
+def test_reflection_and_advection_bound_default_off_and_match_solver(
+        monkeypatch):
+    properties = _load_surface_properties(monkeypatch)
+    settings = properties.STFLIPSettings.__annotations__
+
+    reflection = settings["reflection"]
+    assert reflection["kind"] == "BoolProperty"
+    assert reflection["default"] is SolverParams().reflection is False
+
+    bound = settings["advection_bound"]
+    assert bound["kind"] == "EnumProperty"
+    assert bound["default"] == SolverParams().advection_bound == "global"
+    identifiers = [item[0] for item in bound["items"]]
+    assert identifiers == ["global", "local"]
+    for identifier in identifiers:
+        # Every enum identifier must survive solver-side validation.
+        SolverParams(advection_bound=identifier)
+
+
 def _load_surface_panels(monkeypatch, *, rebuilding=False):
     root = "_stflip_surface_panels_test"
     for name in (root, f"{root}.addon"):
@@ -2038,6 +2058,29 @@ def test_presets_panel_exposes_final_paper_fidelity_action(monkeypatch):
 
     assert ("operator", "stflip.apply_paper_fidelity") in layout.records
     assert ("label", "Output quality:") in layout.records
+
+
+def test_solver_panel_exposes_reflection_and_advection_bound(monkeypatch):
+    panels = _load_surface_panels(monkeypatch)
+    settings = types.SimpleNamespace(
+        bake_state="IDLE",
+        st_enabled=True,
+        transfer="flip",
+        two_phase=False,
+        surface_tension=0.0,
+        whitewater=False,
+    )
+    context = types.SimpleNamespace(
+        scene=types.SimpleNamespace(stflip=settings))
+    panel = panels.STFLIP_PT_solver()
+    layout = _RecordingLayout()
+    panel.layout = layout
+
+    panel.draw(context)
+
+    props = [value for kind, value in layout.records if kind == "prop"]
+    assert props.index("sparse") < props.index("reflection")
+    assert props.index("reflection") < props.index("advection_bound")
 
 
 def test_surface_panel_freezes_rebuild_controls_but_leaves_cancel_enabled(
