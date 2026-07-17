@@ -11,7 +11,7 @@ This is an independent implementation of **ST-FLIP**:
 > Very Large Time Steps.* ACM Transactions on Graphics 45(4), Article 76,
 > SIGGRAPH 2026. <https://doi.org/10.1145/3811289>
 
-[![ST Flip Blender](https://img.youtube.com/vi/_UvYP4Lexzc/maxresdefault.jpg)](https://youtu.be/_UvYP4Lexzc)
+[![ST Flip Blender](https://img.youtube.com/vi/QHRU1TwxALs/maxresdefault.jpg)](https://youtu.be/QHRU1TwxALs)
 
 **New here?** The [User Guide](docs/README.md) has step-by-step tutorials:
 [getting started](docs/getting-started.md) ·
