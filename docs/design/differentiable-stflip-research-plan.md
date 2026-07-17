@@ -49,6 +49,51 @@ Deliverable: a table in this doc. Gate: no stage is UNRESOLVABLE for
 short-horizon (<= 2 physical seconds) unrolls. Kill: a load-bearing
 stage (projection, P2G) proves non-adjointable in practice.
 
+#### R0 result (2026-07-16): GATE PASSED
+
+A five-group, line-cited inventory of every operation in the stepping
+core ran (10 agents: per-group classification, adversarially verified
+row by row; full 86-item table with citations and verifier corrections
+in validation/r0_differentiability_inventory.json). Counts:
+
+| group | SMOOTH | FIXED-POINT | REPARAM | FREEZE | EXCLUDE |
+| --- | --- | --- | --- | --- | --- |
+| dt + temporal jitter | 9 | 0 | 2 | 7 | 2 |
+| P2G + forces | 18 | 2 | 2 | 4 | 1 |
+| projection | 6 | 2 | 0 | 3 | 3 |
+| G2P + advection | 8 | 0 | 0 | 5 | 1 |
+| topology + secondaries | 4 | 0 | 1 | 4 | 2 |
+
+No stage is unresolvable. Load-bearing findings that BIND R1's design:
+
+1. **The dt controller freeze is exact almost everywhere**, not an
+   approximation: the even-subdivision ceil makes dt piecewise-constant
+   in vmax, so recording the forward dt schedule loses gradient only on
+   the measure-zero substep-count boundaries.
+2. **dt_resid is differentiable per-particle STATE** on the tape (it
+   feeds the next substep's temporal weight and the render resync); the
+   jitter itself is REPARAM -- and the Owen sampler is a pure integer
+   hash of (particle_id, substep, seed), so the backward pass can
+   RECOMPUTE xi instead of storing it. sobol_owen is therefore the
+   PREFERRED sampler for differentiation work (an unexpected second
+   life for the SAMP machinery after its promotion kill).
+3. **Two fixed-point families** get IFT adjoints at convergence:
+   pressure CG/multigrid and the semi-implicit capillary Helmholtz --
+   both conditioned on frozen active/valid topology.
+4. **Verifier catches R1 must honor**: forces.py's confinement norms
+   have UNGUARDED sqrts (149, 154) -- exact-zero vorticity would NaN a
+   backward pass; the art-force early-outs (e.g. vortex_accel returns
+   None at strength == 0) BLOCK gradients w.r.t. a zero-initialized
+   force strength, so the differentiable port must not early-out (or
+   training must start from nonzero strengths); the reflected mirror
+   mask (phi_f >= 0.5) is a state-dependent discrete gate whose
+   freeze carries a genuine O(u1 - u*) jump at the mask boundary.
+5. Discrete freezes come with existing diagnostics: the solver already
+   measures clamp-bind fractions, giving a cheap runtime monitor for
+   when frozen-topology assumptions are being stressed.
+
+R1 may proceed.
+
 ### R1 -- minimal differentiable core (Warp, small 3D)
 
 Framework choice: **NVIDIA Warp** over JAX -- first-class Windows +

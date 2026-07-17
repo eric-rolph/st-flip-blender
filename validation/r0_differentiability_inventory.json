@@ -1,0 +1,625 @@
+{
+ "groups": [
+  {
+   "group": "dt-jitter",
+   "table": {
+    "items": [
+     {
+      "op": "vmax reduction (max particle speed feeding the CFL controller)",
+      "lines": "stflip/solver.py:3349-3350, 3363-3364, 3403-3404, 3418",
+      "class": "DISCRETE-FREEZE",
+      "note": "vmax = max over particles of |v| is itself subdifferentiable (maxpool-style: gradient to the argmax particle), but it feeds only dt, whose downstream ceil quantization (solver.py:3400) makes dt piecewise-constant in vmax. So d(dt)/d(vmax) = 0 almost everywhere and freezing the forward dt schedule is EXACT except on the measure-zero set where the substep count N changes. Record the per-substep dt sequence on the forward pass; treat each dt as a constant in the tape. Per-frame scalar derived from per-particle state (vel); not a parameter."
+     },
+     {
+      "op": "CFL dt candidate: dt = min(cfl_target*dx/max(vmax,1e-6), segment_rem)",
+      "lines": "stflip/solver.py:3377-3379",
+      "class": "DISCRETE-FREEZE",
+      "note": "min() is piecewise-smooth, and cfl_target/dx are parameters, but the same argument as vmax applies: after the even-subdivision ceil, dt within a fixed substep count is segment_rem/N, a scene constant. Freeze the whole controller output. If cfl_target were a differentiation target, its only true sensitivity is the a.e.-zero one through N, so nothing is lost."
+     },
+     {
+      "op": "capillary (Brackbill) dt clamp: dt = min(dt, st_clamp_scale*sqrt(rho_sum*dx^3/(4*pi*sigma)))",
+      "lines": "stflip/solver.py:3380-3392",
+      "class": "DISCRETE-FREEZE",
+      "note": "Smooth closed-form in the PARAMETERS sigma (surface_tension), rho, rho_gas, dx, st_clamp_scale -- no state dependence at all. Freezing dt discards d(dt)/d(sigma) when the clamp binds, but that path is again annihilated a.e. by the ceil at 3400. Caveat for the note file: if sigma is a primary learnable and the clamp is the binding constraint for the whole run, the substep COUNT is the sigma-sensitive quantity, and no smooth treatment recovers it; accept frozen N over <=2 s."
+     },
+     {
+      "op": "even frame subdivision: dt = segment_rem / ceil(segment_rem / dt)",
+      "lines": "stflip/solver.py:3399-3400",
+      "class": "DISCRETE-FREEZE",
+      "note": "ceil is the one genuinely integer decision in the controller. Freeze N per (frame, segment) at forward values; then dt = segment_rem/N is a constant (frame_dt is a fixed parameter, inflow start times are scene constants). Frozen-topology error is zero except exactly at N-transition boundaries in parameter space -- acceptable over a <=2 s horizon (<=48 frames at 1/24 s). This freeze is also what licenses treating dt and dt_prev as non-differentiated scalars everywhere below."
+     },
+     {
+      "op": "inflow segmentation and next-start selection (_next_inflow_start; segment_rem)",
+      "lines": "stflip/solver.py:3356-3376, 3423-3432",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "min over registered start times plus tolerance comparisons; pure event scheduling on scene constants (start/end times), independent of the differentiated state. Keep entirely outside the tape: it partitions the frame into segments whose boundaries do not move under any state/parameter perturbation we differentiate."
+     },
+     {
+      "op": "empty-solver idle time skip",
+      "lines": "stflip/solver.py:3352-3372",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "Fast path taken only when N_particles == 0; a rare, render/bookkeeping-side branch that cannot trigger while any differentiated fluid exists. Sound to exclude: on the empty branch there is no state to carry gradients."
+     },
+     {
+      "op": "per-particle jitter strength gamma, speed mode (_jitter_gamma): gamma = jitter_strength * smoothstep(|v|*dt/dx) [+ clipped interiorness term in surface mode]",
+      "lines": "stflip/solver.py:1245-1274 (gate 1259-1273); kernels.py:54-57",
+      "class": "SMOOTH",
+      "note": "smoothstep is C1, |v| is smooth away from v=0 (only stationary particles sit at the kink), the surface-mode phi_gate sample (_sample_cells) is a smooth interpolation, and the clip at 1272 is piecewise-linear. jitter_strength (Params, scalar) is the natural learnable parameter here; gamma itself is derived PER-PARTICLE DATA, a function of per-particle vel and the frozen dt. This is the main gradient inlet from velocities into the temporal-sampling machinery."
+     },
+     {
+      "op": "deformation-mode gamma (_deformation_gamma): phase smoothing, strain/flux/unsteadiness activity, 3-way max, smoothstep gates",
+      "lines": "stflip/solver.py:1277-1356",
+      "class": "SMOOTH",
+      "note": "Piecewise-smooth throughout: xp.gradient (linear), 1e-12-floored normalization, three-way max (subdifferentiable), smoothsteps, cell sampling. Note the unsteadiness term reads the PREVIOUS substep's committed grids (self._grids, 1316-1324), so the tape must span substeps -- already required by dt_resid. Default-off mode; lowest priority."
+     },
+     {
+      "op": "temporal jitter deviate xi, pseudo mode: rng.random(n) - 0.5",
+      "lines": "stflip/solver.py:2958-2960, 3270-3272",
+      "class": "REPARAM",
+      "note": "Noise = xi ~ U[-1/2, 1/2) per particle per substep from the NumPy Generator (state-carried; checkpointed at solver.py:569). Freeze by recording each substep's xi array on the forward pass (or replaying from the saved RNG state); given frozen xi, everything downstream is a deterministic function of gamma and dt. xi is per-particle DATA, never a parameter; seed is a non-differentiable int."
+     },
+     {
+      "op": "temporal jitter deviate xi, sobol_owen / cp_rot modes (sampling.temporal_xi, temporal_xi_cp_rot)",
+      "lines": "stflip/sampling.py:100-128, 131-146; call sites stflip/solver.py:2952-2957, 3264-3269",
+      "class": "REPARAM",
+      "note": "Noise = Owen-scrambled Sobol dim-0 (or CP-rotated van der Corput) deviate; a pure uint32-hash function of (particle_id, substep_index, seed) -- all non-differentiable integers. Inherently frozen: the backward pass can RECOMPUTE xi exactly instead of storing it, which is the memory-friendliest option for a Warp reverse-mode port. This is the preferred sampler for differentiation work."
+     },
+     {
+      "op": "jitter magnitude jit = gamma * xi * dt",
+      "lines": "stflip/solver.py:2961, 3273",
+      "class": "SMOOTH",
+      "note": "Bilinear given frozen xi and frozen dt; the whole d(loss)/d(jitter_strength) path and the vel->gamma->temporal-sample-position path flow through this product."
+     },
+     {
+      "op": "actual advection time clamp: dt_act = clip(dt + dt_resid + jit, 0, 2dt); reflected halves dt_act1 = clip(dt/2 + dt_resid, 0, dt), dt_act2 = clip(dt/2 + r1 + jit, 0, dt)",
+      "lines": "stflip/solver.py:2964, 3173, 3276",
+      "class": "SMOOTH",
+      "note": "Piecewise-linear clip: subdifferentiable, gradient exactly zero for clamp-bound particles. The solver already measures how often the flat region is hit (clamp_bind_fractions, solver.py:3311-3316); the stationary dt_resid distribution (-gamma*xi*dt) keeps dt+resid+jit inside (0, 2dt) except after abrupt adaptive-dt shrinks, so the dead-gradient population is small and transient. dt_act is per-particle DATA."
+     },
+     {
+      "op": "residual carryover update: dt_resid = dt + dt_resid - dt_act (reflected: r1 = dt/2 + dt_resid - dt_act1; dt_resid = dt/2 + r1 - dt_act2)",
+      "lines": "stflip/solver.py:2965, 3174, 3277",
+      "class": "SMOOTH",
+      "note": "Linear. dt_resid is PER-PARTICLE DIFFERENTIABLE STATE carried across substeps (already a checkpoint member, solver.py:564-566) -- it must live on the tape like pos/vel, because it is both the output of this substep's draw and the input to the next substep's P2G temporal weight (theta) and to the render-time resync advection (solver.py:3488-3506). This recursion is what makes the jitter group stateful rather than per-step i.i.d."
+     },
+     {
+      "op": "r1 residual compaction under the outflow keep mask (r1 = r1[keep])",
+      "lines": "stflip/solver.py:3180-3183",
+      "class": "DISCRETE-FREEZE",
+      "note": "The keep mask is the outflow group's topology decision; given the forward indices the gather is linear and trivially adjointable (scatter in reverse). Freezing which particles are removed over <=2 s only misassigns gradients for the small boundary population that exits the domain -- acceptable short-horizon error, consistent with however the outflow group freezes the mask itself."
+     },
+     {
+      "op": "slab-normalised sample time theta = -dt_resid / max(dt_prev, 1e-12)",
+      "lines": "stflip/solver.py:1403-1407",
+      "class": "SMOOTH",
+      "note": "Linear in dt_resid with dt_prev a frozen scalar from the dt controller (committed at solver.py:2986/3292). This is where the per-particle temporal state re-enters the P2G weights, i.e. the coupling from the jitter group into the deposition group."
+     },
+     {
+      "op": "temporal kernel polynomial W_T = NORM_T * w6(theta - 1/2) on the in-slab branch",
+      "lines": "stflip/kernels.py:21-25, 33-35; call stflip/solver.py:1409",
+      "class": "SMOOTH",
+      "note": "Degree-6 polynomial; w6's max(.,0) gives C2 contact at the LOWER support edge theta = -1/2, so that side is genuinely smooth. NORM_T = 35/16 is a fixed normalization constant, not a parameter. The instantaneous wt = 1 path (solver.py:1440-1445) is a constant and needs nothing."
+     },
+     {
+      "op": "slab-membership cut 1{theta <= 1/2} in w_temporal (the one-sided kernel's hard end)",
+      "lines": "stflip/kernels.py:33-35 (xp.where), design comment stflip/solver.py:1403-1407",
+      "class": "DISCRETE-FREEZE",
+      "note": "Unlike the lower edge, the upper cut is a JUMP from the kernel's PEAK value 35/16 to 0 (Eq. 19 peaks at tau = +1/2 by design). Freeze the where-mask at forward values (straight-through on the polynomial branch). Justification for short horizons: under the frozen dt schedule and frozen xi, theta = gamma*xi stays in [-1/2, 1/2) in steady operation, and a particle only lands past the cut after an abrupt adaptive-dt change -- exactly the regime boundaries the frozen dt schedule already excludes; each crossing perturbs the loss by O(1/N). See trickiest."
+     },
+     {
+      "op": "exact temporal normalization (NORM divisor): wt = wt / w_temporal_mean(gamma), mu(g) = (945 + 105 g^2 - 21 g^4 - 5 g^6)/1024",
+      "lines": "stflip/solver.py:1410-1438; stflip/kernels.py:38-51",
+      "class": "SMOOTH",
+      "note": "mu is a degree-6 polynomial in gamma, bounded in [945/1024, 1] and never zero, so the division is uniformly well-conditioned. Key adjoint subtlety: the SAME gamma value participates in two substeps -- at the draw (substep k, forms jit) and at the next deposit (substep k+1's divisor). Speed mode RECOMPUTES it from self.vel under the vel-immutability contract (solver.py:2929-2939, 1436-1437), so the tape must recognise that gamma(deposit) is a function of substep-k's post-G2P vel and accumulate BOTH adjoint contributions into d(vel_k). exact_temporal_norm is a boolean mode, jitter_strength the scalar parameter inside gamma."
+     },
+     {
+      "op": "gamma recompute at deposit time, speed mode: gamma = _jitter_gamma(dt_prev)",
+      "lines": "stflip/solver.py:1436-1437",
+      "class": "SMOOTH",
+      "note": "Same smoothstep pipeline as the draw, evaluated with the committed dt_prev. Differentiable as-is, but it doubles as a recomputation trick: in a Warp port this is a free rematerialisation point (recompute gamma in the backward from stored vel rather than storing gamma)."
+     },
+     {
+      "op": "persisted-gamma reconciliation at deposit (surface/deformation modes): pad fresh particles with full-jitter divisor, truncate stale tail of _gamma_prev",
+      "lines": "stflip/solver.py:1419-1435; persistence at 2940-2949, 3252-3261; checkpoint 593-603",
+      "class": "DISCRETE-FREEZE",
+      "note": "Pure index bookkeeping on frozen shapes: the concatenate/slice is linear given forward particle counts, and the padded constant divisor for never-drawn particles is bounded in [1, 1024/945] for exactly one substep (self-healing, per the comment at 1421-1425). _gamma_prev is per-particle DATA carried across one substep; in these modes it is a stale but exact function of substep-k's grids (c_phi), so its adjoint feeds back into the previous substep's deposited phase field."
+     }
+    ],
+    "trickiest": {
+     "op": "the one-sided temporal kernel's slab-end cut 1{theta <= 1/2} (kernels.py:33-35) fed by the dt_resid recursion",
+     "why": "Every other nonsmoothness in this group is a kink (clip, max, smoothstep edges) with bounded subgradients, but this one is a genuine JUMP whose height is the kernel's MAXIMUM (35/16 -> 0), because Eq. 19 deliberately peaks at tau = +1/2. Worse, the stationary jitter distribution theta = gamma*xi places probability mass arbitrarily close to that edge at the default jitter_strength = 1 (xi -> 1/2, gamma -> 1), so a perturbation of jitter_strength, or of any velocity through the adaptive-gamma gate, pushes an O(N * d(gamma)) sliver of particles across a peak-to-zero weight cliff in the NEXT substep's P2G. Straight-through freezing is still the right call over <= 2 s -- each crossing is an O(1/N) loss jump and the frozen dt schedule removes the main mechanism (abrupt adaptive-dt shrink) that puts particles past the cut -- but it is the one place where the frozen-forward gradient systematically ignores a first-order effect rather than an a.e.-zero one, and it interacts with three other items at once (dt_act clamp saturation, the exact-norm divisor whose mu(gamma) was derived assuming the un-truncated in-slab integral, and the dt controller freeze). A Warp implementation should surface a diagnostic counting near-edge particles (|theta - 1/2| < eps), analogous to the existing clamp_bind_fractions, before trusting gradients w.r.t. jitter_strength."
+    }
+   },
+   "verdict": {
+    "agree": false,
+    "corrections": [
+     "Row '_deformation_gamma' (SMOOTH, solver.py:1277-1356): the note's 'Piecewise-smooth throughout' hides a state-dependent discrete branch at solver.py:1317-1319 -- `if (prev and prev.get(\"u\") is not None and prev[\"u\"].shape == grids[\"u\"].shape)` silently ZEROES the unsteadiness term (unsteady stays xp.zeros, 1316) whenever self._grids is empty (post-restore) or the sparse active window changed shape. Under sparse mode (solver.py:2753-2765) the window shape is a discrete function of particle positions via _active_window, so this guard can flip between substeps as fluid spreads -- it is not a config constant. Keep the row SMOOTH for the math but add an explicit DISCRETE-FREEZE sub-item for this guard (freeze the branch at forward value; error bounded because the term only raises the [0,1] activity gate and the docstring at 1287-1291 documents the one-substep zeroing). A Warp port that assumes no branching here would bake in a silent tape/shape mismatch.",
+     "Row 'per-particle jitter strength gamma, speed mode': parenthetical 'gate 1259-1273' is off -- 1259-1260 is the jitter_strength*ones base; the adaptive gate is 1261-1273 (guarded by `if p.adaptive_gamma:` at 1261, itself a config constant, so SMOOTH stands). Cited outer range 1245-1274 is correct.",
+     "Row 'inflow segmentation and next-start selection': cited range 3356-3376 mostly overlaps the empty-solver branch (3357-3372) that the next row classifies separately; the segmentation op proper is 3356 (the call inside the empty branch), 3373-3376 (segment_rem), and 3423-3432 (_next_inflow_start). No class change -- DISCRETE-EXCLUDE stands (start/end times are scene constants; verified 3426-3432).",
+     "Trickiest-item wording nit (no verdict change): 'the frozen dt schedule removes the main mechanism (abrupt adaptive-dt shrink) that puts particles past the cut' is loose -- freezing REPLAYS the forward schedule including its shrinks, so forward-pass out-of-slab particles still occur (and the frozen where-mask handles them, per the comment at solver.py:1404-1406); what freezing removes is perturbation-induced NEW crossings via dt changes. The first-order boundary-term claim itself is correct: at gamma->1 (default jitter_strength=1.0, solver.py:106) with xi->1/2, a finite d(gamma) crosses an O(d) mass of particles over the 35/16->0 jump, and mu(gamma) at kernels.py:38-51 assumes the un-truncated in-slab integral, so the interaction with the exact-norm divisor is as described.",
+     "Everything else verified correct against the code: all other line citations (3349-3350/3363-3364/3403-3404/3418, 3377-3379, 3380-3392, 3399-3400, 3352-3372, 2952-2960, 3264-3272, sampling.py:100-128/131-146, 2961/3273, 2964/3173/3276, 2965/3174/3277, 3180-3183, 1403-1407, kernels.py:21-25/33-35/38-51, 1409-1445, 1419-1438, 2940-2949, 3252-3261, 564-569, 593-603, 2986/3292, 3311-3316, 3488-3506, 2929-2939); all classifications; and the trickiest-item selection. Supporting facts confirmed independently: _apply_outflow_filter compacts dt_resid (solver.py:1828) and _gamma_prev (1835-1837) under the same keep mask; freshly seeded particles append dt_resid=0 (1183-1184) so theta=0 for their first deposit; _p2g is called with the committed _dt_prev (2776/2780), which equals the dt used at the previous draw, confirming theta = gamma*xi in unclamped steady operation."
+    ]
+   }
+  },
+  {
+   "group": "p2g-forces",
+   "table": {
+    "items": [
+     {
+      "op": "Separable poly6 spatial P2G weights (per-tap 1D products)",
+      "lines": "stflip/kernels.py:21-30; stflip/solver.py:1491-1494",
+      "class": "SMOOTH",
+      "note": "w6(r)=max(0,1-r^2)^3 is C^2 and vanishes with two derivatives at |r|=1, so the deposited quantity is C^2 in particle position even across cell crossings. Warp differentiates the polynomial directly."
+     },
+     {
+      "op": "Tap base-index selection (floor) and frac decomposition",
+      "lines": "stflip/solver.py:1488-1490",
+      "class": "SMOOTH",
+      "note": "floor gets zero gradient under AD, and that is EXACT here: index changes coincide with the kernel weight vanishing at the support edge, so differentiating weights w.r.t. frac with indices held at forward values is the true gradient. No straight-through correction needed."
+     },
+     {
+      "op": "One-sided temporal kernel W_T(theta) evaluation",
+      "lines": "stflip/kernels.py:33-35; stflip/solver.py:1407-1409",
+      "class": "SMOOTH",
+      "note": "Piecewise polynomial in theta; C^2 at the trailing support edge (tau=-1/2). The one-sided cutoff at tau=+1/2 is a jump, but the residual-carryover recursion places theta strictly inside (-1/2,1/2) except at the noise-distribution endpoint or after abrupt adaptive-dt changes -- measure-zero; take the interior-branch gradient (which is 0 at the peak since w6'(0)=0, so no spike)."
+     },
+     {
+      "op": "Slab time theta = -dt_resid/dt_prev (jitter-dependent P2G input)",
+      "lines": "stflip/solver.py:1407; jitter commit stflip/solver.py:2952-2965 (reflected 3264-3277)",
+      "class": "REPARAM",
+      "note": "Noise = per-particle per-substep xi ~ U(-1/2,1/2) from the solver PRNG, or the stateless Owen-scrambled Sobol deviates keyed by particle id + substep (temporal_sampling='sobol_owen'). Freeze xi per rollout; theta is then smooth in gamma (velocities) and dt. The dt_act clip to [0,2dt] is C^0 (subgradient); Sobol keying makes frozen-noise replay trivial in Warp."
+     },
+     {
+      "op": "Exact temporal normalization wt /= mu(gamma_p) and the gamma gate",
+      "lines": "stflip/solver.py:1410-1438; stflip/kernels.py:38-57; stflip/solver.py:1245-1274",
+      "class": "SMOOTH",
+      "note": "mu(gamma) is a degree-6 polynomial; gamma = jitter_strength * smoothstep(|v| dt/dx) (+ clipped interiorness) is C^1 in particle velocity. Port caveat: _norm_rows sqrt has infinite gradient at exactly zero velocity -- add an eps inside the sqrt. Persisted _gamma_prev (surface/deformation modes) is just a saved tensor on the tape; fresh-particle padding is bookkeeping."
+     },
+     {
+      "op": "Scatter-add accumulation of volume/liquid-volume/momentum/temporal moments (m0 accumulators)",
+      "lines": "stflip/solver.py:1504-1529; stflip/backend.py:199-201",
+      "class": "SMOOTH",
+      "note": "Linear in the scattered values; the reverse-mode adjoint is a gather at the same (frozen-exact, see floor item) indices. Warp's wp.atomic_add has a built-in adjoint; float-atomic ordering nondeterminism perturbs forward values slightly but not differentiability."
+     },
+     {
+      "op": "APIC affine momentum term v + dx * C.(x_f - x_p)",
+      "lines": "stflip/solver.py:1509-1524",
+      "class": "SMOOTH",
+      "note": "Bilinear in (C, frac); gradients flow to both the affine matrix and positions."
+     },
+     {
+      "op": "Two-phase per-particle volume/mass weights (phase labels)",
+      "lines": "stflip/solver.py:1456-1469",
+      "class": "SMOOTH",
+      "note": "phase is a frozen per-particle 0/1 constant assigned at seeding; the weights are linear in it and it is never a differentiation target. rho_gas/rho enter smoothly and are legitimate parameters."
+     },
+     {
+      "op": "Domain-bounds tap mask (ok) + clipped flat index",
+      "lines": "stflip/solver.py:1498-1503",
+      "class": "DISCRETE-FREEZE",
+      "note": "The mask flips as a particle's tap crosses the domain-edge cell layer, where the spatial weight does NOT vanish -- a genuine discontinuity, but confined to the one-cell boundary layer. Freeze at forward value: over <=2 s the affected particles are a thin shell near walls where velocities are already boundary-conditioned, so the dropped weight gradient is second-order."
+     },
+     {
+      "op": "Face validity threshold m > eps_m and where(valid, qbar, 0)",
+      "lines": "stflip/solver.py:1544-1559 (two-phase finalize), 1562-1575 (single-phase)",
+      "class": "DISCRETE-FREEZE",
+      "note": "Sampled-support topology. Faces crossing eps_m carry O(eps) mass and invalid faces are overwritten by extrapolation in the forward pass anyway, so the frozen mask only mis-attributes gradient on the outermost sampled shell; over a short horizon the interface band moves ~1 cell per substep and the frozen-topology error stays local. Consistent with freezing the extrapolation front (other group)."
+     },
+     {
+      "op": "Face velocity average qbar = mom / max(m or face_mass, eps) + linear-in-tau temporal fit",
+      "lines": "stflip/solver.py:1547-1551, 1568-1573; stflip/solver.py:1371-1390",
+      "class": "SMOOTH",
+      "note": "Ratio-of-accumulators is smooth where support exceeds eps; max()/clip/maximum(...,0) kinks are subdifferentiable. The ridge-regularised fit (var + lam + 1e-12 denominator) is well-guarded."
+     },
+     {
+      "op": "Space-time phase field phi = min(sqrt(m/(eta_phi m0)), 1) and c_phi",
+      "lines": "stflip/solver.py:1554-1559, 1576-1589; m0 stflip/solver.py:1358-1369",
+      "class": "SMOOTH",
+      "note": "m0 is the analytic constant ppc (no state dependence). Port caveat: d sqrt/dm -> inf as m->0+, so use sqrt(max(m, eps)) to keep the adjoint finite; the min-at-1 clamp zeroes gradient in the saturated interior, which is fine (interior phi is constant). This field feeds pressure coefficients AND surface tension, so its gradient quality matters."
+     },
+     {
+      "op": "Gravity kick u += g*dt",
+      "lines": "stflip/solver.py:2792-2795 (reflected copy 3027-3030)",
+      "class": "SMOOTH",
+      "note": "Linear; gravity is a clean control/inverse-problem parameter."
+     },
+     {
+      "op": "Force time-window gate t_start <= time < t_end",
+      "lines": "stflip/solver.py:1112 (windows defined 1065-1101)",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "Activation depends only on the frozen substep schedule (self.time), never on differentiated state, so it is sound to keep it off the tape entirely -- with the schedule fixed the gate is a constant per substep. If window times themselves become optimization targets, replace with a smooth ramp (smoothstep in time); a hard freeze would give them zero gradient."
+     },
+     {
+      "op": "Directional (wind) force field",
+      "lines": "stflip/forces.py:39-50; dispatch stflip/solver.py:1115-1117",
+      "class": "SMOOTH",
+      "note": "Constant field; smooth in direction/strength away from the |d|<1e-12 degeneracy early-out."
+     },
+     {
+      "op": "Vortex force field",
+      "lines": "stflip/forces.py:53-84",
+      "class": "SMOOTH",
+      "note": "Analytic projections, cross products, Gaussian radial falloff -- smooth in center/axis/strength/radius (axis normalization kinks only at |axis|=0). Prime candidate parameters for the R2 inverse problem via the existing GOAL-M1 force system."
+     },
+     {
+      "op": "Turbulence force (curl of animated sinusoidal vector potential)",
+      "lines": "stflip/forces.py:87-121; noise draws 97, 104-106",
+      "class": "REPARAM",
+      "note": "Noise = per-octave random unit wavevectors k and phases drawn host-side from np.random.default_rng(force seed). Frozen per rollout the field is a fixed sum of sines: smooth in strength, scale, and time (time enters the sine argument, so timing gradients exist). xp.gradient curl is linear."
+     },
+     {
+      "op": "Vorticity confinement: curl, smoothing, normalization, magnitude clamp",
+      "lines": "stflip/forces.py:137-157, 160-162; dispatch stflip/solver.py:1122-1124",
+      "class": "SMOOTH",
+      "note": "Central differences and binomial smoothing are linear; sqrt norms are eps-guarded (1e-12) with kinks only where vorticity/its gradient vanish; the per-cell clamp min(1, clamp/|a|) is C^0. Note this force is documented to stay OFF in validation/decision runs, so training configs may simply disable it."
+     },
+     {
+      "op": "Vorticity confinement liquid gate (c_phi >= 0.5)",
+      "lines": "stflip/forces.py:158-159",
+      "class": "DISCRETE-FREEZE",
+      "note": "Cell liquid-labeling threshold. Freeze at forward value: the 0.5 level set moves at most ~1 cell per substep, the force is magnitude-clamped, and it is an art-direction extra (excluded from validation runs), so frozen-gate error over <=2 s is negligible relative to the force's own model error."
+     },
+     {
+      "op": "Cell-centred acceleration -> face averaging -> velocity increment",
+      "lines": "stflip/solver.py:1134-1143",
+      "class": "SMOOTH",
+      "note": "Fixed linear 2-point averaging then u += dt*a; adjoint is the transposed stencil."
+     },
+     {
+      "op": "Phase smoothing: separable binomial (cubic-B-spline) passes with clamped edges",
+      "lines": "stflip/surface_tension.py:26-71; call sites stflip/solver.py:2822-2825, forces.py:146-148, solver.py:1298",
+      "class": "SMOOTH",
+      "note": "Fixed linear convolution (clamp padding = edge-row duplication, still linear); adjoint is the transposed convolution. Iteration count st_smooth_iters is a config constant."
+     },
+     {
+      "op": "Smoothed-phase gradient and interface delta |grad phi_s|",
+      "lines": "stflip/surface_tension.py:74-85",
+      "class": "SMOOTH",
+      "note": "xp.gradient is linear; sqrt kink only where grad phi_s = 0, i.e. off-interface where downstream use is eps-floored; guard the sqrt in the port."
+     },
+     {
+      "op": "CSF curvature and force: kappa = -div(grad phi_s / max(|grad phi_s|, eps)), F = sigma*kappa*grad phi_s",
+      "lines": "stflip/surface_tension.py:88-105",
+      "class": "SMOOTH",
+      "note": "Smooth a.e. (the max(mag,eps) floor is a C^0 kink; off-interface the normalized direction is garbage but F ~ 0 there). Differentiable as-is on paper -- but see trickiest: the reverse chain is a third-spatial-derivative of a Monte-Carlo-sampled field."
+     },
+     {
+      "op": "CSF face kick: face-averaged F * dt / max(rho_face, eps_rho) with st_max_dv_cells clip",
+      "lines": "stflip/solver.py:2828-2847 (reflected copy 3057-3073); rho faces 2802-2815",
+      "class": "SMOOTH",
+      "note": "Piecewise smooth. Caveat: xp.clip zeroes d(kick)/d(sigma) wherever the limiter binds; on the violent scenes the limiter exists for, sigma could be gradient-starved -- swap for a softclip (tanh-scaled) in the differentiable port if sigma is a training target."
+     },
+     {
+      "op": "Capillary stabilizer DOF and edge gating (dof = valid & open; both-DOF pair gate)",
+      "lines": "stflip/solver.py:2859-2862; stflip/st_implicit.py:76-106 (pair_gate 101); face_delta averaging 43-73",
+      "class": "DISCRETE-FREEZE",
+      "note": "face_delta averaging and the coefficient scale dt^2*sigma/dx^2 are smooth; the gates are sampled-support + solid-geometry topology. Freeze at forward values, consistent with the P2G validity freeze: away from the interface all edge coefficients are already zero, so a frozen band only misplaces damping by <=1 cell per substep."
+     },
+     {
+      "op": "Semi-implicit capillary Helmholtz solve (R + A) u = R u_hat per component (Jacobi-CG)",
+      "lines": "stflip/st_implicit.py:109-156; invoked stflip/solver.py:2863-2870 (reflected 3084-3091)",
+      "class": "FIXED-POINT",
+      "note": "SPD and self-adjoint: the IFT adjoint is one more CG solve with the SAME operator (lambda = (R+A)^{-1} dL/du), then dL/du_hat = R lambda, dL/drho = lambda*(u_hat - u) elementwise, and dL/dA flows through edge coefficients into sigma, dt, and the interface delta -> phase -> particle deposits. Iteration count, check_every, and the residual break test stay off the tape. The state-dependent operator means a black-box linear-solve adjoint is not enough -- the dA/dstate term must be implemented."
+     },
+     {
+      "op": "Implicit viscosity backward-Euler diffusion (I - coef*L) x = u per component (Jacobi-CG)",
+      "lines": "stflip/viscosity.py:51-97; invoked stflip/solver.py:2875-2885 (reflected 3093-3103)",
+      "class": "FIXED-POINT",
+      "note": "SPD, self-adjoint constant-stencil operator: IFT adjoint = one CG solve with the same operator; d/dnu flows smoothly through coef = dt*nu/dx^2 (viscosity is a natural training parameter). The Dirichlet fixed mask (~open, solid faces) is static geometry topology -- frozen, owned by the apertures group."
+     }
+    ],
+    "trickiest": {
+     "op": "CSF curvature chain: P2G phase -> binomial smoothing -> normalized-gradient divergence -> force -> Helmholtz coefficients (stflip/surface_tension.py:88-105 + stflip/st_implicit.py:76-106)",
+     "why": "Every individual op is smooth a.e., but reverse-mode composes them into effectively a THIRD spatial derivative of a Monte-Carlo-sampled field divided by a near-singular normalization: d(force)/d(particle position) chains the C^2 deposit kernel through two binomial smoothings, two xp.gradient levels, and 1/max(|grad phi_s|, eps). The MC deposit noise that the forward pass tolerates (the paper's whole design) gets amplified by each differentiation level exactly at the interface where any surface-shape loss lives, so gradient variance/explosion is likeliest here, while the eps floor and the st_max_dv_cells clip simultaneously create zero-gradient dead zones in the most active regions. On top of that, the same noisy delta parameterizes the semi-implicit operator A, so the FIXED-POINT adjoint needs the dA/dstate term (solve-then-outer-product over gated edges), not a black-box linear-solve adjoint -- making this the one place where SMOOTH, FIXED-POINT, DISCRETE-FREEZE, and REPARAM(-noise) interactions all compound. Recommend R1 explicitly gradcheck a sigma-perturbation through 4 unrolled substeps with frozen xi before trusting any surface-tension-inclusive training run (R1's scope wisely already excludes it)."
+    }
+   },
+   "verdict": {
+    "agree": false,
+    "corrections": [
+     "Row 'Domain-bounds tap mask (ok) + clipped flat index' (solver.py:1498-1503): the justification is factually wrong and the class is unnecessarily conservative. The ok mask depends only on base+di (base = floor(xi), solver.py:1489), so it can flip ONLY at integer crossings of xi -- and at those crossings every real grid node's deposit is C^2-continuous: e.g. near the x_min edge, for xi in (-1,0) node 0 receives w6(xi) via tap di=1, and for xi in (0,1) it receives w6(xi) via tap di=0 -- the same polynomial continues across the flip, and the masked tap (ii=-1) targets a nonexistent node so its nonzero weight never reaches any real accumulator. There is NO 'genuine discontinuity' in the one-cell boundary layer and no 'second-order dropped weight gradient': freezing ok at forward values gives the EXACT gradient, by the identical argument the table itself uses for the floor row. Correct class: SMOOTH (exact under frozen indices), not DISCRETE-FREEZE.",
+     "Row 'Vorticity confinement' (forces.py:137-162): the note's claim 'sqrt norms are eps-guarded (1e-12)' is false for both sqrts. forces.py:149 (mag = sqrt(ox^2+oy^2+oz^2)) and forces.py:160 (amag = sqrt((out*out).sum(-1))) are UNguarded; the 1e-12 epses at lines 153 and 161 guard only the subsequent divisions. Reverse-mode d(sqrt)/dx is infinite at exactly zero vorticity, which is common (still fluid, regions zeroed by the liquid gate), and 0*inf through the min(1, clamp/max(amag,1e-12)) branch yields NaN adjoints. Classification can stay SMOOTH only with the same 'add eps inside the sqrt' port caveat the table correctly applies to _norm_rows and |grad phi_s|.",
+     "Row 'Vortex force field' (and Turbulence/Confinement/Viscosity): omits gradient-blocking early-outs on the very parameters the table nominates as training targets. forces.py:60 (vortex 'strength == 0.0: return None'), forces.py:94 (turbulence), forces.py:135 (confinement), plus solver.py:2875 ('if p.viscosity > 0.0') and viscosity.py:59-60 ('if coef <= 0.0: return u'). Each makes dF/d(strength) and dL/d(nu) exactly zero at parameter value 0 -- measure-zero in parameter space but a real trap for the R2 inverse problem if strengths are initialized at 0; the differentiable port should drop these early-outs or start parameters off zero.",
+     "Row 'Space-time phase field phi = min(sqrt(...),1)' : formula/line mismatch. solver.py:1554-1559 (two-phase face phi) and 1585-1589 (two-phase c_phi) are ratio-clip forms clip(ml / max(m, eps_m), 0, 1), NOT the sqrt formula; the min(sqrt(m/(eta_phi*m0)),1) form -- and therefore the d(sqrt)/dm -> inf port caveat -- applies only to the single-phase branch at solver.py:1576-1581. SMOOTH classification holds for both, but the note conflates two different (and differently-guarded) expressions.",
+     "Row 'Force time-window gate' (solver.py:1112): 'activation depends only on the frozen substep schedule (self.time), never on differentiated state' is true only AFTER freezing the schedule, which the note assumes implicitly. In the code as written the schedule IS state-dependent: dt = min(cfl_target*dx/max(vmax,1e-6), segment_rem) at solver.py:3377-3378 with vmax = max particle speed (solver.py:3349-3350, 3403-3404), plus the capillary clamp at 3390-3392, so self.time at substep k depends on differentiated velocities. DISCRETE-EXCLUDE remains sound, but only jointly with an explicit R0 decision to freeze the forward dt schedule -- the same assumption that silently underwrites every 'smooth in dt' claim elsewhere in the table, so it should be stated once as a global precondition rather than implied.",
+     "Minor: row 'Slab time theta' omits the third sampling arm temporal_sampling='cp_rot' (solver.py:2955-2957, sampling.py:131-146); it is likewise stateless-keyed by (particle_id, substep_index, seed) so the REPARAM treatment covers it unchanged."
+    ]
+   }
+  },
+  {
+   "group": "projection",
+   "table": {
+    "items": [
+     {
+      "op": "Face densities rho_f = rho_l*phi_f (+ rho_g*(1-phi_f) in two-phase) from the P2G deposit",
+      "lines": "stflip/solver.py:2798-2811 (reflected path: 3033-3046; second deposit: 3196-3208); phi_f construction stflip/solver.py:1554-1559 (two-phase face phi), 1576-1581 (free-surface sqrt phase), 1585-1589 (two-phase cell phi)",
+      "class": "SMOOTH",
+      "note": "Linear in phi_f. phi_f itself is clip(ml/max(m,eps_m),0,1) or min(sqrt(m/(eta_phi*m0)),1): piecewise-smooth with measure-zero kinks at the clip/min boundaries, standard clamp handling in Warp. sqrt's infinite slope as m->0 is harmless: any face where rho_f falls below eps_rho has its gradient path zeroed downstream by the max-clamp (next item), so no exploding adjoint through near-empty faces."
+     },
+     {
+      "op": "eps-rho clamping at interface faces: inv_rho_f = 1/max(rho_f, eps_rho)",
+      "lines": "stflip/solver.py:2802, 2813-2815 (reflected: 3047-3049, 3209-3213)",
+      "class": "SMOOTH",
+      "note": "max() clamp is C0 piecewise-smooth (value continuous, derivative kink on a measure-zero set). On clamped near-interface faces d(inv_rho)/d(phi_f) = 0 exactly -- this deliberately kills the worst-conditioned 1/rho^2 gradients from the least-sampled faces, which is good for gradient SNR but means interface faces contribute zero smooth sensitivity (see trickiest)."
+     },
+     {
+      "op": "Face validity masks (m_f > eps_m) and PPE active/solvable cell masks (c_phi >= 0.5 or c_m > eps_m, & ~solid_c; solvable = liquid & diag > 0)",
+      "lines": "stflip/solver.py:1544, 1553, 1567, 1575 (valid); 2807, 2812 (active; reflected: 3041, 3046, 3203, 3208); stflip/pressure.py:340-342; stflip/multigrid.py:104, 241-242",
+      "class": "DISCRETE-FREEZE",
+      "note": "These decide which cells are in the PPE and where the air Dirichlet p=0 sits (Dirichlet-by-masking: pressure.py:9-11, 54, 82). Freeze at forward values: the mask can only move with the interface, ~1 cell/substep (advection clip <= 2dt), so frozen-topology error is confined to a one-cell free-surface band per substep and does not corrupt interior pressure dynamics; over <= 2 s with statistics-level losses this is the standard treatment (DiffTaichi/PhiFlow treat liquid masks as data). Escape hatch if the straight-through bias proves too large: c_phi is already a continuous field, so a smooth sigmoid relaxation of the 0.5 threshold is available without new machinery."
+     },
+     {
+      "op": "Cut-cell solid apertures from the node SDF (triangle/square open fractions, fully-solid cell classification) and binary cell-center fallback",
+      "lines": "stflip/solver.py:1600-1663 (computed once, cached at 1608-1609, 1662); stflip/apertures.py:51-79 (sorted-corner triangle fraction), 101-111, 154-184, 187-212",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "Sound exclusion: apertures depend only on static solid geometry and are computed once and cached for the entire rollout, so they are exact constants w.r.t. every short-horizon differentiation target (initial state, forces, material/control params) -- zero error, nothing to approximate. If solid-shape optimization is ever wanted, the fractions are C0 piecewise-polynomial in the node SDF (sort + positive-count branches are piecewise selection, differentiable a.e.), but that is outside R0/R1 scope."
+     },
+     {
+      "op": "Open-face booleans open_f = alpha_f > 0 and pressure-outflow face opening masks",
+      "lines": "stflip/solver.py:2782-2784 (reflected: 3018-3020); 1689-1720 (_pressure_face_masks, cached); 1722-1751 (_active_face_apertures)",
+      "class": "DISCRETE-FREEZE",
+      "note": "Thresholds on cached, rollout-constant apertures and static outflow side masks: the frozen value never changes during the unroll, so freezing is EXACT (zero frozen-topology error). Classified FREEZE rather than EXCLUDE only because these booleans sit inside differentiated xp.where selects and must ride the tape as constants."
+     },
+     {
+      "op": "Aperture-weighted divergence RHS, incl. moving-wall blocked-fraction flux and rhs = -div * active",
+      "lines": "stflip/apertures.py:248-291 (weighted_divergence); stflip/solver.py:2635-2649",
+      "class": "SMOOTH",
+      "note": "Exactly linear in u,v,w and in the prescribed solid face velocities, with constant aperture weights; final masking is a product with the frozen active mask. Trivial reverse-mode."
+     },
+     {
+      "op": "PPE face coefficients k_f = dt * alpha_f * inv_rho_f / dx^2",
+      "lines": "stflip/solver.py:2631-2633, 2650",
+      "class": "SMOOTH",
+      "note": "Products of constants (dt, alpha, dx) with inv_rho_f. Important consequence: the system MATRIX A(k) depends on the deposit through rho_f, so the IFT adjoint must include the dA term (-lambda outer-product structure against p via d k_f), not just the RHS sensitivity -- the operator is not constant across the tape."
+     },
+     {
+      "op": "Jacobi-preconditioned CG pressure solve",
+      "lines": "stflip/pressure.py:304-331 (solve + component dispatch), 333-375 (_solve_core; convergence check 370-373); called from stflip/solver.py:2651-2658",
+      "class": "FIXED-POINT",
+      "note": "IFT adjoint at convergence: differentiate A(k) p = rhs, giving one extra linear solve A lambda = dL/dp (A symmetric, so the SAME solver and preconditioner apply), then VJPs into rhs (+lambda) and k (-via dA). The data-dependent iteration count (residual checked every check_every=8, early break) therefore never enters the tape at all -- it is an execution detail of computing the fixed point, with O(1) adjoint memory instead of O(iters). Gradient error is O(tol_fwd + tol_adj); the default pcg_tol=1e-4 (float32) may need tightening for gradcheck through multi-step unrolls. The sAs/sigma breakdown guards (360-367) are likewise iterate-internal and exempt."
+     },
+     {
+      "op": "crop_to_active / crop_boxes / axis-separable component splitting of the PPE",
+      "lines": "stflip/pressure.py:103-168 (_component_boxes), 185-243 (_crop_component, crop_boxes), 246-301 (crop_to_active); multigrid dispatch stflip/multigrid.py:217-230",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "Pure integer bookkeeping documented to leave the computed function unchanged (same discretization, exact up to float summation order: pressure.py:253-262). The discrete box decisions are an execution plan, not part of the math; the adjoint solve simply reuses the forward boxes. Nothing to straight-through because there is no approximation. Warp-side cost: data-dependent shapes are an implementation nuisance (dynamic allocation), not a differentiability problem."
+     },
+     {
+      "op": "Multigrid V-cycle preconditioner inside MG-PCG (hierarchy build, any-of-8 coarse masks, face gates, damped-Jacobi smoothing, coarsest-level sweeps)",
+      "lines": "stflip/multigrid.py:47-107 (coarsening + levels), 110-136 (build_hierarchy), 139-163 (_face_gate), 166-198 (_smooth, vcycle), 201-289 (solve/_solve_core)",
+      "class": "FIXED-POINT",
+      "note": "Same IFT treatment as the CG item. Key structural fact: the V-cycle is only ever a preconditioner and the outer CG checks the TRUE residual (documented contract, multigrid.py:24-27), so every discrete decision inside it -- coarse-mask any-of-8 (69-72), face gating (139-163), level-count cutoffs (119-123) -- affects convergence speed but never the converged solution. The entire preconditioner stays off the tape; the adjoint solve reuses the forward hierarchy since A^T = A. Data-dependent iteration count: identical argument to the CG item."
+     },
+     {
+      "op": "Convergence-contract failure (PressureSolveError raise)",
+      "lines": "stflip/solver.py:2659-2660; stflip/pressure.py:24-44",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "Rare-event abort of the whole rollout: a failed solve produces no training sample and no gradient, so it is outside the differentiated computation by construction. In training it just surfaces as a skipped/rejected rollout."
+     },
+     {
+      "op": "Pressure application to faces: pm = p * active, face-difference gradient, u_f -= dt * inv_rho_f * grad(p) gated by open_f, plus half-cell p=0 outflow boundary correction",
+      "lines": "stflip/solver.py:2662, 2668-2679 (interior), 2681-2715 (pressure-outflow boundary terms)",
+      "class": "SMOOTH",
+      "note": "Linear in p and bilinear in (p, inv_rho); the xp.where gates use rollout-constant open/pressure-outflow masks. Gradients flow both into p (feeding the IFT adjoint solve) and into inv_rho_f (back into the deposit). Note the aperture asymmetry (aperture-weighted operator, unweighted correction, solver.py:2628-2630) is a modeling choice, not a differentiability issue."
+     },
+     {
+      "op": "No-through enforcement u_f <- u_solid on fully blocked faces (pre-projection, post-projection, defensive post-extrapolation)",
+      "lines": "stflip/solver.py:2890-2892 (pre), 2717-2719 (post), 2746 (post-extrap); reflected: 3105-3107, 3133, 3214-3216",
+      "class": "SMOOTH",
+      "note": "xp.where selects whose condition (open_f) is constant for the whole rollout: exactly differentiable, routing full gradient to fluid u on open faces and to the prescribed solid velocity on blocked faces. No runtime discreteness because the branch never depends on simulated state."
+     },
+     {
+      "op": "Half-band velocity extrapolation of valid faces (layered neighbor averaging with per-layer frontier masks, dilated-bbox crop, early termination)",
+      "lines": "stflip/solver.py:2721-2750 (_extrapolate_valid_faces), 1936-2006 (_extrapolate; frontier mask 1994, early break 1995-1996, bbox 1963-1976), band size 2903 (reflected half-band: 3137-3152); bbox helper 1916-1934",
+      "class": "DISCRETE-FREEZE",
+      "note": "With the per-layer fill masks (newly = ~valid & allowed & c>0) frozen at forward values, each layer is a LINEAR averaging operator on u -- the value path is fully differentiable; only 'which faces fill, from which neighbors' is frozen. Acceptable short-horizon: the extrapolated band is already only a constant O(dx) extension whose sole consumers are near-surface G2P samples and the FLIP baseline (extrapolated with the SAME mask precisely to avoid spurious deltas, 2723-2732), so a mis-frozen stencil perturbs values carrying no accuracy claim, and band membership drifts with the interface only ~1 cell/substep. layers = ceil(2*cfl_target)+2 is static; early break and bbox crop are value-exact execution details. Cost note for Warp: the frozen masks are per-layer per-substep booleans that must be saved for the backward pass (or recomputed from the saved valid set)."
+     }
+    ],
+    "trickiest": {
+     "op": "IFT pressure adjoint conditioned on the frozen active/valid topology (interaction of the mask freeze, the eps_rho clamp, and the A(k) dependence on the deposit)",
+     "why": "The projection is the plan's load-bearing stage (R0's explicit kill criterion), and its clean FIXED-POINT story is only exact CONDITIONAL on the frozen liquid mask: A depends smoothly on the deposit through k_f = dt*alpha_f/max(rho_f, eps_rho) but discontinuously on which cells are active/solvable, and both channels concentrate at the free surface. Worse, they conspire there: exactly on the interface faces where topology sensitivity lives, the eps_rho clamp zeroes the smooth path (d inv_rho/d phi = 0 when clamped) while the mask flip carries the remaining -- dropped -- sensitivity. So the differentiated solver systematically underreports dp/d(surface position), and the free surface is where both the physics (Dirichlet p=0) and typical losses (surface statistics, splash shape) look. The frequently-worried-about data-dependent CG/multigrid iteration count, by contrast, vanishes entirely under IFT. The R0-actionable check: gradcheck interface-adjacent DOFs separately from interior DOFs through a few-substep unroll; if interface gradients are unusably biased, the fallback is a smooth relaxation of the active threshold on c_phi (already a continuous field), at the cost of a slightly blurred Dirichlet boundary."
+    }
+   },
+   "verdict": {
+    "agree": false,
+    "corrections": [
+     "Row 'Face validity masks' (DISCRETE-FREEZE) and row 'Half-band velocity extrapolation': the quantitative freeze bound is wrong. The note claims the mask/band 'can only move with the interface, ~1 cell/substep (advection clip <= 2dt)' and that frozen-topology error is 'confined to a one-cell free-surface band per substep'. But cfl_target defaults to 8.0 (stflip/solver.py:99), dt is chosen as cfl_target*dx/vmax (solver.py:3377-3378), and dt_act is clipped to 2*dt (solver.py:2964), so per-substep interface travel is bounded by ~2*cfl_target ~= 16 cells at defaults -- which is exactly why the extrapolation band is ceil(2*cfl_target)+2 = 18 layers (solver.py:2545, 2903). The DISCRETE-FREEZE class can stand, but the acceptability argument must be restated as 'error confined to the interface band swept per substep, width ~2*cfl_target cells' plus an explicit requirement that differentiation unrolls run at small cfl_target (~0.5-1) for the one-cell-band story to hold; at the shipped default the frozen active mask is stale over a ~16-cell band and does feed back into the projection within a couple of substeps.",
+     "Row 'eps-rho clamping' and the TRICKIEST item: the clamp/mask 'conspiracy' at the interface is factually wrong at defaults. eps_rho_rel defaults to 1e-3 (solver.py:117), so inv_rho is clamped only where phi_f < ~1e-3 -- nearly-empty spray/tail faces -- while the active-mask flip lives at c_phi = 0.5 (solver.py:2812). These two loci are far apart on the phase profile: faces straddling the free surface (phi ~ 0.5) are NOT clamped and carry full smooth d(inv_rho)/d(phi) sensitivity, so the claims 'interface faces contribute zero smooth sensitivity' (row 2) and 'exactly on the interface faces where topology sensitivity lives, the eps_rho clamp zeroes the smooth path' (trickiest) are false. In two-phase mode the clamp NEVER engages at defaults: rho_f >= rho_gas = 1.2 (solver.py:161, 2804-2806) > eps_rho = 1e-3*1000 = 1.0. The dropped mask-flip sensitivity at c_phi=0.5 remains a legitimate standalone concern, but the trickiest item's causal story needs rewriting. It also inverts the real hazard: just ABOVE the clamp boundary d(inv_rho)/d(phi) = -1/(rho*phi^2) is ~1e6/rho at phi=1e-3 (further amplified by the sqrt phase map's m^-1/2 slope, solver.py:1578-1579), i.e. the danger on near-empty faces is exploding, not zeroed, adjoints -- contradicting row 1's 'no exploding adjoint through near-empty faces'. Gradient-SNR mitigation (e.g. larger eps_rho_rel for differentiated runs) belongs in the note.",
+     "Rows 'Cut-cell solid apertures' (DISCRETE-EXCLUDE), 'Open-face booleans' (DISCRETE-FREEZE), and 'No-through enforcement' (SMOOTH): the 'computed once / cached for the entire rollout / never changes during the unroll / constant for the whole rollout' premise is false as a property of this code. set_solid_sdf is the documented per-frame entry point for animated moving-wall obstacles ('call this once per frame with the current obstacle pose', solver.py:846-848) and invalidates the aperture and outflow-face caches (solver.py:874-876), so with animated/deforming walls alpha_f, solid_c, and open_f change every frame. Additionally, the sparse-window path drops the aperture cache EVERY substep (_enter_window, solver.py:2591) and rebuilds the binary-fallback apertures on a moving window whose origin is a discrete function of particle positions (solver.py:2555-2572; sparse mode is only disabled for node-SDF/outflow cases, solver.py:2547-2553, so the binary fallback row IS affected). The classifications survive with the corrected argument: apertures/open_f depend only on the prescribed solid animation, never on simulated fluid state, so they are exogenous (piecewise-constant-in-time) constants w.r.t. R0 differentiation targets; and the sparse window is value-exact execution planning (band+pad guarantees, solver.py:2563-2568) analogous to crop_to_active. But the notes' factual premises as written are wrong, and 'zero frozen-topology error' for open-face booleans should be conditioned on not differentiating w.r.t. solid pose.",
+     "Coverage gap adjacent to cited lines: the reflected-path mirror mask 'mirror = open_f & valid & (phi_f >= 0.5)' (solver.py:3129-3132) is a state-dependent discrete gate between the two projections -- it decides on which faces the reflected pressure impulse 2*u1 - u_star applies, i.e. where first-projection pressure gradients feed particle momentum. The table cites its neighbor line 3133 (in the no-through row) but no row classifies the mirror mask itself; it needs a DISCRETE-FREEZE entry (or an explicit statement that it belongs to the transfer/reflection group).",
+     "Minor line-number nits (no class impact): pressure.py solve() spans 304-330, not 304-331; the no-through row omits the reflected-path re-enforcements at solver.py:3145, 3148, 3152 (same xp.where pattern, same SMOOTH treatment); row 1's cited range 2798-2811 includes the two-phase active-mask line 2807, which belongs to the mask row."
+    ]
+   }
+  },
+  {
+   "group": "g2p-advect",
+   "table": {
+    "items": [
+     {
+      "op": "Trilinear G2P face gather (_sample_faces)",
+      "lines": "stflip/solver.py:2008-2029",
+      "class": "SMOOTH",
+      "note": "Linear in grid values, piecewise-polynomial in position. floor->base (2017) and index clip (2024-2026) select the stencil; no gradient is needed through the integer path because the weight on a dropped tap vanishes exactly at the switching boundary, so the sampled value is C0 with only derivative kinks at cell faces (measure zero; standard subgradient treatment, native in Warp/diff-MPM). Reverse-mode scatters adjoints into grid values with the same weights."
+     },
+     {
+      "op": "APIC affine reconstruction: B/D accumulation, Tikhonov reg, closed-form 3x3 inverse (_g2p_apic + _inv3x3)",
+      "lines": "stflip/solver.py:2031-2087, 59-64",
+      "class": "SMOOTH",
+      "note": "Same trilinear weights as the gather; D is symmetrized (2075-2077) and Tikhonov-regularised (2078-2079) so it is uniformly SPD, making the adjugate inverse (2080, _inv3x3) a smooth rational function with bounded conditioning -- no linear solve, hence no IFT adjoint needed. The regulariser that was added to dodge cuBLAS is exactly what keeps the backward pass well-posed. C row assembly (2081-2086) is bilinear."
+     },
+     {
+      "op": "FLIP delta vs PIC/APIC replacement blend (transfer step)",
+      "lines": "stflip/solver.py:2911-2920, 3159-3166, 3233-3242",
+      "class": "SMOOTH",
+      "note": "vel <- a*(vel + (u_new - u_old)) + (1-a)*u_new is affine in all three velocity samples and in flip_blend; the 'old' snapshot (.copy() at 2788/3022/3189) is just a second differentiable branch through P2G. The mode dispatch (p.transfer) is a compile-time config, not a runtime discrete op. Key structural fact for unrolls: FLIP carries particle velocity across substeps with Jacobian block a*I on the carry path -- contractive for a<1, so the blend parameter directly conditions the chained-Jacobian product the research plan cares about (pure FLIP a=1 is the worst case)."
+     },
+     {
+      "op": "Advection-reflection mirror linear combination u_hat = 2*u1 - u_star",
+      "lines": "stflip/solver.py:3108, 3131-3132",
+      "class": "SMOOTH",
+      "note": "Pure affine combination of the projected field u1 and the pre-projection snapshot u_star (3108). Both parents are on the tape (u1 via the projection adjoint, another group's item). Never used for transport (comment 3120-3123), so its adjoint only flows back through the mid-step G2P at 3159-3166."
+     },
+     {
+      "op": "Mirror gating masks: open_f & u_valid & (u_phi >= 0.5), plus the no-through re-mask",
+      "lines": "stflip/solver.py:3129-3130, 3133",
+      "class": "DISCRETE-FREEZE",
+      "note": "State-dependent thresholds: u_phi and u_valid come from P2G, so the mask moves with particle positions. Freeze at forward value. Acceptable short-horizon: a flipped face sits at phi ~ 0.5 (interface) or at the valid-band edge, and the two branches (u_hat vs u1) differ there by the projection residual 2*(u1 - u_star), a single dt-scale impulse on an O(surface-area) face set -- the accumulated bias over <= 2 s is below the truncation error already accepted by freezing nsub. The eps_rho-clamp rationale in the comment (3121-3123) says exactly why these faces are under-resolved anyway."
+     },
+     {
+      "op": "Global substep count: speed bound -> nsub = ceil(...) -> max_n loop bound",
+      "lines": "stflip/solver.py:2188-2197, 2356-2364",
+      "class": "DISCRETE-FREEZE",
+      "note": "The benign integer to freeze: with nsub frozen at its forward value, h = dt_act/nsub (2363) stays smooth in dt_act and in nothing else, and the RK3 chain is smooth in the field. Perturbing nsub by +/-1 re-partitions the SAME flow map, changing only O(h^3)-per-substep truncation error, never an O(1) trajectory jump -- so the frozen-count gradient bias is truncation-order. The never-cap comment (2360-2362) is forward-safety only; _grid_velocity_bound's max/abs (2196-2197) needs no gradient because it only feeds this frozen integer."
+     },
+     {
+      "op": "RK3 (Ralston) stages k1/k2/k3 and position update",
+      "lines": "stflip/solver.py:2405-2410, 2418-2423, 2466-2472, 2478-2481, 2517-2520",
+      "class": "SMOOTH",
+      "note": "Composition of three _sample_faces gathers with fixed affine coefficients (2/9, 3/9, 4/9); smooth given a frozen substep schedule. The real cost is memory, not smoothness: reverse-mode needs the stage input positions per substep per particle (nsub can reach ~1e4 in stress cases per the ledger comment at 2374-2376), so checkpointing across substeps is mandatory in the Warp port."
+     },
+     {
+      "op": "Local speed-bound grid: face abs-maxima + edge-clamped Chebyshev dilation",
+      "lines": "stflip/solver.py:2199-2238",
+      "class": "DISCRETE-FREEZE",
+      "note": "Technically piecewise-smooth (nested max), but it should be deliberately detached (frozen at forward value): it is a numerics safety device backed by a strict-bound lemma (docs/design/local-speed-advection.md), not physics. Differentiating through argmax selections of a dilated bound would inject spurious, high-variance sensitivity into step sizes. Freezing is sound because the bound is strict with cushion (radius = ceil(cfl_local)+1, 2217), so it remains a valid bound under infinitesimal state perturbation."
+     },
+     {
+      "op": "Local adaptive step size: hmag = min(rem, cap/bound[cell(pos)]) per-particle schedule",
+      "lines": "stflip/solver.py:2382-2392, 2403, 2416, 2510-2511",
+      "class": "DISCRETE-FREEZE",
+      "note": "Three discrete decisions inside the innermost loop: floor cell index (2388-2389), the cap-vs-remainder argmin (2403/2416/2511), and the data-dependent trip pattern. Freeze the cell index, the bound value, and the min-branch at forward values -- BUT keep the remainder path (h = rem) on the tape so sum(h_s) = |dt_act| holds differentiably and dt_act/jitter gradients survive through the final rem-limited substep. Frozen-schedule bias is then a re-partition of the same flow (truncation-order), same argument as global nsub, valid because the frozen caps stay strict bounds under perturbation."
+     },
+     {
+      "op": "Active-subset iteration: rem>0 / s<nsub membership, nonzero index gather/scatter, owned-copy discipline",
+      "lines": "stflip/solver.py:2397-2440, 2461-2489, 2507-2516",
+      "class": "DISCRETE-FREEZE",
+      "note": "Freeze membership at forward values -- and this freeze is EXACT, zero bias: an inactive lane's update is a he=0 no-op (pos + 0 = pos), and the code is verified bit-identical to the dense masked loop (comment 2441-2460). It is program structure, not math: the adjoint replays the recorded index sets with transposed gather/scatter. The he = where((s<nsub)&alive, h, 0) mask (2513-2516) is the same frozen membership in the tracked branch."
+     },
+     {
+      "op": "float64 remaining-time ledger rem (and sgn = where(dt_act<0,...))",
+      "lines": "stflip/solver.py:2384-2385, 2411, 2428, 2537",
+      "class": "SMOOTH",
+      "note": "Plain subtraction arithmetic; smooth given the frozen schedule. Its discrete role (loop termination rem>0, the every-8th-iteration early-out sync at 2508) is subsumed by frozen trip counts. float64 is a forward-robustness measure (comment 2372-2377); the adjoint only needs the ledger through the rem-limited h of the last substep. sgn (2385) is a frozen sign, kink only at dt_act exactly 0 (measure zero; dt_act is clipped >= 0 in the stepping cores at 2964/3173/3276)."
+     },
+     {
+      "op": "Collision push-out (_push_out_of_solids): SDF sample, normalized gradient, ReLU push, per-substep relaxation",
+      "lines": "stflip/solver.py:2165-2183 (called 2432, 2439, 2487, 2527)",
+      "class": "SMOOTH",
+      "note": "Continuous despite the mask: push = max(margin - d, 0)*n vanishes exactly where need = d < margin (2171) switches, so the where (2183) introduces no jump -- it is a ReLU-style projection, a.e. differentiable (kinks at d = margin and at SDF-skeleton gradient singularities, both measure zero). Crucially it is NOT a converged fixed point: one relaxation pass per RK substep (comment 2452-2456), iteration count = the already-frozen substep count, so differentiate through each pass directly -- no IFT machinery. Binding contact makes the pass Jacobian rank-deficient along the normal (gradient of penetration depth is killed), which is the physically correct contact behavior."
+     },
+     {
+      "op": "Domain clamp (_clamp_domain)",
+      "lines": "stflip/solver.py:2185-2186 (bounds 2593-2596)",
+      "class": "SMOOTH",
+      "note": "Piecewise-linear clip: continuous, subgradient 0 in a binding component. Wall-pinned particles lose position gradient in the clamped axis for as long as they bind -- acceptable over a short horizon (they also lose forward dynamics in that axis); if wall-adjacent control ever matters, a soft-clip relaxation is the drop-in fix. Note the where at 2535 lets outflow-removed particles bypass the clamp; that branch belongs to the excluded outflow item."
+     },
+     {
+      "op": "Outflow machinery: sink/exit hit tests (_positions_in_mask, _segments_hit_mask Amanatides-Woo, _pressure_exit_allowed), alive/removed masks, particle removal",
+      "lines": "stflip/solver.py:2240-2344, 2491-2538",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "Particle deletion is a topology change the research plan itself earmarks as genuinely discrete (R0 list: 'particle add/remove at outflows'), and R1's minimal core has no outflows at all. Sound to exclude: the traversal (2248-2294) produces only booleans (no gradient path exists through it), removal events are rare boundary crossings, and a removed particle simply exits the loss domain at its removal step -- its adjoint chain terminates there rather than being corrupted. If an objective ever depends on outflow flux, that needs a dedicated smoothed counter, not differentiation of this code."
+     }
+    ],
+    "trickiest": {
+     "op": "Local adaptive step size hmag = min(rem, cap/bound[cell(pos)]) (stflip/solver.py:2382-2392 with consumers 2403/2416/2511)",
+     "why": "It is the only place a discrete, state-dependent decision sits INSIDE the innermost differentiated loop and directly sets the integrator's step size: h depends on the particle's current position through a floor() cell lookup into a max-dilated bound field, then through a cap-vs-remainder min, with per-particle data-dependent trip counts on top. Freeze everything and you sever legitimate dt_act/jitter gradients through the final remainder-limited substep (breaking the sum(h)=|dt_act| constraint the temporal-normalization machinery relies on); differentiate naively and you inject spurious high-variance gradients through a numerics-only safety bound and its argmax selections. The correct treatment is a split straight-through -- freeze bound, cell index, and min-branch, keep the rem path on the tape -- and unlike the global-nsub freeze (state-independent h = dt/nsub, bias trivially truncation-order), justifying the frozen-schedule bias here requires the strict-bound-with-cushion lemma to argue the frozen caps remain valid along perturbed trajectories. It also sets the checkpointing burden: heterogeneous per-particle substep counts (up to ~1e4 per the float64-ledger comment) make naive per-stage taping infeasible in the Warp port."
+    }
+   },
+   "verdict": {
+    "agree": false,
+    "corrections": [
+     "Row 2 (APIC): _inv3x3 spans solver.py:59-89, not 59-64 (the cited range covers only the docstring). The body contains a hidden branch the note omits: inv_det = 1/where(|det|>1e-30, det, 1e-30) at line 78. It is inert given the Tikhonov floor (det >= reg^3 with reg = apic_reg*dx^2, line 2043/2078-2079), but it is a where() inside a claimed-SMOOTH op and should be explicitly noted as a never-binding guard (or detached) in the Warp port. Classification SMOOTH stands.",
+     "Row 5 (mirror gating): factor-of-2 error in the justification. At a flipped face the two where-branches at 3131-3132 are u_hat = 2*u1 - u_star versus u1, so the jump is (2*u1 - u_star) - u1 = u1 - u_star -- ONE projection impulse, not '2*(u1 - u_star)'. The error overstates the frozen-mask bias by 2x, so the short-horizon acceptability argument actually strengthens; classification DISCRETE-FREEZE stands. Line cites 3129-3130/3133 verified correct.",
+     "Row 3 (FLIP blend): the cited site 3159-3166 is NOT the a-blend formula quoted in the note. The reflected mid-step FLIP transfer at 3166 is the pure delta self.vel = self.vel + (u_hat_p - u_old_p) (comment 3154-3158: pure delta by design, no (1-a) PIC term). The a-blend appears only at 2920 and 3240-3242. Consequence for the note's structural claim: in reflection mode the per-substep carry Jacobian is I at the mid-step transfer and only becomes a*I after the final G2P at 3241 -- the contraction argument holds per full substep, not per transfer. Classification SMOOTH stands (still affine).",
+     "Row 13 (domain clamp): wrong bounds citation. The primary _clamp_lo/_clamp_hi assignment is solver.py:442-445 (__init__, eps = 1e-3*dx); the cited 2593-2596 is only the sparse-window rebind inside _enter_window (2574-2600), active only when the sparse window is engaged. Classification SMOOTH stands; the 2535 outflow-bypass observation is verified correct.",
+     "Row 11 (rem ledger / sgn): the note's scoping 'dt_act is clipped >= 0 in the stepping cores at 2964/3173/3276' is verified correct, but it omits that negative dt_act genuinely occurs in the codebase: _resynced_positions_and_keep (solver.py:3481-3506) calls _advect with signed self.dt_resid (centred near 0 by the jitter stationary distribution) for render resync at 3487-3489, 3500-3501, 3506. If the differentiated loss reads rendered positions, that path IS on the tape and sgn's kink at 0 is hit at nonzero measure. It remains harmless -- when rem-limited (|dt_act| < cap/bound, always true near 0) the composite he = sgn*min(|dt_act|, cap) equals dt_act exactly, smooth through 0 -- but the row should state this rather than lean on the stepping-core clip. Classification SMOOTH stands.",
+     "Trivial line-number nits (no action needed beyond citation cleanup): row 6 never-cap comment is 2360-2361 (2362 is the maximum(nsub,1) clamp); row 10 he=where mask is 2514-2516 (2513 is the else:). All other ranges verified exact: 2008-2029, 2031-2087, 2075-2080, 2165-2183 (+call sites 2432/2439/2487/2527), 2185-2186, 2188-2197, 2199-2238 (radius 2217), 2240-2344 (traversal 2248-2294), 2356-2364, 2382-2392 (+2403/2416/2510-2511), 2397-2440/2461-2489/2507-2516 (comment 2441-2460, early-out 2508), 2405-2410/2418-2423/2466-2472/2478-2481/2517-2520, 2491-2538 (bypass 2535), 2788/3022/3189, 2911-2920, 3108, 3120-3123, 3129-3133, 3233-3242, clips 2964/3173/3276, ~1.2e4-substep comment 2374-2376; research-plan R0 'particle add/remove at outflows' confirmed at docs/design/differentiable-stflip-research-plan.md:43; _apply_outflow_filter (1810-1849) confirmed to compact every particle array by keep-mask, supporting row 14's 'adjoint chain terminates at removal' argument. No misclassifications found; the trickiest-item designation and its split straight-through prescription are consistent with the code."
+    ]
+   }
+  },
+  {
+   "group": "topology",
+   "table": {
+    "items": [
+     {
+      "op": "Sheeting density build: nearest-cell occupancy histogram feeding the anti-clump gradient",
+      "lines": "stflip/solver.py:1231-1241 (_cell_counts scatter_add of int32-binned positions), 2102-2103 (smoothed in _apply_sheeting)",
+      "class": "DISCRETE-FREEZE",
+      "note": "Note first: in this codebase sheeting is position-only anti-clumping, NOT particle insertion (docstring 2090-2095); particle count never changes. The counts grid is a sum of nearest-cell indicators, so it is piecewise constant in positions: its true derivative w.r.t. pos is zero almost everywhere. Freezing the density field (stop-gradient through counts) therefore IS the a.e.-correct derivative, not an approximation; the only lost events are measure-zero cell-boundary crossings. The primary smooth chain (sample location -> sampled gradient -> displacement) survives the freeze."
+     },
+     {
+      "op": "Sheeting displacement given the frozen density field",
+      "lines": "stflip/solver.py:2104-2119 (xp.gradient, trilinear samples via _sample_cells 2145-2161, clamped step 2109-2111, excess gate 2115-2117, push-out+clamp 2118-2119)",
+      "class": "SMOOTH",
+      "note": "Piecewise smooth: min/clip kinks (2111, 2116) and the domain clamp are subdifferentiable; displacement magnitude is hard-capped at 0.3*dx per substep (2111), so its Jacobian contribution is a small bounded perturbation of identity -- benign in a <=2 s unroll. _push_out_of_solids (2165-2183) is a smooth SDF-gradient projection away from its where() switch; that switch is the collision group's concern."
+     },
+     {
+      "op": "Outflow removal decision: volume-sink membership, swept-segment Amanatides-Woo traversal, pressure-exit face test (keep/alive masks)",
+      "lines": "stflip/solver.py:2240-2246 (_positions_in_mask), 2248-2294 (_segments_hit_mask), 2296-2344 (_pressure_exit_allowed); consumed at 2491-2535 in _advect and 2967-2974 / 3175-3184 / 3280-3284 in the step cores",
+      "class": "DISCRETE-FREEZE",
+      "note": "All three produce booleans only -- there is no continuous output to differentiate, so freeze the alive/volume_removed/pressure_removed masks at their forward values (straight-through). Given frozen masks, the alive-gated clamp select at 2535 becomes a fixed smooth select. Frozen-topology error is confined to particles within O(eps) of a sink boundary at some substep; removed particles leave the loss support permanently, so their truncated gradients are exactly zero, and survivors' gradients are exact. Over <=2 s the biased set is a thin boundary layer of the sink flux. Bonus for the Warp port: the traversal already runs a fixed, CFL-derived iteration count (2280-2281) with no data-dependent host sync, so the frozen backward kernel has static structure."
+     },
+     {
+      "op": "Outflow compaction: shared keep-mask gather over all particle-state arrays",
+      "lines": "stflip/solver.py:1810-1849 (_apply_outflow_filter; gathers 1826-1837), 3180-3183 (reflected path also gathers the residual ledger r1)",
+      "class": "SMOOTH",
+      "note": "Given the frozen keep mask, compaction is a linear gather; its adjoint is a zero-fill scatter back to the pre-compaction index space. The real engineering cost is bookkeeping, not math: the reverse pass must record one index map per substep so adjoints route correctly across a particle count that shrinks mid-chain. Counter/stat updates (1838-1844) are ints outside the graph. Setup-time cull_outflows (1851-1880) runs before the horizon -> trivially outside the tape."
+     },
+     {
+      "op": "Sparse active window bounds: block-aligned crop rectangle from particle min/max",
+      "lines": "stflip/solver.py:2542-2545 (_band), 2547-2553 (_sparse_engaged), 2555-2572 (_active_window: floor/ceil, band+pad, block align)",
+      "class": "DISCRETE-FREEZE",
+      "note": "Integer, piecewise-constant in positions -- but the freeze here is exceptionally cheap: by the band contract (2542-2545) the cropped solve is an EXACT reindexing of the dense solve (same fields on the fluid support, window clamps unreachable in one step), so replaying the forward window in the backward pass yields gradients identical to the dense solve wherever the guarantee holds. Frozen-topology error is zero, not merely small; a window change between substeps is pure re-indexing, not a physics change. Record lo/sub_shape per substep on the tape. _sparse_engaged also guarantees sparse and outflows are mutually exclusive (2551-2553), so these two freezes never interact."
+     },
+     {
+      "op": "Window enter/exit and origin shift: grid crops, particle translation by dxlo, force-frame offset",
+      "lines": "stflip/solver.py:2574-2606 (_enter_window/_exit_window slicing, clamp bounds 2593-2596, _frame_origin_cells 2599), 2752-2768 (_step: pos - dxlo / pos + dxlo), 1109-1128 (forces consume the origin)",
+      "class": "SMOOTH",
+      "note": "With the integer origin frozen, the +/- dxlo shift is a constant translation (identity Jacobian, exactly cancelling across the substep) and the grid crops are slices whose adjoint is scatter-into-slice. World-space force evaluation at pos+origin stays smooth in positions and force parameters."
+     },
+     {
+      "op": "Frame-boundary re-synchronization: un-jitter advection of a position copy by per-particle dt_resid (possibly negative)",
+      "lines": "stflip/solver.py:3481-3506 (_resynced_positions_and_keep), 2346-2364+2384-2385 (_advect negative-dt support: sgn/|dt| split, h = dt_act/nsub), 3492-3504 (sparse-window re-enter on the render path)",
+      "class": "SMOOTH",
+      "note": "RK3 through the committed (frozen-in-the-tape) grid field is smooth in both position and dt_resid; negative dt only flips the sign of h/sgn, which is constant given the forward value and continuous at dt=0. dt_resid itself comes from clipped jitter ledgers (2964-2965, 3276-3277): piecewise linear, and smooth once the xi draws are frozen (REPARAM -- the jitter group's item); nsub/max_n substep counts freeze at forward values (advection group). The outflow keep on this path (3486-3491) inherits the outflow freeze. Structurally friendly: it operates on pos.copy() and never mutates solver state, so per frame it is a leaf branch of the graph -- adjoints flow from the frame loss into (pos, vel, dt_resid, grids) but no cross-frame chain passes through the resync itself."
+     },
+     {
+      "op": "Inflow reseeding, decision side: occupancy-gated refill cell selection and emission count",
+      "lines": "stflip/solver.py:3434-3477 (_seed_inflows: int32 binning 3457-3463, refill = mask & counts < 0.5*ppc at 3467, host argwhere 3469), 3413-3418 (mid-frame refill in step_frame)",
+      "class": "DISCRETE-FREEZE",
+      "note": "Which cells refill, and hence how many particles appear, is a thresholded integer decision; freeze the recorded per-substep emission schedule (cell list and count) and replay it backward. Acceptable because the 0.5*ppc hysteresis makes flips rare over <=2 s, a flip only perturbs the source region (upstream boundary condition, information flows outward), and appended particles enlarge arrays by whole-ppc quanta -- the same per-substep index-map bookkeeping built for outflow compaction handles growth in the other direction. Note this solver has NO bulk-interior reseeding/resampling: insertion happens only via inflow refill (plus setup-time seeding at 914/1217, outside the horizon)."
+     },
+     {
+      "op": "Inflow reseeding, placement side: jittered seed positions and velocity assignment for new particles",
+      "lines": "stflip/solver.py:1159-1200 (_seed_cells: host RNG jitter 1169, stratified placement 1170-1178, vel = field.sample(pts) 1180, attribute appends 1181-1199)",
+      "class": "REPARAM",
+      "note": "The noise is the host self._rng uniform draws for sub-cell jitter (1169) -- fix them per rollout (record or reseed deterministically) and the seeded positions become constants; the inserted velocities field.sample(pts) are then smooth in any optimized inflow-field parameters, which is exactly the gradient path an inverse problem over sources needs. Appends themselves are concatenations: linear, adjoint = split."
+     },
+     {
+      "op": "Particle-attribute reconciliation padding",
+      "lines": "stflip/solver.py:500-530 (_reconcile_particle_attrs)",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "Pure shape bookkeeping: a no-op whenever mutations went through _seed_cells/_apply_outflow_filter (which the step loop guarantees), and it touches only non-differentiated attribute arrays (phase constants, age, source_id, zero-init C). Safe to leave off the tape; assert length-consistency instead in the differentiable port."
+     },
+     {
+      "op": "Whitewater secondary-particle module (emission, classification, per-kind dynamics, cull/cap)",
+      "lines": "stflip/whitewater.py:86-154 (_emit: Bernoulli-rounded expected counts 121-129, host np.repeat expansion 133-143), 158-164 (_classify thresholds), 166-225 (step: per-kind where-dynamics 183-201, life decay 204-205, cull 208-216, FIFO cap 217-222)",
+      "class": "DISCRETE-EXCLUDE",
+      "note": "Confirmed sound to exclude: coupling is strictly one-way -- step() reads solver grids/particles (76-82, 93-117) and writes only its own pos/vel/life/kind, and it runs after solver.step_frame() (167). Excluding it therefore cannot bias any solver-state gradient; it only forbids foam-count losses, which R1/R2 do not use (losses are on solver state/statistics). Internally it is discreteness-dense (stochastic integer emission with host expansion, three-way phi-threshold classification, domain cull, oldest-drop cap) and its natural gradient estimator for the rate parameters would be score-function, not pathwise -- wrong tool for this plan. If a foam-aware loss is ever wanted, differentiate only the smooth per-kind ODE (187-201) with frozen emission and classification."
+     }
+    ],
+    "trickiest": {
+     "op": "Outflow particle removal (the frozen keep-mask around _segments_hit_mask / _pressure_exit_allowed and the resulting mid-chain compaction)",
+     "why": "It is the only discrete event in this group that is both dense in time and state-restructuring. Unlike the sparse window (freeze is exactly gradient-preserving) or inflow flips (rare, hysteresis-guarded), sink crossings fire every substep whenever an outflow scene is running, so the straight-through bias is systematic rather than measure-zero: an eps position perturbation near a sink boundary changes the loss by O(1), because a particle kept instead of removed goes on depositing mass into P2G for the rest of the horizon. The frozen mask must also be kept mutually consistent across three coupled decision sites per substep (start-of-advection mask, swept-segment traversal at each local-CFL sub-step, pressure-exit test after collision push-out) plus the alive-gated clamp select at solver.py:2535, and the reverse pass has to carry per-substep index maps and zero-fill scatter adjoints through a particle count that shrinks mid-chain -- the heaviest tape bookkeeping in the group. The soundness argument (removed particles exit the loss support, so only a thin boundary layer of survivors carries biased gradients) is plausible for <=2 s but is the one claim in this group that genuinely needs the R1 gradcheck-vs-finite-difference gate to confirm."
+    }
+   },
+   "verdict": {
+    "agree": false,
+    "corrections": [
+     "Row '_reconcile_particle_attrs': wrong line range. The function spans solver.py:500-542, not 500-530; the cited range (and the note's inventory of touched arrays) omits the particle_id padding block at 531-542, which pads FRESH int64 ids ('never zeros', 534-539). DISCRETE-EXCLUDE still stands (ids are non-differentiated ints and the step loop makes the whole function a no-op), but particle_id is the key for the frozen sobol_owen/cp_rot jitter noise (sampling.temporal_xi at 2952-2957 and 3264-3269), so the proposed length-consistency assertion in the differentiable port must also assert that no mid-horizon id padding fires -- a mid-horizon pad would silently change the identity of the 'frozen' noise stream the REPARAM rows rely on.",
+     "Row 'Inflow reseeding, decision side': incomplete call-site coverage. _seed_inflows runs at THREE points inside the horizon, not one: the start-of-frame call at solver.py:3347, the idle-restart path at 3356-3365 (call at 3362, after jumping the clock to the next emitter start), and the cited mid-frame refill at 3413-3418. The frozen per-substep emission schedule must be recorded at all three sites (the idle path also mutates self.time/t_rem before seeding). Additionally, 'hysteresis' is imprecise: line 3467 is a plain half-occupancy threshold (counts < 0.5*ppc); the hysteresis-like flip guard actually comes from refill APPENDING a full ppc on top of the existing sub-threshold count (3470-3477, note also the sequential counts update at 3477 that makes later sources in registration order see earlier sources' seeds), which lands the cell well above threshold after every refill. The rarity conclusion survives, but for the stated mechanism, not a threshold-pair hysteresis.",
+     "Row 'Outflow removal decision': the Warp-port bonus claim 'the traversal already runs a fixed, CFL-derived iteration count (2280-2281) with no data-dependent host sync, so the frozen backward kernel has static structure' is true only of _segments_hit_mask in isolation. The ENCLOSING track_outflows advection loop that invokes it is not static: max_n = int(nsub.max()) at solver.py:2364 is a data-dependent host sync that sets the loop trip count (2499), and in local advection-bound mode there is an additional amortized early-out host sync bool(stepping.any()) at 2508 plus data-dependent per-particle step magnitudes hmag at 2510-2511. The frozen backward kernel only has static structure after nsub/max_n (and, in local mode, the realized iteration count) are recorded on the tape -- which the table assigns to the advection group only implicitly, via a parenthetical in the resync row. State the dependency explicitly in this row so the outflow tape design does not assume a compile-time loop bound."
+    ]
+   }
+  }
+ ]
+}
