@@ -78,6 +78,41 @@ session; the feature lands headless-first.
 GPU gate studies run only after the hero-bake / whirlpool renders
 release the GPU (honest timings and no contention).
 
-## Verdict
+## Verdict: SHIP AS EXPERIMENTAL (four iterations, 2026-07-17)
 
-(to be filled by the gate studies)
+Artifacts: validation/goal_splash_demo.json (full battery, clean re-run
+under the final optimizer), validation/goal_splash_iter3.json (32^3
+demo probe), validation/goal_splash_iter4.json (two-stage demo).
+
+- **G-CTRL-1 (mechanism): PASS, decisively.** Every optimizer seed in
+  every iteration beat the no-force baseline by far more than 3x --
+  baselines on this scene are ~0.000, optimized target mass 0.26-0.30.
+- **G-CTRL-2 (unreachable goal): PASS.** The elevated catch basin is
+  untouched by the uncontrolled flow (< 0.0005 mass); the optimizer
+  reaches 0.26-0.31 with the keep-dry penalty satisfied. In every
+  iteration the CEM DISCOVERED a pulsed force on its own (windows
+  ~0.24-0.39 s to ~1.5-1.8 s), exercising the time-window feature
+  without being told to.
+- **G-CTRL-3 (transfer): PASS.** 48^3 -> 128^3 retention measured
+  independently three times: 0.813, 0.729, 0.815. A raw 32^3 proxy
+  transfers at only 0.599 -- exactly the borderline case this doc
+  pre-committed to -- and the mandatory warm-started 48^3 refine stage
+  (3 generations seeded at the coarse winner, init_std 0.08) restores
+  retention to 0.815. Two-stage search is the shipped recommendation.
+- **G-CTRL-4 (budget): FAIL at the pre-registered 30-minute bar.**
+  Measured envelope on the RTX 5090: 48^3 demo 108 min; 32^3 demo
+  57 min; two-stage (32^3 + refine) 64 min. The root cause is physics,
+  not harness overhead: a forced rollout costs ~2x the baseline
+  because the injected momentum raises vmax and therefore the
+  substep count, and the CEM genuinely uses ~100+ rollouts (best
+  scores kept improving through generation 9-10; patience-3 early
+  stopping rarely triggered). The 30-minute bar was optimistic by
+  roughly 2x for this scene class. Budget is a quality dial the
+  artist controls: fewer generations give a rougher answer sooner.
+
+Per the pre-registered fallback pattern, the feature ships HEADLESS
+and EXPERIMENTAL: the mechanism, constraint handling, and two-stage
+transfer are proven; the honest cost of a converged optimization on
+5090-class hardware is about an hour, run as a background job. The
+CuPy pool release per rollout and CEM warm-starting/early-stopping
+landed as library improvements regardless.

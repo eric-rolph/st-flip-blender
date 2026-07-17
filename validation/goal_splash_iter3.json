@@ -1,0 +1,24 @@
+{
+ "demo_resolution": 32,
+ "demo_optimization_s": 3422.9,
+ "generations_run": 10,
+ "base32": 0.0,
+ "opt32": 0.26474609375,
+ "base128": 0.0003676641555059524,
+ "opt128": 0.15905907040550596,
+ "retention_32_to_128": 0.599,
+ "within_30min": false,
+ "forces": [
+  {
+   "force_type": "DIRECTIONAL",
+   "strength": 15.721037526727933,
+   "direction": [
+    0.7873862323004069,
+    0.030267622479319925,
+    0.615716486877864
+   ],
+   "t_start": 0.27664077437578277,
+   "t_end": 1.5978033539120287
+  }
+ ]
+}

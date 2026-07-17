@@ -158,6 +158,15 @@ def rollout_score(build_solver, genes, unit, objective) -> float:
         solver.step_frame()
         if frame in wanted:
             positions_by_frame[frame] = solver.be.to_numpy(solver.pos)
+    del solver
+    try:
+        # Hundreds of short-lived solvers fragment the CuPy pool and
+        # progressively double per-rollout cost; release between
+        # rollouts (measured: 28 s -> ~13 s per 32^3 rollout).
+        import cupy
+        cupy.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
     return objective.score(positions_by_frame)
 
 
@@ -176,23 +185,35 @@ def optimize_forces(build_solver, genes, objective, *,
                     generations: int = 12, population: int = 16,
                     elite_frac: float = 0.25, init_std: float = 0.3,
                     std_floor: float = 0.02, seed: int = 0,
+                    patience: int = 0, init_mean=None,
                     log=None) -> CEMResult:
     """Cross-Entropy Method over the gene box (docs pre-register gates).
 
     Deterministic under ``seed``. Scores every candidate with a full
     proxy rollout, refits mean/std to the elite quantile, anneals the
     std toward ``std_floor``, and never evaluates outside [0, 1]^d.
+    ``patience`` > 0 stops early after that many consecutive
+    generations without a new overall best (0 disables). ``init_mean``
+    warm-starts the search distribution (e.g. a coarser stage's best
+    unit vector for the refine stage); pair it with a small
+    ``init_std``.
     """
     dim = genome_dim(genes)
     if dim == 0:
         raise ValueError("no free parameters to optimize")
     n_elite = max(2, int(round(population * elite_frac)))
     rng = np.random.default_rng(seed)
-    mean = np.full(dim, 0.5)
+    if init_mean is not None:
+        mean = np.clip(np.asarray(init_mean, dtype=float), 0.0, 1.0)
+        if mean.shape != (dim,):
+            raise ValueError("init_mean must match the genome dimension")
+    else:
+        mean = np.full(dim, 0.5)
     std = np.full(dim, float(init_std))
     best_unit = mean.copy()
     best_score = -math.inf
     history = []
+    stale = 0
     for gen in range(generations):
         samples = rng.normal(mean, std, size=(population, dim))
         samples = np.clip(samples, 0.0, 1.0)
@@ -208,6 +229,9 @@ def optimize_forces(build_solver, genes, objective, *,
         if scores[order[0]] > best_score:
             best_score = float(scores[order[0]])
             best_unit = samples[order[0]].copy()
+            stale = 0
+        else:
+            stale += 1
         entry = {"generation": gen,
                  "best": float(scores[order[0]]),
                  "mean": float(scores.mean()),
@@ -215,6 +239,8 @@ def optimize_forces(build_solver, genes, objective, *,
         history.append(entry)
         if log is not None:
             log(entry)
+        if patience and stale >= patience:
+            break
     return CEMResult(
         best_unit=best_unit, best_score=best_score, history=history,
         best_forces=decode_genes(genes, best_unit))

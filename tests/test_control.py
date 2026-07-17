@@ -158,6 +158,49 @@ class TestCEM:
         assert a.best_score == b.best_score
         assert np.array_equal(a.best_unit, b.best_unit)
 
+    def test_patience_stops_early(self):
+        genes = [ForceGene(strength=(0.0, 1.0))]
+
+        def fake_rollout(_build, _genes, unit, _obj):
+            return 1.0  # constant: never improves after gen 0
+
+        import stflip.control as control
+        original = control.rollout_score
+        control.rollout_score = fake_rollout
+        try:
+            obj = Objective(targets=[(1, ((0, 0, 0), (1, 1, 1)), 1.0)])
+            result = optimize_forces(
+                lambda: None, genes, obj, generations=20,
+                population=6, seed=0, patience=3)
+        finally:
+            control.rollout_score = original
+        # gen 0 sets the best; 3 stale generations then stop = 4 total.
+        assert len(result.history) == 4
+
+    def test_warm_start_biases_search(self):
+        genes = [ForceGene(strength=(0.0, 1.0))]
+        seen = []
+
+        def fake_rollout(_build, _genes, unit, _obj):
+            seen.append(float(unit[0]))
+            return 0.0
+
+        import stflip.control as control
+        original = control.rollout_score
+        control.rollout_score = fake_rollout
+        try:
+            obj = Objective(targets=[(1, ((0, 0, 0), (1, 1, 1)), 1.0)])
+            optimize_forces(
+                lambda: None, genes, obj, generations=1, population=16,
+                seed=0, init_mean=[0.9], init_std=0.05)
+        finally:
+            control.rollout_score = original
+        assert abs(np.mean(seen) - 0.9) < 0.1
+        with pytest.raises(ValueError):
+            optimize_forces(
+                lambda: None, genes, obj, generations=1, population=4,
+                init_mean=[0.5, 0.5])
+
     def test_rejects_empty_genome(self):
         with pytest.raises(ValueError):
             optimize_forces(
